@@ -1,18 +1,17 @@
 name: Build and Release RcloneManager
 
 on:
-  push:
-    tags:
-      - 'v*' # v1.0.0, v2.1 등 'v'로 시작하는 태그가 푸시될 때만 실행
-  workflow_dispatch: # 수동으로 빌드를 실행할 수 있는 버튼 활성화
+  release:
+    types: [published]
+  workflow_dispatch: 
 
 permissions:
-  contents: write # 릴리스 생성 및 파일 업로드를 위한 권한
+  contents: write
 
 jobs:
   build:
     name: Build EXE on Windows
-    runs-on: windows-latest # Windows 환경에서 실행 (exe 빌드 필수)
+    runs-on: windows-latest
 
     steps:
       - name: Checkout Code
@@ -29,7 +28,6 @@ jobs:
           pip install pyinstaller pystray pillow requests
 
       - name: Build with PyInstaller
-        # ★ 수정된 부분: 캐럿(^) 대신 백틱(`)을 사용합니다.
         run: |
           pyinstaller --clean --noconfirm --onefile --windowed `
             --name "RcloneManager" `
@@ -41,9 +39,17 @@ jobs:
         run: |
           Compress-Archive -Path dist\RcloneManager.exe -DestinationPath RcloneManager.zip
 
-      - name: Release and Upload Asset
+      - name: Generate Tag Name for Manual Run
+        if: github.event_name == 'workflow_dispatch'
+        id: generate_tag
+        run: |
+          $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+          echo "TAG_NAME=v$timestamp" >> $env:GITHUB_ENV
+
+      - name: Upload Asset to Release
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/') 
         with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && env.TAG_NAME || github.event.release.tag_name }}
           files: RcloneManager.zip
-          generate_release_notes: true
+          # ★ 추가된 부분: 수동 실행일 때만 Pre-release로 체크되도록 설정
+          prerelease: ${{ github.event_name == 'workflow_dispatch' }}
