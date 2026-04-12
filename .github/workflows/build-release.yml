@@ -1,0 +1,51 @@
+name: Build and Release RcloneManager
+
+on:
+  push:
+    tags:
+      - 'v*' # v1.0.0, v2.1 등 'v'로 시작하는 태그가 푸시될 때만 실행
+  workflow_dispatch: # 수동으로 빌드를 실행할 수 있는 버튼 활성화
+
+permissions:
+  contents: write # 릴리스 생성 및 파일 업로드를 위한 권한
+
+jobs:
+  build:
+    name: Build EXE on Windows
+    runs-on: windows-latest # Windows 환경에서 실행 (exe 빌드 필수)
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11' # 기존 스크립트가 3.10+ 이므로 안정적인 3.11 사용
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller pystray pillow requests
+
+      - name: Build with PyInstaller
+        # 기존 빌드 스크립트의 옵션을 그대로 적용
+        run: |
+          pyinstaller --clean --noconfirm --onefile --windowed ^
+            --name "RcloneManager" ^
+            --hidden-import "pystray._win32" ^
+            --hidden-import "PIL._tkinter_finder" ^
+            rclone_manager.py
+
+      - name: Create ZIP archive
+        # 생성된 exe 파일을 zip 파일로 압축
+        run: |
+          Compress-Archive -Path dist\RcloneManager.exe -DestinationPath RcloneManager.zip
+
+      - name: Release and Upload Asset
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/') # 태그 푸시에 의해 실행되었을 때만 릴리스 생성
+        with:
+          files: RcloneManager.zip
+          generate_release_notes: true # 커밋 내역을 바탕으로 릴리스 노트 자동 생성
