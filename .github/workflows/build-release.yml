@@ -21,7 +21,8 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11' # 기존 스크립트가 3.10+ 이므로 안정적인 3.11 사용
+          python-version: '3.11' 
+          # 주의: 에러를 발생시켰던 cache: 'pip' 줄을 삭제했습니다.
 
       - name: Install Dependencies
         run: |
@@ -29,7 +30,6 @@ jobs:
           pip install pyinstaller pystray pillow requests
 
       - name: Build with PyInstaller
-        # 기존 빌드 스크립트의 옵션을 그대로 적용
         run: |
           pyinstaller --clean --noconfirm --onefile --windowed ^
             --name "RcloneManager" ^
@@ -38,13 +38,12 @@ jobs:
             rclone_manager.py
 
       - name: Create ZIP archive
-        # 생성된 exe 파일을 zip 파일로 압축
         run: |
           Compress-Archive -Path dist\RcloneManager.exe -DestinationPath RcloneManager.zip
 
       - name: Release and Upload Asset
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/') # 태그 푸시에 의해 실행되었을 때만 릴리스 생성
+        if: startsWith(github.ref, 'refs/tags/') 
         with:
           files: RcloneManager.zip
-          generate_release_notes: true # 커밋 내역을 바탕으로 릴리스 노트 자동 생성
+          generate_release_notes: true
