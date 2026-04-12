@@ -22,7 +22,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11' 
-          # 주의: 에러를 발생시켰던 cache: 'pip' 줄을 삭제했습니다.
 
       - name: Install Dependencies
         run: |
@@ -30,11 +29,12 @@ jobs:
           pip install pyinstaller pystray pillow requests
 
       - name: Build with PyInstaller
+        # ★ 수정된 부분: 캐럿(^) 대신 백틱(`)을 사용합니다.
         run: |
-          pyinstaller --clean --noconfirm --onefile --windowed ^
-            --name "RcloneManager" ^
-            --hidden-import "pystray._win32" ^
-            --hidden-import "PIL._tkinter_finder" ^
+          pyinstaller --clean --noconfirm --onefile --windowed `
+            --name "RcloneManager" `
+            --hidden-import "pystray._win32" `
+            --hidden-import "PIL._tkinter_finder" `
             rclone_manager.py
 
       - name: Create ZIP archive
