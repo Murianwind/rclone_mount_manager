@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 import rclone_manager
 import os
 import configparser
+import tkinter as tk
 
 class TestRcloneManagerBDD(unittest.TestCase):
 
@@ -12,7 +13,10 @@ class TestRcloneManagerBDD(unittest.TestCase):
         self.sample_cfg = {"remotes": [], "mounts": [], "rclone_path": "", "auto_mount": False}
 
     def _create_mocked_app(self, cfg=None):
-        """Mock 앱 인스턴스 생성 유틸리티"""
+        """
+        오류 수정을 위한 Mock 앱 생성 유틸리티
+        Tkinter 변수와의 충돌을 피하기 위해 명시적으로 Mock을 주입합니다.
+        """
         app = rclone_manager.App.__new__(rclone_manager.App)
         app._cfg = cfg if cfg else self.sample_cfg
         app._status = {}
@@ -21,6 +25,9 @@ class TestRcloneManagerBDD(unittest.TestCase):
         app._rc_ver_label = MagicMock()
         app._app_up_btn = MagicMock()
         app._rc_var = MagicMock()
+        # Tkinter Variable RecursionError 방지를 위한 순수 Mock 주입
+        app._am_var = MagicMock()
+        app._st_var = MagicMock()
         app.after = MagicMock()
         app.withdraw = MagicMock()
         app.deiconify = MagicMock()
@@ -116,9 +123,10 @@ class TestRcloneManagerBDD(unittest.TestCase):
 
     # 8. 시작 프로그램 상태 확인
     def test_scenario_08_startup_check(self):
-        # Given: 레지스트리에 앱이 등록되어 있을 때
-        with patch("winreg.OpenKey", return_value=MagicMock()):
-            with patch("winreg.QueryValueEx", return_value=("cmd", 1)):
+        # Given: 레지스트리 모듈이 패치되었을 때
+        # (rclone_manager.winreg로 접근 가능하도록 수정 필요)
+        with patch("rclone_manager.winreg.OpenKey", return_value=MagicMock()):
+            with patch("rclone_manager.winreg.QueryValueEx", return_value=("cmd", 1)):
                 # When: 시작 프로그램 여부를 확인하면
                 enabled = rclone_manager.is_startup_enabled()
                 # Then: True가 반환되어야 한다.
@@ -225,13 +233,13 @@ class TestRcloneManagerBDD(unittest.TestCase):
     # 16. 시작 프로그램 등록/해제
     def test_scenario_16_set_startup(self):
         # Given: 레지스트리 키에 접근 가능할 때
-        with patch("winreg.OpenKey", return_value=MagicMock()):
-            with patch("winreg.SetValueEx") as mock_set:
+        with patch("rclone_manager.winreg.OpenKey", return_value=MagicMock()):
+            with patch("rclone_manager.winreg.SetValueEx") as mock_set:
                 # When: 시작 프로그램 등록을 설정하면
                 rclone_manager.set_startup(True)
                 # Then: 값 설정 함수가 호출되어야 한다.
                 mock_set.assert_called_once()
-            with patch("winreg.DeleteValue") as mock_del:
+            with patch("rclone_manager.winreg.DeleteValue") as mock_del:
                 # When: 시작 프로그램 해제를 설정하면
                 rclone_manager.set_startup(False)
                 # Then: 값 제거 함수가 호출되어야 한다.
@@ -267,6 +275,7 @@ class TestRcloneManagerBDD(unittest.TestCase):
     def test_scenario_19_toggle_auto_mount(self):
         # Given: 체크박스 변수가 참으로 바뀌었을 때
         app = self._create_mocked_app({"auto_mount": False})
+        # RecursionError 방지를 위해 .get() 메서드 자체를 Mocking
         app._am_var.get.return_value = True
         with patch("rclone_manager.save_config") as mock_save:
             # When: 자동 마운트 토글을 실행하면
@@ -329,13 +338,10 @@ class TestRcloneManagerBDD(unittest.TestCase):
         When: parse_rclone_conf 함수가 파일을 읽으면
         Then: 섹션의 이름과 타입이 정확히 리스트로 추출되어야 한다.
         """
-        # Given
         with patch("configparser.ConfigParser.read") as mock_read:
             with patch("configparser.ConfigParser.sections", return_value=["my_drive"]):
                 with patch("configparser.ConfigParser.get", return_value="drive"):
-                    # When
                     remotes = rclone_manager.parse_rclone_conf(Path("fake.conf"))
-                    # Then
                     self.assertEqual(len(remotes), 1)
                     self.assertEqual(remotes[0]["name"], "my_drive")
 
@@ -346,10 +352,9 @@ class TestRcloneManagerBDD(unittest.TestCase):
         When: '열기' 항목을 정의하면
         Then: 해당 항목의 default 속성이 True로 설정되어 더블클릭 시 작동해야 한다.
         """
-        # Given & When: pystray MenuItem 정의 시뮬레이션
-        with patch("pystray.MenuItem") as mock_item:
+        with patch("rclone_manager.pystray.MenuItem") as mock_item:
+            # pystray가 모듈 레벨로 임포트되어 있어야 합니다.
             rclone_manager.pystray.MenuItem("열기", MagicMock(), default=True)
-            # Then
             mock_item.assert_called_with("열기", unittest.mock.ANY, default=True)
 
     # ── 요구사항 3: 업데이트 확인 창 분기 테스트 ──
@@ -359,11 +364,8 @@ class TestRcloneManagerBDD(unittest.TestCase):
         When: 사용자가 '아니오(Cancel)'를 선택하면
         Then: 업데이트 액션이 수행되지 않아야 한다.
         """
-        # Given
         with patch("tkinter.messagebox.askyesno", return_value=False):
-            # When: 업데이트 여부를 물으면
             res = rclone_manager.messagebox.askyesno("rclone", "업데이트 할까요?")
-            # Then
             self.assertFalse(res)
 
     def test_scenario_27_update_dialog_confirm(self):
@@ -372,11 +374,8 @@ class TestRcloneManagerBDD(unittest.TestCase):
         When: 사용자가 '예(Confirm)'를 선택하면
         Then: 업데이트 액션(다운로드 등)이 수행되어야 한다.
         """
-        # Given
         with patch("tkinter.messagebox.askyesno", return_value=True):
-            # When: 업데이트 여부를 물으면
             res = rclone_manager.messagebox.askyesno("rclone", "업데이트 할까요?")
-            # Then
             self.assertTrue(res)
 
 if __name__ == "__main__":
