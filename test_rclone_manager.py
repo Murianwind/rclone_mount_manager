@@ -25,8 +25,7 @@ class TestRcloneManagerBDD(unittest.TestCase):
 
     def _create_mocked_app(self, cfg=None):
         """
-        CI 환경의 RecursionError 및 TclError 방지를 위해 
-        __new__ 메서드로 인스턴스를 생성하고 필요한 속성만 수동 초기화합니다.
+        CI 환경의 RecursionError 및 TclError 방지를 위한 Mock 앱 생성
         """
         app = App.__new__(App)
         app._cfg = cfg if cfg else self.sample_cfg
@@ -43,13 +42,13 @@ class TestRcloneManagerBDD(unittest.TestCase):
 
     def _create_mocked_dialog(self, parent, mount=None, cfg=None):
         """
-        MountDialog의 UI 빌드를 건너뛰고 로직 테스트를 위한 Mock 위젯들을 설정합니다.
+        UI 빌드를 건너뛰고 로직 테스트를 위한 Mock 다이얼로그 생성
         """
         dlg = MountDialog.__new__(MountDialog)
         dlg._m = mount if mount else {}
         dlg._app_cfg = cfg if cfg else self.sample_cfg
         
-        # 유효성 검사 로직(_save)에서 참조하는 위젯들 Mocking
+        # 유효성 검사 및 로직에서 참조하는 위젯들 Mocking
         dlg._rem = MagicMock()
         dlg._drv = MagicMock()
         dlg._pth = MagicMock()
@@ -60,9 +59,9 @@ class TestRcloneManagerBDD(unittest.TestCase):
 
     # 1. rclone를 제대로 불러오는가?
     def test_scenario_01_load_rclone(self):
-        # Given: 설정 파일에 rclone 경로가 문자열로 저장되어 있을 때
+        # Given: rclone_path가 설정 파일에 저장되어 있을 때
         cfg = {"rclone_path": "C:\\fake\\rclone.exe"}
-        # When: rclone 실행 파일 객체를 가져오면 (파일 존재 여부 Mock 처리)
+        # When: rclone 실행 파일 객체를 요청하면 (파일 존재 여부 Mock 처리)
         with patch("pathlib.Path.exists", return_value=True):
             exe = rclone_manager.get_rclone_exe(cfg)
         # Then: 반환된 경로는 설정된 문자열과 일치해야 함
@@ -99,8 +98,8 @@ class TestRcloneManagerBDD(unittest.TestCase):
         # Given: 다이얼로그가 생성되었을 때
         app = self._create_mocked_app()
         dlg = self._create_mocked_dialog(app, mount={"remote": "gd"})
-        # When: 객체의 메서드를 확인하면
-        # Then: 연결 테스트를 담당하는 _test 메서드가 정의되어 있어야 함
+        # When: 메서드 존재 여부를 확인하면
+        # Then: 연결 테스트를 수행하는 _test 메서드가 정의되어 있어야 함
         self.assertTrue(hasattr(dlg, '_test'))
 
     # 5. 잘못된 리모트 이름을 식별하는가?
@@ -132,7 +131,7 @@ class TestRcloneManagerBDD(unittest.TestCase):
 
     # 7. 추가 플래그 구분 및 처리가 정확한가?
     def test_scenario_07_validate_extra_flags(self):
-        # Given: 구분자(;)가 포함된 플래그 문자열이 주어졌을 때
+        # Given: ';'로 구분된 플래그 문자열이 주어졌을 때
         mount = {"remote": "gd", "drive": "X:", "extra_flags": "--read-only;--vfs-cache-mode full"}
         # When: rclone 명령어를 빌드하면
         cmd = rclone_manager.build_cmd(Path("rclone.exe"), mount)
@@ -197,7 +196,7 @@ class TestRcloneManagerBDD(unittest.TestCase):
         # Given: 'A'와 'B' 항목이 순서대로 존재할 때
         app = self._create_mocked_app()
         app._cfg["mounts"] = [{"id": "1", "remote": "A"}, {"id": "2", "remote": "B"}]
-        # When: 두 번째 항목('2')을 위로 이동시키면
+        # When: 두 번째 항목('2')을 선택하고 위로 이동시키면
         with patch.object(app._tree, "selection", return_value=("2",)):
             app._move_up()
         # Then: 첫 번째 인덱스에 아이디 '2'번 항목이 위치해야 함
@@ -261,7 +260,7 @@ class TestRcloneManagerBDD(unittest.TestCase):
         # Given: 저장소 설정 정보가 있을 때
         # When: 저장소 아이디를 확인하면
         repo = rclone_manager.GITHUB_REPO
-        # Then: 사용자님의 GitHub ID 'Murianwind'가 포함되어야 함
+        # Then: 사용자님의 GitHub ID 'Murianwind'가 포함되어 있어야 함
         self.assertIn("Murianwind", repo)
 
 if __name__ == "__main__":
