@@ -5,7 +5,7 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-  workflow_dispatch: # 수동 실행 가능
+  workflow_dispatch:
 
 jobs:
   test:
@@ -13,20 +13,110 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout Code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
+          cache: "pip"
 
-      - name: Install Dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install pytest pytest-asyncio requests pystray Pillow
 
-      - name: Execute BDD Tests
+      - name: Run Tests
+        # shell: bash를 사용하여 제공해주신 분석 스크립트(Unix 스타일)를 그대로 활용합니다.
+        shell: bash
         run: |
-          # unittest를 사용하여 작성한 테스트 스크립트 실행
-          python test_rclone_manager.py
+          set +e
+          # pytest를 사용하여 테스트 실행 (결과를 파일로 기록)
+          python -m pytest test_rclone_manager.py \
+            --no-header \
+            --tb=short \
+            --color=no \
+            -v \
+            2>&1 | tee pytest-output.txt
+          
+          PYTEST_EXIT=${PIPESTATUS[0]}
+          echo "PYTEST_EXIT=$PYTEST_EXIT" >> $GITHUB_ENV
+          exit $PYTEST_EXIT
+
+      - name: Publish Test Summary
+        if: always()
+        shell: bash
+        run: |
+          # 요약 라인 추출 (passed, failed, error 등)
+          SUMMARY_LINE=$(grep -E "[0-9]+ (passed|failed|error)" pytest-output.txt | tail -1 || true)
+
+          # ── 헤더 + 요약 ──────────────────────────────────────────────────
+          if [ "${PYTEST_EXIT:-0}" = "0" ]; then
+            echo "### ✅ BDD 테스트 결과: 전체 통과" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ❌ BDD 테스트 결과: 실패 있음" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**${SUMMARY_LINE}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # ── 실행된 테스트 전체 목록 (접기) ──────────────────────────────
+          echo "<details>" >> $GITHUB_STEP_SUMMARY
+          echo "<summary>📋 실행된 테스트 전체 목록 (클릭하여 펼치기)</summary>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          # 파일::메서드 형식을 파싱하여 예쁘게 출력
+          grep "::" pytest-output.txt \
+            | sed 's/  *\[[ 0-9]*%\]$//' \
+            | sed 's/ PASSED$/  ✓/' \
+            | sed 's/ FAILED$/  ✗  ← FAILED/' \
+            | sed 's/ ERROR$/  !  ← ERROR/' \
+            | sed 's/ SKIPPED$/  (skipped)/' \
+            >> $GITHUB_STEP_SUMMARY || echo "(없음)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "</details>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # ── 실패 상세 ────────────────────────────────────────────────────
+          FAIL_COUNT=$(grep -cE "^(FAILED|ERROR) " pytest-output.txt 2>/dev/null || echo 0)
+          if [ "$FAIL_COUNT" -gt "0" ]; then
+            echo "---" >> $GITHUB_STEP_SUMMARY
+            echo "### ❌ 실패 상세" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+
+            echo "**실패한 테스트:**" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            grep -E "^(FAILED|ERROR) " pytest-output.txt >> $GITHUB_STEP_SUMMARY || true
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+
+            echo "**Traceback:**" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            # pytest 실패 구문 블록 추출
+            awk '
+              /^_{5,}/ { in_fail=1; print ""; print; next }
+              in_fail && /^={5,}/ { in_fail=0; next }
+              in_fail { print }
+            ' pytest-output.txt >> $GITHUB_STEP_SUMMARY || true
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+
+            # 원인 분류: 로직 문제(rclone_manager.py) vs 테스트 문제(test_rclone_manager.py)
+            echo "**원인 분류:**" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            SRC=$(grep -oE "rclone_manager\.py:[0-9]+" pytest-output.txt | sort -u || true)
+            TEST=$(grep -oE "test_rclone_manager\.py:[0-9]+" pytest-output.txt | sort -u || true)
+
+            if [ -n "$SRC" ]; then
+              echo "📦 소스 코드 문제 (rclone_manager.py):" >> $GITHUB_STEP_SUMMARY
+              echo "$SRC" >> $GITHUB_STEP_SUMMARY
+              echo "  → 실제 앱 로직 버그일 가능성이 큽니다." >> $GITHUB_STEP_SUMMARY
+            fi
+            if [ -n "$TEST" ]; then
+              echo "🧪 테스트 코드 문제 (test_rclone_manager.py):" >> $GITHUB_STEP_SUMMARY
+              echo "$TEST" >> $GITHUB_STEP_SUMMARY
+              echo "  → 테스트 케이스나 Mock 설정 문제일 가능성이 큽니다." >> $GITHUB_STEP_SUMMARY
+            fi
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
