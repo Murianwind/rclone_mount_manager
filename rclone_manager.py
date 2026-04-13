@@ -34,7 +34,7 @@ except ImportError:
     pystray = None
 
 # ── 프로그램 설정 ──
-APP_VERSION = "1.0.8"
+APP_VERSION = "1.1.0"
 GITHUB_REPO = "Murianwind/rclone_mount_manager"
 
 # ── 1. 고해상도(DPI) 대응 및 시스템 정보 수집 ──
