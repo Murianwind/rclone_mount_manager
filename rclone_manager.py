@@ -16,6 +16,21 @@ import urllib.parse
 from pathlib import Path
 import ctypes
 
+# --- 선택적 임포트 처리 (테스트 및 환경 호환성 보강) ---
+# winreg, pystray, PIL 등이 없는 환경에서도 변수는 선언되어야 NameError가 나지 않습니다.
+try:
+    import winreg
+except ImportError:
+    winreg = None
+
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+except ImportError:
+    pystray = None
+    Image = None
+    ImageDraw = None
+
 # --- 시스템 호출 및 환경 설정 ---
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(1)
@@ -49,8 +64,8 @@ GITHUB_REPO = "Murianwind/rclone_mount_manager"
 
 # --- 유틸리티 함수 ---
 def is_startup_enabled():
+    if not winreg: return False
     try:
-        import winreg
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
         winreg.QueryValueEx(key, "RcloneManager")
         winreg.CloseKey(key)
@@ -59,8 +74,8 @@ def is_startup_enabled():
         return False
 
 def set_startup(enable: bool):
+    if not winreg: return "Registry access not available"
     try:
-        import winreg
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE)
         if enable:
             exe_path = f'"{sys.executable}"' if getattr(sys, 'frozen', False) else f'pythonw "{Path(__file__).resolve()}"'
@@ -155,7 +170,6 @@ def get_rclone_exe(cfg):
 active_mounts = {}
 
 def build_cmd(exe: Path, mount: dict):
-    # SyntaxError 수정: f-string 내부에서 역슬래시 제거
     raw_path = mount.get('remote_path', '').strip()
     clean_path = raw_path.replace('\\', '/').strip('/')
     remote_part = f"{mount['remote']}:{clean_path}"
@@ -603,13 +617,11 @@ class App(tk.Tk):
         self._version_check_running = True
         def task():
             try:
-                # rclone 최신 버전 확인
                 res = requests.get("https://api.github.com/repos/rclone/rclone/releases/latest", timeout=10)
                 if res.status_code == 200:
                     self._latest_rc = res.json()["tag_name"].lstrip('v')
                     self.after(0, self._check_rclone_presence)
                 
-                # 앱 최신 버전 확인
                 res = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest", timeout=10)
                 if res.status_code == 200:
                     info = res.json()
@@ -647,7 +659,6 @@ class App(tk.Tk):
     def _start_tray(self):
         if not pystray: return
         def create_image():
-            from PIL import Image, ImageDraw
             img = Image.new('RGB', (64, 64), color='#1e1e2e')
             d = ImageDraw.Draw(img)
             d.rectangle([16, 16, 48, 48], fill='#cba6f7')
@@ -658,7 +669,6 @@ class App(tk.Tk):
 
     def _update_tray_menu(self):
         if not self._tray: return
-        import pystray
         items = [pystray.MenuItem("열기", self.show_window, default=True)]
         if active_mounts:
             items.append(pystray.Menu.SEPARATOR)
@@ -666,7 +676,6 @@ class App(tk.Tk):
                 m = next((i for i in self._cfg["mounts"] if i["id"] == mid), None)
                 if m:
                     label = f"⏹ {m['drive']} {m['remote']}"
-                    # Tray 메뉴 클릭 시 해제 로직
                     items.append(pystray.MenuItem(label, (lambda m_id=mid: (lambda x: self._unmount_from_tray(m_id)))(mid)))
         items.append(pystray.Menu.SEPARATOR)
         items.append(pystray.MenuItem("종료", self._quit_app))
