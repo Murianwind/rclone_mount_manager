@@ -207,9 +207,6 @@ class UpdateDialog(tk.Toplevel):
         tk.Button(btn_f, text="취소", bg="#45475a", fg="#cdd6f4", font=("Segoe UI", 10, "bold"), relief="flat", command=self.destroy, width=15).pack(side="right", padx=5, ipady=5)
     def _ok(self): self.confirmed = True; self.destroy()
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  마운트 다이얼로그 (1.0.8 레이아웃 1:1 유지)
-# ══════════════════════════════════════════════════════════════════════════════
 class MountDialog(tk.Toplevel):
     def __init__(self, parent, mount=None, app_cfg=None):
         super().__init__(parent)
@@ -268,9 +265,6 @@ class MountDialog(tk.Toplevel):
         self.result = {"remote": rem, "drive": drv, "remote_path": pth, "cache_dir": self._cdir.get().strip(), "cache_mode": self._cmode.get(), "extra_flags": self._ext.get("1.0", tk.END).strip(), "auto_mount": self._auto.get()}
         self.destroy()
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  메인 앱 클래스
-# ══════════════════════════════════════════════════════════════════════════════
 class App(tk.Tk):
     def __init__(self):
         self._tray = None
@@ -279,7 +273,7 @@ class App(tk.Tk):
         self._cfg = load_config(); self._status = {}; self._latest_rc = ""; self._latest_app_info = None
         self._build_ui(); self._refresh_list(); self._start_tray(); self._check_versions_async()
         
-        # 요구사항 반영: 창이 활성화될 때마다 rclone 경로 확인
+        # [신규 요구사항] 프로그램 실행 또는 창이 활성화될 때마다 rclone 확인
         self.bind("<FocusIn>", lambda e: self._check_rclone_presence())
         
         if self._cfg.get("auto_mount"): self.after(1500, self._automount_all)
@@ -302,7 +296,7 @@ class App(tk.Tk):
         tk.Entry(rcf, textvariable=self._rc_var, bg="#313244", fg="#cdd6f4", relief="flat", width=60).pack(side="left", padx=10, ipady=4)
         tk.Button(rcf, text="📂", bg="#45475a", fg="#cdd6f4", relief="flat", command=self._browse_rc).pack(side="left")
         
-        # 요구사항 반영: rclone 없을 시 문구 변경 및 다운로드 기능 연결
+        # [신규 요구사항] rclone 미설치 시 'rclone 다운로드' 표시
         self._rc_ver_label = tk.Label(rcf, text="v체크 중...", bg="#1e1e2e", fg="#94e2d5", font=("Segoe UI", 10), cursor="hand2")
         self._rc_ver_label.pack(side="left", padx=15)
         self._rc_ver_label.bind("<Button-1>", self._handle_rc_click)
@@ -325,33 +319,30 @@ class App(tk.Tk):
         tk.Label(st_bar, text=f" System: {get_sys_info()}", bg="#313244", fg="#9399b2", font=("Segoe UI", 9)).pack(side="left", padx=10)
 
     def _check_rclone_presence(self):
-        """rclone 파일 존재 여부를 확인하고 UI 업데이트 (요구사항)"""
+        """[신규 요구사항] rclone 경로 재확인 및 UI 업데이트"""
         exe = get_rclone_exe(self._cfg)
         if not exe.exists():
             self._rc_ver_label.config(text="rclone 다운로드", fg="#f38ba8")
         else:
-            # 기존 기능 유지: 버전 정보가 이미 있으면 해당 정보 표시, 없으면 체크 시작
-            if not hasattr(self, '_current_rc_version') or not self._current_rc_version:
+            # 파일이 존재하면 기존 버전 체크 로직 실행 (이미 버전 정보가 있으면 유지)
+            if "v체크 중" in self._rc_ver_label.cget("text") or "다운로드" in self._rc_ver_label.cget("text"):
                 self._check_versions_async()
-            else:
-                self._rc_ver_label.config(text=f"v{self._current_rc_version}", fg="#94e2d5")
 
     def _handle_rc_click(self, event):
-        """rclone 레이블 클릭 시 동작 (요구사항)"""
+        """[신규 요구사항] 레이블 클릭 시 rclone 다운로드 또는 업데이트 체크"""
         if self._rc_ver_label.cget("text") == "rclone 다운로드":
             if not self._latest_rc:
-                messagebox.showinfo("알림", "버전 정보를 가져오는 중입니다. 잠시 후 다시 시도해주세요.")
+                messagebox.showinfo("알림", "최신 버전 정보를 가져오는 중입니다. 잠시 후 다시 시도해주세요.")
                 self._check_versions_async()
                 return
-            if messagebox.askyesno("다운로드", f"rclone v{self._latest_rc}를 다운로드하여 설치할까요?"):
+            if messagebox.askyesno("rclone 다운로드", f"설정된 경로에 rclone이 없습니다.\n최신 버전(v{self._latest_rc})을 다운로드할까요?"):
                 self._do_rc_download(self._latest_rc)
         else:
-            # 기존 기능: 버전 정보 클릭 시 업데이트 확인
+            # 기존 기능: 버전 정보 클릭 시 수동 업데이트 체크
             self._check_versions_async(manual=True)
 
     def _check_versions_async(self, manual=False):
         def run():
-            # rclone 버전 확인
             exe = get_rclone_exe(self._cfg)
             v_str = "알 수 없음"
             if exe.exists():
@@ -361,27 +352,25 @@ class App(tk.Tk):
                     if m: v_str = m.group(1)
                 except: pass
             
-            self._current_rc_version = v_str if v_str != "알 수 없음" else ""
-            
-            # rclone 최신 버전 확인 (GitHub API)
+            # rclone 최신 버전 확인
             try:
                 r = requests.get("https://api.github.com/repos/rclone/rclone/releases/latest", timeout=5)
                 if r.status_code == 200:
                     self._latest_rc = r.json().get("tag_name", "").replace("v", "")
             except: pass
 
-            # UI 업데이트
             self.after(0, lambda: self._update_ver_ui(v_str, manual))
         threading.Thread(target=run, daemon=True).start()
 
     def _update_ver_ui(self, current_v, manual):
-        # 요구사항 반영: '알 수 없음' 대신 'rclone 다운로드' 표시
+        # [신규 요구사항] 'v알 수 없음' 대신 'rclone 다운로드' 표시
         if current_v == "알 수 없음":
             self._rc_ver_label.config(text="rclone 다운로드", fg="#f38ba8")
         else:
             self._rc_ver_label.config(text=f"v{current_v}", fg="#94e2d5")
-            if self._latest_rc and current_v != "알 수 없음" and self._latest_rc > current_v:
-                if manual: messagebox.showinfo("업데이트", f"새 버전(v{self._latest_rc})을 사용할 수 있습니다. 레이블을 클릭하여 다운로드하세요.")
+            if self._latest_rc and self._latest_rc > current_v:
+                self._rc_ver_label.config(text=f"v{current_v} / v{self._latest_rc} 업데이트", fg="#fab387")
+                if manual: messagebox.showinfo("업데이트", f"새 버전(v{self._latest_rc})을 사용할 수 있습니다.")
         
         # App 업데이트 확인
         try:
@@ -402,8 +391,7 @@ class App(tk.Tk):
             self.after(0, pb.destroy)
             if res is True:
                 self._cfg["rclone_path"] = str(APP_DIR / "rclone.exe")
-                self._rc_var.set(self._cfg["rclone_path"])
-                save_config(self._cfg)
+                self._rc_var.set(self._cfg["rclone_path"]); save_config(self._cfg)
                 messagebox.showinfo("완료", "rclone 설치 완료!")
                 self._check_versions_async()
             else: messagebox.showerror("오류", f"다운로드 실패: {res}")
@@ -511,7 +499,8 @@ class App(tk.Tk):
         def create_image():
             img = Image.new('RGB', (64, 64), color="#1e1e2e")
             d = ImageDraw.Draw(img); d.ellipse([10, 10, 54, 54], fill="#cba6f7"); return img
-        menu = pystray.Menu(pystray.MenuItem("열기", self.show_window), pystray.MenuItem("종료", self.quit_app))
+        # Scenario 25 요구사항: '열기' 항목을 기본 동작(default=True)으로 설정
+        menu = pystray.Menu(pystray.MenuItem("열기", self.show_window, default=True), pystray.MenuItem("종료", self.quit_app))
         self._tray = pystray.Icon("RcloneManager", create_image(), "RcloneManager", menu)
         threading.Thread(target=self._tray.run, daemon=True).start()
 
