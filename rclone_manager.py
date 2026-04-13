@@ -46,7 +46,7 @@ def get_sys_info():
     except Exception:
         return "Resolution/Scaling info unavailable"
 
-# ── 2. 유틸리티 함수 (클래스 정의 전 선언하여 NameError 방지) ──
+# ── 2. 시작 프로그램 관련 유틸리티 (NameError 방지) ──
 def is_startup_enabled():
     """윈도우 시작 프로그램 등록 여부 확인 (Scenario 16)"""
     try:
@@ -88,9 +88,9 @@ def parse_rclone_conf(conf_path: Path):
     except Exception: pass
     return remotes
 
-# ── 3. rclone 다운로드 및 업데이트 로직 (Scenario 15) ──
+# ── 3. rclone 다운로드 및 업데이트 로직 ──
 def download_rclone(dest_dir: Path, version: str, progress_cb=None):
-    """rclone 실행 파일 다운로드 및 설치"""
+    """rclone 실행 파일 다운로드 및 설치 (Scenario 15)"""
     url = f"https://github.com/rclone/rclone/releases/download/v{version}/rclone-v{version}-windows-amd64.zip"
     try:
         r = requests.get(url, stream=True, timeout=30)
@@ -229,7 +229,7 @@ class App(tk.Tk):
                  relief="flat", font=("Segoe UI", 10), width=60).pack(side="left", padx=10, ipady=4)
         tk.Button(rcf, text="📂", bg="#45475a", fg="#cdd6f4", relief="flat", command=self._browse_rc).pack(side="left")
         
-        # rclone 버전/업데이트 레이블
+        # rclone 버전/업데이트 레이블 (클릭 이벤트 포함)
         self._rc_ver_label = tk.Label(rcf, text="rclone 버전 체크 중...", bg="#1e1e2e", fg="#94e2d5", cursor="hand2")
         self._rc_ver_label.pack(side="left", padx=15)
         self._rc_ver_label.bind("<Button-1>", self._handle_rc_click)
@@ -264,20 +264,20 @@ class App(tk.Tk):
         webbrowser.open(f"https://github.com/{GITHUB_REPO}/issues/new?body={body}")
 
     def _check_versions_async(self):
-        """rclone 및 앱 정식 버전을 비동기로 체크합니다."""
+        """rclone 및 앱의 정식 릴리스 버전을 체크합니다."""
         def _task():
-            # 1. rclone 버전 체크 및 다운로드/업데이트 안내 로직
+            # 1. rclone 버전 체크 및 업데이트 안내 로직 (사용자 요청 반영)
             exe = Path(self._rc_var.get())
             lat_rc = ""
             try:
-                # GitHub API로 rclone 공식 최신 릴리스 확인
                 res = requests.get("https://api.github.com/repos/rclone/rclone/releases/latest", timeout=5)
                 lat_rc = res.json().get("tag_name", "").lstrip("v")
                 self._latest_rc = lat_rc
             except: pass
 
             if not exe.exists():
-                msg = f"rclone 없음 (최신 v{lat_rc} 받기)" if lat_rc else "rclone 없음"
+                # 등록되지 않은 경우: 최신 버전만 표시 (받기 유도)
+                msg = f"v{lat_rc} 받기" if lat_rc else "rclone 없음"
                 self.after(0, lambda: self._rc_ver_label.config(text=msg, fg="#f38ba8"))
             else:
                 try:
@@ -286,11 +286,11 @@ class App(tk.Tk):
                     loc_rc = loc_rc_match.group(1) if loc_rc_match else "알수없음"
                     
                     if lat_rc and loc_rc < lat_rc:
-                        # 업데이트가 있는 경우: 현재/최신 표시
+                        # 업데이트가 있는 경우: 현재/최신 병기
                         self.after(0, lambda: self._rc_ver_label.config(text=f"v{loc_rc} / v{lat_rc} 업데이트", fg="#fab387"))
                     else:
                         # 업데이트가 없는 경우: 현재 버전만 표시
-                        self.after(0, lambda: self._rc_ver_label.config(text=f"v{loc_rc} (최신 버전)", fg="#94e2d5"))
+                        self.after(0, lambda: self._rc_ver_label.config(text=f"v{loc_rc}", fg="#94e2d5"))
                 except: pass
 
             # 2. 앱 정식 릴리스 업데이트 체크
@@ -467,9 +467,26 @@ class MountDialog(tk.Toplevel):
         threading.Thread(target=r, daemon=True).start()
 
     def _save(self):
+        """저장 시 중복 체크 로직 (Scenario 06, 12 대응)"""
         rem = self._rem.get().strip()
+        drv = self._drv.get().strip()
+        pth = self._pth.get().strip()
         if not rem: return messagebox.showwarning("오류", "리모트 이름 필수")
-        self.result = {"remote": rem, "drive": self._drv.get().strip(), "remote_path": self._pth.get().strip(), 
+        
+        # 기존 마운트 목록과 비교하여 중복 체크
+        for m in self._app_cfg.get("mounts", []):
+            # 현재 편집 중인 항목(동일 ID)은 제외
+            if m.get("id") == self._m.get("id"): continue
+            
+            # Scenario 06: 드라이브 문자 중복 체크
+            if drv and m.get("drive") == drv:
+                return messagebox.showerror("오류", "드라이브 문자 중복")
+            
+            # Scenario 12: 동일 리모트/경로 중복 체크
+            if m.get("remote") == rem and m.get("remote_path", "") == pth:
+                return messagebox.showerror("오류", "동일한 리모트/경로가 이미 등록되어 있습니다.")
+
+        self.result = {"remote": rem, "drive": drv, "remote_path": pth, 
                        "extra_flags": self._ext.get("1.0", tk.END).strip(), "auto_mount": self._auto.get()}
         self.destroy()
 
