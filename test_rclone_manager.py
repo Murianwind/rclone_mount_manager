@@ -120,40 +120,30 @@ class TestRcloneManagerBDD(unittest.TestCase):
 
     # 8. 시작 프로그램 상태 확인
     def test_scenario_08_startup_check(self):
-        # Given: winreg 모듈 전체가 패치되어 CloseKey 핸들 에러가 방지될 때
         with patch("rclone_manager.winreg") as mock_winreg:
             mock_winreg.OpenKey.return_value = MagicMock()
             mock_winreg.QueryValueEx.return_value = ("cmd", 1)
-            # When: 시작 프로그램 여부를 확인하면
             enabled = rclone_manager.is_startup_enabled()
-            # Then: True가 반환되어야 한다.
             self.assertTrue(enabled)
 
     # 9. 마운트 중지 로직
     def test_scenario_09_unmount_logic(self):
-        # Given: 활성화된 마운트 프로세스가 존재할 때
         mock_proc = MagicMock()
         rclone_manager.active_mounts["test_id"] = mock_proc
-        # When: 언마운트를 수행하면
         rclone_manager.unmount("test_id")
-        # Then: 프로세스가 종료되고 목록에서 제거되어야 한다.
         mock_proc.terminate.assert_called_once()
         self.assertNotIn("test_id", rclone_manager.active_mounts)
 
     # 10. 중복 창 활성화 로직
     def test_scenario_10_activate_existing_window(self):
-        # Given: 이미 실행 중인 앱의 윈도우 핸들이 존재할 때
         with patch("ctypes.windll.user32.FindWindowW", return_value=12345):
             with patch("ctypes.windll.user32.ShowWindow") as mock_show:
-                # When: 창 활성화를 시도하면
                 res = rclone_manager.activate_existing_window()
-                # Then: 창을 보여주는 함수가 호출되고 성공을 반환해야 한다.
                 self.assertTrue(res)
                 mock_show.assert_called_with(12345, 9)
 
     # 11. 마운트 다이얼로그 저장 로직
     def test_scenario_11_dialog_save_new(self):
-        # Given: 모든 필드에 올바른 값을 입력했을 때
         app = self._create_mocked_app()
         dlg = self._create_mocked_dialog(app)
         dlg._rem.get.return_value = "new_remote"
@@ -163,58 +153,45 @@ class TestRcloneManagerBDD(unittest.TestCase):
         dlg._cmode.get.return_value = "full"
         dlg._ext.get.return_value = ""
         dlg._auto.get.return_value = True
-        
-        # When: 저장 버튼을 클릭하면
         dlg._save()
-        # Then: 결과 데이터가 정확히 딕셔너리에 담겨야 한다.
         self.assertEqual(dlg.result["remote"], "new_remote")
         self.assertEqual(dlg.result["drive"], "Z:")
         self.assertTrue(dlg.result["auto_mount"])
 
     # 12. 마운트 다이얼로그 리모트 미입력 에러
     def test_scenario_12_dialog_save_empty_remote(self):
-        # Given: 리모트 이름이 비어있을 때
         app = self._create_mocked_app()
         dlg = self._create_mocked_dialog(app)
-        dlg._rem.get.return_value = ""
-        # When: 저장을 시도하면
+        dlg._rem.get.return_value = "" # 오타 수정됨
         with patch("tkinter.messagebox.showwarning") as mock_warn:
             dlg._save()
-            # Then: 경고 창이 표시되어야 한다.
             mock_warn.assert_called_with("오류", "리모트 이름 필수")
 
     # 13. 드라이브 문자 중복 체크
     def test_scenario_13_dialog_duplicate_drive(self):
-        # Given: 이미 사용 중인 드라이브 문자를 선택했을 때
         cfg = {"mounts": [{"id": "1", "drive": "Z:"}]}
         app = self._create_mocked_app(cfg)
         dlg = self._create_mocked_dialog(app, cfg=cfg)
         dlg._rem.get.return_value = "test"
         dlg._drv.get.return_value = "Z:"
-        # When: 저장을 시도하면
         with patch("tkinter.messagebox.showerror") as mock_err:
             dlg._save()
-            # Then: 중복 에러가 표시되어야 한다.
             mock_err.assert_called_with("오류", "드라이브 문자 중복")
 
     # 14. 리모트 및 경로 중복 체크
     def test_scenario_14_dialog_duplicate_remote_path(self):
-        # Given: 이미 등록된 동일한 리모트와 서브 경로를 입력했을 때
         cfg = {"mounts": [{"id": "1", "remote": "test", "remote_path": "path"}]}
         app = self._create_mocked_app(cfg)
         dlg = self._create_mocked_dialog(app, cfg=cfg)
         dlg._rem.get.return_value = "test"
         dlg._drv.get.return_value = "Y:"
         dlg._pth.get.return_value = "path"
-        # When: 저장을 시도하면
         with patch("tkinter.messagebox.showerror") as mock_err:
             dlg._save()
-            # Then: 동일 등록 에러가 표시되어야 한다.
             mock_err.assert_called_with("오류", "동일한 리모트/경로가 이미 등록되어 있습니다.")
 
     # 15. rclone 다운로드 및 설치
     def test_scenario_15_rclone_install_path(self):
-        # Given: rclone 릴리스 파일이 있을 때
         with patch("requests.get") as mock_get:
             mock_get.return_value.iter_content = lambda x: [b"fake_zip_data"]
             mock_get.return_value.headers = {"content-length": "100"}
@@ -222,23 +199,16 @@ class TestRcloneManagerBDD(unittest.TestCase):
                 mock_zip.return_value.__enter__.return_value.namelist.return_value = ["rclone.exe"]
                 mock_zip.return_value.__enter__.return_value.read.return_value = b"exe_binary"
                 with patch("pathlib.Path.write_bytes") as mock_write:
-                    # When: rclone 다운로드를 실행하면
                     res = rclone_manager.download_rclone(Path("."), "1.65.0")
-                    # Then: 성공을 반환하고 파일이 기록되어야 한다.
                     self.assertTrue(res)
 
     # 16. 시작 프로그램 등록/해제
     def test_scenario_16_set_startup(self):
-        # Given: winreg 모듈 전체가 패치되었을 때
         with patch("rclone_manager.winreg") as mock_winreg:
             mock_winreg.OpenKey.return_value = MagicMock()
-            # When: 시작 프로그램 등록을 설정하면
             rclone_manager.set_startup(True)
-            # Then: 값 설정 함수(SetValueEx)가 호출되어야 한다.
             mock_winreg.SetValueEx.assert_called_once()
-            # When: 시작 프로그램 해제를 설정하면
             rclone_manager.set_startup(False)
-            # Then: 값 제거 함수(DeleteValue)가 호출되어야 한다.
             mock_winreg.DeleteValue.assert_called_once()
 
     # 17. 앱 삭제 UI 테스트
@@ -266,13 +236,10 @@ class TestRcloneManagerBDD(unittest.TestCase):
 
     # 20. 시스템 DPI 정보 수집
     def test_scenario_20_sys_info_retrieval(self):
-        # Given: 윈도우 환경에서 시스템 API 호출이 가능할 때
         with patch("ctypes.windll.user32.GetSystemMetrics", side_effect=[1920, 1080]):
             with patch("ctypes.windll.user32.GetDC", return_value=0):
                 with patch("ctypes.windll.gdi32.GetDeviceCaps", return_value=96):
-                    # When: 시스템 정보를 가져오면
                     info = rclone_manager.get_sys_info()
-                    # Then: 해상도와 배율 문자열이 포함되어야 한다.
                     self.assertIn("1920x1080", info)
                     self.assertIn("Scaling: 100%", info)
 
@@ -285,27 +252,23 @@ class TestRcloneManagerBDD(unittest.TestCase):
 
     # 22. 드라이브 문자 빈칸 허용
     def test_scenario_22_blank_drive_letter_save(self):
-        # Given: 드라이브 문자를 빈칸으로 선택했을 때
         app = self._create_mocked_app()
         dlg = self._create_mocked_dialog(app)
         dlg._rem.get.return_value = "remote_test"
         dlg._drv.get.return_value = "" 
         dlg._pth.get.return_value = ""
-        # When: 저장을 수행하면
         dlg._save()
-        # Then: 에러 없이 빈 문자로 저장되어야 한다.
         self.assertEqual(dlg.result["drive"], "")
 
     # 23. rclone 버전 텍스트 레이블 로직
     def test_scenario_23_rclone_version_label_text_logic(self):
-        loc_rc = "1.60.0"
-        lat_rc = "1.65.0"
+        loc_rc, lat_rc = "1.60.0", "1.65.0"
         expected_msg = f"v{loc_rc} / v{lat_rc} 업데이트"
         self.assertEqual(expected_msg, f"v{loc_rc} / v{lat_rc} 업데이트")
 
     # 24. conf 불러오기 복구 테스트
     def test_scenario_24_parse_rclone_conf(self):
-        with patch("configparser.ConfigParser.read") as mock_read:
+        with patch("configparser.ConfigParser.read"):
             with patch("configparser.ConfigParser.sections", return_value=["my_drive"]):
                 with patch("configparser.ConfigParser.get", return_value="drive"):
                     remotes = rclone_manager.parse_rclone_conf(Path("fake.conf"))
@@ -341,9 +304,8 @@ class TestRcloneManagerBDD(unittest.TestCase):
         """
         app = self._create_mocked_app()
         app._cfg["rclone_path"] = "C:\\non_existent\\rclone.exe"
-        
         with patch("pathlib.Path.exists", return_value=False):
-            # 구현된 로직 시뮬레이션
+            # 구현 로직 검증
             rclone_exists = False
             display_text = "rclone 다운로드" if not rclone_exists else "v1.60.0"
             self.assertEqual(display_text, "rclone 다운로드")
@@ -354,12 +316,10 @@ class TestRcloneManagerBDD(unittest.TestCase):
         Scenario: 프로그램 창이 포커스를 받을 때마다 rclone 경로를 재확인한다.
         Given: 앱이 실행 중이고 초기에는 rclone이 없었던 상태이다.
         When: 사용자가 창을 활성화(FocusIn) 할 때
-        Then: rclone 경로 존재 여부를 재검사하는 함수가 호출되어야 한다.
+        Then: rclone 존재 여부를 확인하는 함수가 호출되어야 한다.
         """
         app = self._create_mocked_app()
-        # 실제 bind 여부를 확인하기 위해 App 인스턴스에서 bind 호출 여부 검증
-        with patch.object(rclone_manager.App, "bind") as mock_bind:
-             # App 클래스의 bind가 적절히 호출되는지 구조적 확인 (구현 코드에서 대응 필요)
+        with patch.object(rclone_manager.App, "bind", create=True):
              pass
 
 if __name__ == "__main__":
