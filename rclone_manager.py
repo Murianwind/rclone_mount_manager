@@ -21,6 +21,7 @@ import urllib.parse
 from pathlib import Path
 import ctypes
 
+# 테스트 환경 대응용 모듈 관리
 try:
     import winreg
 except ImportError:
@@ -271,20 +272,19 @@ class App(tk.Tk):
         self._cfg = load_config(); self._status = {}; self._latest_rc = ""; self._latest_app_info = None
         self._build_ui(); self._refresh_list(); self._start_tray(); self._check_versions_async()
         
-        # [Scenario 29] 창 활성화 시 재확인
+        # [Scenario 29] 창 활성화 시 재확인 바인딩
         self.bind("<FocusIn>", self._on_focus_in)
         
         if self._cfg.get("auto_mount"): self.after(1500, self._automount_all)
 
     def _build_ui(self):
-        """image_abe4d4.png 레이아웃 (5개 컬럼, 하단 8개 버튼) 완벽 복구"""
+        """image_abe4d4.png 레이아웃 (5개 컬럼, 하단 8개 버튼) 100% 복구"""
         s = ttk.Style(self); s.theme_use("clam")
         s.configure("TFrame", background="#1e1e2e"); s.configure("TLabel", background="#1e1e2e", foreground="#cdd6f4", font=("Segoe UI", 10))
         s.configure("Header.TLabel", font=("Segoe UI", 16, "bold"), foreground="#cba6f7")
         s.configure("Treeview", background="#313244", foreground="#cdd6f4", fieldbackground="#313244", rowheight=30)
         s.configure("Treeview.Heading", background="#45475a", foreground="#cba6f7", font=("Segoe UI", 11, "bold"))
         
-        # 헤더
         hdr = ttk.Frame(self); hdr.pack(fill="x", padx=20, pady=15)
         ttl_f = ttk.Frame(hdr); ttl_f.pack(side="left")
         ttk.Label(ttl_f, text="🚀 RcloneManager", style="Header.TLabel").pack(side="left")
@@ -292,29 +292,27 @@ class App(tk.Tk):
         tk.Button(ttl_f, text="!", bg="#f38ba8", fg="#1e1e2e", font=("Segoe UI", 9, "bold"), relief="flat", width=2, command=self._open_issue).pack(side="left", padx=5, pady=(5,0))
         self._app_up_btn = tk.Button(hdr, text="✨ 새 버전 업데이트 가능", bg="#a6e3a1", fg="#1e1e2e", font=("Segoe UI", 9, "bold"), relief="flat", command=self._show_app_update_confirm)
         
-        # rclone 경로
         rcf = tk.Frame(self, bg="#1e1e2e"); rcf.pack(fill="x", padx=20, pady=5)
         tk.Label(rcf, text="rclone 경로:", bg="#1e1e2e", fg="#cba6f7", font=("Segoe UI", 10, "bold")).pack(side="left")
         self._rc_var = tk.StringVar(value=self._cfg.get("rclone_path", ""))
         tk.Entry(rcf, textvariable=self._rc_var, bg="#313244", fg="#cdd6f4", relief="flat", width=60).pack(side="left", padx=10, ipady=4)
         tk.Button(rcf, text="📂", bg="#45475a", fg="#cdd6f4", relief="flat", command=self._browse_rc).pack(side="left")
         
-        # rclone 버전/안내 (Scenario 28)
+        # [Scenario 28] rclone 상태 표시 레이블
         self._rc_ver_label = tk.Label(rcf, text="v체크 중...", bg="#1e1e2e", fg="#94e2d5", font=("Segoe UI", 10), cursor="hand2")
         self._rc_ver_label.pack(side="left", padx=15)
         self._rc_ver_label.bind("<Button-1>", self._handle_rc_click)
         
-        # 시작 옵션
         opt = tk.Frame(self, bg="#1e1e2e"); opt.pack(fill="x", padx=20, pady=10)
         self._st_var = tk.BooleanVar(value=is_startup_enabled()); ttk.Checkbutton(opt, text="시작 시 자동 실행", variable=self._st_var, command=self._toggle_st).pack(side="left", padx=(0, 25))
         self._am_var = tk.BooleanVar(value=self._cfg.get("auto_mount", False)); ttk.Checkbutton(opt, text="시작 시 자동 마운트", variable=self._am_var, command=self._toggle_am).pack(side="left")
         
-        # 메인 리스트 (5개 컬럼)
+        # 5개 컬럼 (원본 image_abe4d4와 동일)
         cols = ("type", "auto", "drive", "remote", "status"); self._tree = ttk.Treeview(self, columns=cols, show="headings", height=14)
         for col, head in zip(cols, ("구분", "자동", "드라이브", "리모트 (서브경로)", "상태")): self._tree.heading(col, text=head)
         self._tree.pack(fill="both", expand=True, padx=20, pady=5); self._tree.tag_configure("remote_tag", foreground="#8fa0b5")
         
-        # 하단 버튼 (8개 버튼 구성)
+        # 하단 8개 버튼 (원본 image_abe4d4와 동일)
         btn_f = ttk.Frame(self); btn_f.pack(fill="x", padx=20, pady=15)
         ttk.Button(btn_f, text="➕ 추가", command=self._add).pack(side="left", padx=2)
         ttk.Button(btn_f, text="✏️ 편집", command=self._edit).pack(side="left", padx=2)
@@ -329,11 +327,11 @@ class App(tk.Tk):
         tk.Label(st_bar, text=f" System: {get_sys_info()}", bg="#313244", fg="#9399b2", font=("Segoe UI", 9)).pack(side="left", padx=10)
 
     def _open_issue(self):
-        """(Scenario 21) 이슈 제보"""
-        body = urllib.parse.quote(f"\n\n--- Debug Info ---\n- App Version: {APP_VERSION}\n- {get_sys_info()}"); webbrowser.open(f"https://github.com/{GITHUB_REPO}/issues/new?body={body}")
+        """(Scenario 21) 이슈 제보 페이지"""
+        body = urllib.parse.quote(f"\n\n--- Debug Info ---\n- App Version: {APP_VERSION}\n- {get_sys_info()} text"); webbrowser.open(f"https://github.com/{GITHUB_REPO}/issues/new?body={body}")
 
     def _check_rclone_presence(self):
-        """[Scenario 28] rclone 실행 파일 확인"""
+        """[Scenario 28] rclone 파일 확인 및 문구 변경"""
         exe = Path(self._rc_var.get())
         if not exe.exists():
             self._rc_ver_label.config(text="rclone 다운로드", fg="#f38ba8")
@@ -341,7 +339,7 @@ class App(tk.Tk):
             self._check_versions_async()
 
     def _on_focus_in(self, event):
-        """[Scenario 29] 창 활성화 이벤트"""
+        """[Scenario 29] 창 활성화 시 핸들러"""
         self._check_rclone_presence()
 
     def _check_versions_async(self, manual=False):
@@ -353,7 +351,7 @@ class App(tk.Tk):
             if not exe.exists(): self.after(0, lambda: self._rc_ver_label.config(text="rclone 다운로드", fg="#f38ba8"))
             else:
                 try:
-                    r = subprocess.run([str(exe), "version"], capture_output=True, text=True, timeout=5); loc_match = re.search(r"rclone v([\d.]+)", r.stdout); loc_rc = loc_match.group(1) if loc_match else "알 수 없음"
+                    r = subprocess.run([str(exe), "version"], capture_output=True, text=True, timeout=5, creationflags=0x08000000); loc_match = re.search(r"rclone v([\d.]+)", r.stdout); loc_rc = loc_match.group(1) if loc_match else "알 수 없음"
                     if lat_rc and loc_rc < lat_rc: self.after(0, lambda: self._rc_ver_label.config(text=f"v{loc_rc} / v{lat_rc} 업데이트", fg="#fab387"))
                     else: self.after(0, lambda: self._rc_ver_label.config(text=f"v{loc_rc} (최신)", fg="#94e2d5"))
                 except: self.after(0, lambda: self._rc_ver_label.config(text="v알 수 없음", fg="#f38ba8"))
@@ -362,6 +360,12 @@ class App(tk.Tk):
                 if latest_app > APP_VERSION: self.after(0, lambda: self._app_up_btn.pack(side="right"))
             except: pass
         threading.Thread(target=_task, daemon=True).start()
+
+    def _show_app_update_confirm(self):
+        """업데이트 확인 다이얼로그 호출 (AttributeError 수정)"""
+        if self._latest_app_info:
+            tag = self._latest_app_info.get("tag_name", "New Version"); body = self._latest_app_info.get("body", "No release notes."); dlg = UpdateDialog(self, tag, body); self.wait_window(dlg)
+            if dlg.confirmed: webbrowser.open(f"https://github.com/{GITHUB_REPO}/releases/latest")
 
     def _handle_rc_click(self, event):
         text = self._rc_ver_label.cget("text")
@@ -384,7 +388,7 @@ class App(tk.Tk):
     def _toggle_st(self): set_startup(self._st_var.get())
     def _toggle_am(self): self._save_settings()
 
-    # [Scenario 19] 테스트 대응
+    # [Scenario 19] 테스트 호환 메서드
     def _save_settings(self):
         self._cfg["auto_mount"] = self._am_var.get(); save_config(self._cfg)
 
@@ -422,7 +426,7 @@ class App(tk.Tk):
             return
         self._delete_mount(sel[0])
 
-    # [Scenario 17] 테스트 대응
+    # [Scenario 17] 테스트 호환 메서드
     def _delete_mount(self, mid):
         if messagebox.askyesno("삭제", "선택한 항목을 삭제할까요?"): unmount(mid); self._cfg["mounts"] = [m for m in self._cfg["mounts"] if m["id"] != mid]; save_config(self._cfg); self._refresh_list()
 
@@ -451,7 +455,7 @@ class App(tk.Tk):
         if not sel or sel[0].startswith("remote_") or sel[0] in active_mounts: return
         self._mount_single(sel[0])
 
-    # [Scenario 18] 테스트 대응
+    # [Scenario 18] 테스트 호환 메서드
     def _mount_single(self, mid):
         m = next(m for m in self._cfg["mounts"] if m["id"] == mid); self._do_mount(mid, m)
 
