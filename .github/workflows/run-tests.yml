@@ -25,17 +25,16 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # 커버리지 측정을 위해 pytest-cov 설치 필수
+          # requirements.txt에 없는 pytest-cov를 여기서 명시적으로 설치합니다.
           pip install pytest pytest-asyncio pytest-cov requests pystray Pillow
 
       - name: Run Tests
         shell: bash
         run: |
           set +e
-          # --cov=rclone_manager --cov-branch 옵션을 통해 분기 커버리지 데이터 생성
+          # pytest.ini의 --cov-branch 설정을 활성화하기 위해 --cov 옵션을 추가합니다.
           python -m pytest test_rclone_manager.py \
             --cov=rclone_manager \
-            --cov-branch \
             --cov-report=term-missing \
             --no-header \
             --tb=short \
@@ -51,10 +50,10 @@ jobs:
         if: always()
         shell: bash
         run: |
-          # 1. 요약 데이터 추출
+          # 1. 기초 데이터 추출
           SUMMARY_LINE=$(grep -E "[0-9]+ (passed|failed|error)" pytest-output.txt | tail -1 || true)
-          # 커버리지 결과 라인 추출 (Stmts, Miss, Branch, BrPart, Cover 순서)
-          COV_DATA=$(grep "rclone_manager.py" pytest-output.txt | head -1)
+          # rclone_manager.py 행 데이터 파싱 (Stmts Miss Branch BrPart Cover Missing 순서)
+          RAW_DATA=$(grep "rclone_manager.py" pytest-output.txt | head -1)
           TOTAL_DATA=$(grep "TOTAL" pytest-output.txt | tail -1)
 
           # ── 헤더 + 요약 ──────────────────────────────────────────────────
@@ -72,9 +71,8 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| 파일 경로 | 전체 라인 수 | 실행 가능 구문 | 실행 안 됨 | 구문 커버리지(%) | 누락된 구문 라인 |" >> $GITHUB_STEP_SUMMARY
           echo "|:---|---:|---:|---:|---:|:---| " >> $GITHUB_STEP_SUMMARY
-          
-          # awk를 이용해 rclone_manager.py 행의 $1(파일명), $2(Stmts), $3(Miss) 등 매핑
-          echo "$COV_DATA" | awk '{print "| " $1 " | 479 | " $2 " | " $3 " | **" $4 "%** | " $7 " |"}' >> $GITHUB_STEP_SUMMARY
+          # RAW_DATA에서 $2(Stmts), $3(Miss), $7(Missing lines) 사용
+          echo "$RAW_DATA" | awk '{printf "| %s | 479 | %s | %s | **%.1f%%** | %s |\n", $1, $2, $3, (($2-$3)/$2)*100, $7}' >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           # ── 🌿 2. 분기 커버리지 상세 (Branch Coverage) ───────────────────
@@ -82,21 +80,17 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| 파일 경로 | 전체 분기 수 | 실행된 분기 | 실행 안 됨 | 분기 커버리지(%) | 누락된 분기 (화살표) |" >> $GITHUB_STEP_SUMMARY
           echo "|:---|---:|---:|---:|---:|:---| " >> $GITHUB_STEP_SUMMARY
-          
-          # 분기 데이터($4=Branch, $5=BrPart) 매핑
-          echo "$COV_DATA" | awk '{print "| " $1 " | " $4 " | " $4-$5 " | " $5 " | **" $6 "** | " $7 " |"}' >> $GITHUB_STEP_SUMMARY
+          # $4(Branch), $5(BrPart)를 이용해 계산
+          echo "$RAW_DATA" | awk '{printf "| %s | %s | %s | %s | **%s** | %s |\n", $1, $4, ($4-$5), $5, $6, $7}' >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           # ── 📈 최종 커버리지 요약 ─────────────────────────────────────────
           echo "### 📈 최종 커버리지 요약" >> $GITHUB_STEP_SUMMARY
           echo "| 측정 방식 | 커버리지율 | 상세 수치 (성공/전체) |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|---| " >> $GITHUB_STEP_SUMMARY
-          
-          STMT_PERCENT=$(echo "$TOTAL_DATA" | awk '{print $4}')
-          BRANCH_PERCENT=$(echo "$TOTAL_DATA" | awk '{print $6}')
-          
-          echo "| **구문(Statement)** | **$STMT_PERCENT** | $(echo "$TOTAL_DATA" | awk '{print $2-$3 "/" $2}') |" >> $GITHUB_STEP_SUMMARY
-          echo "| **분기(Branch)** | **$BRANCH_PERCENT** | $(echo "$TOTAL_DATA" | awk '{print $4-$5 "/" $4}') |" >> $GITHUB_STEP_SUMMARY
+          # 종합 통계 출력 (pytest-cov의 TOTAL 라인 활용)
+          echo "$TOTAL_DATA" | awk '{printf "| **구문(Statement)** | **%.2f%%** | %d / %d |\n", (($2-$3)/$2)*100, ($2-$3), $2}' >> $GITHUB_STEP_SUMMARY
+          echo "$TOTAL_DATA" | awk '{printf "| **분기(Branch)** | **%s** | %d / %d |\n", $6, ($4-$5), $4}' >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           # ── 실행된 테스트 전체 목록 (기존 형식 유지) ───────────────────────
@@ -104,18 +98,12 @@ jobs:
           echo "<summary>📋 실행된 테스트 전체 목록 (클릭하여 펼치기)</summary>" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          grep "::" pytest-output.txt \
-            | sed 's/  *\[[ 0-9]*%\]$//' \
-            | sed 's/ PASSED$/  ✓/' \
-            | sed 's/ FAILED$/  ✗  ← FAILED/' \
-            | sed 's/ ERROR$/  !  ← ERROR/' \
-            | sed 's/ SKIPPED$/  (skipped)/' \
-            >> $GITHUB_STEP_SUMMARY || echo "(없음)" >> $GITHUB_STEP_SUMMARY
+          grep "::" pytest-output.txt | sed 's/  *\[[ 0-9]*%\]$//; s/ PASSED$/  ✓/; s/ FAILED$/  ✗  ← FAILED/; s/ ERROR$/  !  ← ERROR/; s/ SKIPPED$/  (skipped)/' >> $GITHUB_STEP_SUMMARY || echo "(없음)" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "</details>" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          # ── 실패 상세 (기존 로직 유지) ───────────────────────────────────
+          # ── 실패 상세 및 원인 분류 (기존 로직 유지) ───────────────────────
           FAIL_COUNT=$(grep -cE "^(FAILED|ERROR) " pytest-output.txt 2>/dev/null || echo 0)
           if [ "$FAIL_COUNT" -gt "0" ]; then
             echo "---" >> $GITHUB_STEP_SUMMARY
@@ -129,5 +117,13 @@ jobs:
             echo "**Traceback:**" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
             awk '/^_{5,}/ { in_fail=1; print ""; print; next } in_fail && /^={5,}/ { in_fail=0; next } in_fail { print }' pytest-output.txt >> $GITHUB_STEP_SUMMARY || true
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**원인 분류:**" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            SRC=$(grep -oE "rclone_manager\.py:[0-9]+" pytest-output.txt | sort -u || true)
+            TEST=$(grep -oE "test_rclone_manager\.py:[0-9]+" pytest-output.txt | sort -u || true)
+            if [ -n "$SRC" ]; then echo "📦 소스 코드 문제 (rclone_manager.py):\n$SRC\n  → 실제 앱 로직 버그일 가능성이 큽니다." >> $GITHUB_STEP_SUMMARY; fi
+            if [ -n "$TEST" ]; then echo "🧪 테스트 코드 문제 (test_rclone_manager.py):\n$TEST\n  → 테스트 케이스나 Mock 설정 문제일 가능성이 큽니다." >> $GITHUB_STEP_SUMMARY; fi
             echo '```' >> $GITHUB_STEP_SUMMARY
           fi
