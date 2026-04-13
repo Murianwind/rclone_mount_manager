@@ -267,8 +267,9 @@ class App(tk.Tk):
         self._start_tray()
         self._check_versions_async()
         
-        # [신규 요구사항] 창이 활성화될 때마다 rclone 확인 (테스트 환경에서는 바인딩 방지)
-        if "pytest" not in sys.modules and "unittest" not in sys.modules:
+        # [신규 요구사항] 창이 활성화될 때마다 rclone 확인 (테스트 환경에서는 데드락 방지를 위해 건너뜀)
+        is_testing = 'unittest' in sys.modules or 'pytest' in sys.modules
+        if not is_testing:
             self.bind("<FocusIn>", lambda e: self._check_rclone_presence())
         
         if self._cfg.get("auto_mount"): self.after(1500, self._automount_all)
