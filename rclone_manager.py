@@ -22,19 +22,18 @@ from pathlib import Path
 import ctypes
 
 # ── 프로그램 설정 ──
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.0.6"
 GITHUB_REPO = "Murianwind/rclone_mount_manager"
 
 # ── 1. 고해상도(DPI) 대응 및 시스템 정보 수집 ──
 try:
-    # Windows 10 이상에서 고해상도 배율을 제대로 인식하도록 설정
     ctypes.windll.shcore.SetProcessDpiAwareness(1)
     ctypes.windll.user32.SetProcessDPIAware()
 except Exception:
     pass
 
 def get_sys_info():
-    """사용자의 해상도 및 배율 정보를 문자열로 반환합니다. (이슈 등록 시 사용)"""
+    """사용자의 해상도 및 배율 정보를 문자열로 반환합니다. (이슈 등록 시 활용)"""
     try:
         user32 = ctypes.windll.user32
         w = user32.GetSystemMetrics(0)
@@ -47,9 +46,9 @@ def get_sys_info():
     except Exception:
         return "Resolution/Scaling info unavailable"
 
-# ── 2. 시작 프로그램 관련 함수 (NameError 해결을 위해 클래스보다 먼저 정의) ──
+# ── 2. 시작 프로그램 및 유틸리티 함수 (클래스 정의 전 선언하여 NameError 방지) ──
 def is_startup_enabled():
-    """윈도우 시작 프로그램 등록 여부를 확인합니다."""
+    """윈도우 시작 프로그램 등록 여부 확인 (Scenario 16)"""
     try:
         import winreg
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
@@ -60,12 +59,11 @@ def is_startup_enabled():
         return False
 
 def set_startup(enable: bool):
-    """윈도우 시작 프로그램에 등록하거나 해제합니다."""
+    """윈도우 시작 프로그램 등록/해제 (Scenario 16)"""
     try:
         import winreg
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE)
         if enable:
-            # frozen 상태(exe)일 때는 exe 경로를, 아닐 때는 pythonw 경로를 등록
             if getattr(sys, 'frozen', False):
                 exe_path = f'"{sys.executable}"'
             else:
@@ -81,7 +79,19 @@ def set_startup(enable: bool):
     except Exception as e:
         return str(e)
 
-# ── 3. 경로 및 설정 로드 ──
+def parse_rclone_conf(conf_path: Path):
+    """rclone.conf 파일을 파싱하여 리모트 목록을 반환합니다. (Scenario 2 해결)"""
+    remotes = []
+    try:
+        cfg = configparser.ConfigParser()
+        cfg.read(str(conf_path), encoding="utf-8")
+        for section in cfg.sections():
+            remotes.append({"name": section, "type": cfg.get(section, "type", fallback="")})
+    except Exception:
+        pass
+    return remotes
+
+# ── 3. 설정 및 경로 관리 ──
 if getattr(sys, 'frozen', False):
     APP_DIR = Path(sys.executable).parent
 else:
@@ -105,29 +115,30 @@ def save_config(cfg):
     CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
 def get_rclone_exe(cfg):
-    """설정된 rclone 실행 파일 경로를 반환합니다."""
+    """설정된 rclone 경로 반환 (Scenario 1)"""
     custom = cfg.get("rclone_path", "").strip()
     if custom and Path(custom).exists():
         return Path(custom)
     return APP_DIR / "rclone.exe"
 
-# ── 4. 마운트 실행 관련 유틸리티 ──
+# ── 4. 마운트 명령어 및 종료 ──
 active_mounts = {}
 
 def build_cmd(rclone_exe: Path, mount: dict):
-    """rclone mount 명령어를 생성합니다."""
+    """마운트 명령어 빌드 (Scenario 7)"""
     rpath = mount.get("remote_path", "").strip().replace("\\", "/").strip("/")
     cmd = [str(rclone_exe), "mount", f"{mount['remote']}:{rpath}", mount["drive"], "--volname", mount.get("label") or mount["remote"]]
     if mount.get("cache_dir"): cmd += ["--cache-dir", mount["cache_dir"]]
     if mount.get("cache_mode"): cmd += ["--vfs-cache-mode", mount["cache_mode"]]
     extra = mount.get("extra_flags", "").strip()
     if extra:
+        # 세미콜론이나 공백으로 구분된 플래그 처리
         for f in re.split(r"[\s;]+", extra):
             if f.strip(): cmd.append(f.strip())
     return cmd
 
 def unmount(m_id):
-    """실행 중인 마운트 프로세스를 종료합니다."""
+    """마운트 해제 (Scenario 14)"""
     p = active_mounts.get(m_id)
     if p:
         p.terminate()
@@ -138,10 +149,10 @@ def unmount(m_id):
         active_mounts.pop(m_id, None)
 
 def activate_existing_window():
-    """이미 실행 중인 인스턴스가 있다면 해당 창을 활성화합니다."""
+    """중복 실행 방지 (Scenario 19)"""
     hwnd = ctypes.windll.user32.FindWindowW(None, "RcloneManager")
     if hwnd:
-        ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        ctypes.windll.user32.ShowWindow(hwnd, 9)
         ctypes.windll.user32.SetForegroundWindow(hwnd)
         return True
     return False
@@ -151,13 +162,11 @@ def activate_existing_window():
 # ══════════════════════════════════════════════════════════════════════════════
 class App(tk.Tk):
     def __init__(self):
-        # RecursionError 방지: Tk 객체 생성 전/직후 초기화
         self._tray = None 
         super().__init__()
         
         self.title("RcloneManager")
-        # 메인 창 크기 확대 (요청 사항 반영)
-        self.geometry("1150x850")
+        self.geometry("1150x850") # 요청하신 확대된 창 크기
         self.minsize(1050, 750)
         self.protocol("WM_DELETE_WINDOW", self.hide_window)
         
@@ -170,7 +179,6 @@ class App(tk.Tk):
         self._start_tray()
         self._check_versions_async()
         
-        # 시작 시 자동 마운트 로직
         if self._cfg.get("auto_mount"):
             self.after(1500, self._automount_all)
 
@@ -185,26 +193,24 @@ class App(tk.Tk):
         s.configure("Treeview", background="#313244", foreground="#cdd6f4", fieldbackground="#313244", rowheight=32)
         s.configure("Treeview.Heading", background="#45475a", foreground="#cba6f7", font=("Segoe UI", 11, "bold"))
 
-        # ── 1. 상단 헤더 (프로그램 버전 및 이슈 등록 버튼) ──
+        # ── 헤더 (버전 및 이슈 등록 버튼) ──
         hdr = ttk.Frame(self)
         hdr.pack(fill="x", padx=20, pady=15)
         
         ttl_f = ttk.Frame(hdr)
         ttl_f.pack(side="left")
         ttk.Label(ttl_f, text="🚀 RcloneManager", style="Header.TLabel").pack(side="left")
-        
-        # 프로그램 버전 표기
         ttk.Label(ttl_f, text=f" v{APP_VERSION}", style="AppVer.TLabel").pack(side="left", padx=(8, 0), pady=(5, 0))
         
-        # 이슈 등록 버튼 (!)
+        # 이슈 버튼 (!)
         tk.Button(ttl_f, text="!", bg="#f38ba8", fg="#1e1e2e", font=("Segoe UI", 9, "bold"), 
                   relief="flat", width=2, command=self._open_issue_report).pack(side="left", padx=12, pady=(5, 0))
 
-        # 앱 업데이트 버튼 (업데이트가 있을 때만 노출)
+        # 업데이트 버튼
         self._app_up_btn = tk.Button(hdr, text="✨ 새 버전 업데이트 가능", bg="#a6e3a1", fg="#1e1e2e", 
                                      font=("Segoe UI", 9, "bold"), relief="flat", command=self._manual_app_update)
 
-        # ── 2. Rclone 경로 및 버전 정보 (배치 수정) ──
+        # ── Rclone 경로 및 버전 정보 ──
         rcf = tk.Frame(self, bg="#1e1e2e")
         rcf.pack(fill="x", padx=20, pady=5)
         
@@ -215,11 +221,11 @@ class App(tk.Tk):
         
         tk.Button(rcf, text="📂", bg="#45475a", fg="#cdd6f4", relief="flat", command=self._browse_rc).pack(side="left")
         
-        # rclone 버전 정보 (경로 입력창 옆으로 이동)
+        # rclone 버전 정보 (경로 옆으로 배치)
         self._rc_ver_label = ttk.Label(rcf, text="rclone 버전 체크 중...", foreground="#94e2d5")
         self._rc_ver_label.pack(side="left", padx=20)
 
-        # ── 3. 설정 옵션 ──
+        # ── 옵션 ──
         opt = tk.Frame(self, bg="#1e1e2e")
         opt.pack(fill="x", padx=20, pady=10)
         self._st_var = tk.BooleanVar(value=is_startup_enabled())
@@ -227,20 +233,14 @@ class App(tk.Tk):
         self._am_var = tk.BooleanVar(value=self._cfg.get("auto_mount", False))
         ttk.Checkbutton(opt, text="시작 시 자동 마운트", variable=self._am_var, command=self._toggle_am).pack(side="left")
 
-        # ── 4. 마운트 리스트 (Treeview) ──
+        # ── 목록 (Treeview) ──
         cols = ("type", "auto", "drive", "remote", "status")
         self._tree = ttk.Treeview(self, columns=cols, show="headings", height=18)
         for col, head in zip(cols, ("구분", "자동", "드라이브", "리모트 (서브경로)", "상태")):
             self._tree.heading(col, text=head)
-        
-        self._tree.column("type", width=130, anchor="center")
-        self._tree.column("auto", width=80, anchor="center")
-        self._tree.column("drive", width=100, anchor="center")
-        self._tree.column("remote", width=550)
-        self._tree.column("status", width=140, anchor="center")
         self._tree.pack(fill="both", expand=True, padx=20, pady=5)
 
-        # ── 5. 하단 제어 버튼 ──
+        # ── 하단 버튼 ──
         btn_f = ttk.Frame(self)
         btn_f.pack(fill="x", padx=20, pady=15)
         ttk.Button(btn_f, text="➕ 추가", command=self._add).pack(side="left", padx=2)
@@ -248,7 +248,6 @@ class App(tk.Tk):
         ttk.Button(btn_f, text="🗑️ 삭제", command=self._del).pack(side="left", padx=2)
         ttk.Button(btn_f, text="🔼", width=4, command=self._move_up).pack(side="left", padx=2)
         ttk.Button(btn_f, text="🔽", width=4, command=self._move_down).pack(side="left", padx=2)
-        
         ttk.Button(btn_f, text="▶ 마운트", command=self._mount_sel).pack(side="left", padx=15)
         ttk.Button(btn_f, text="■ 언마운트", command=self._unmount_sel).pack(side="left")
         
@@ -256,42 +255,35 @@ class App(tk.Tk):
         self._sbar.pack(fill="x", padx=20, pady=(0, 15))
 
     def _open_issue_report(self):
-        """GitHub 이슈 창을 열고 해상도 및 배율 정보를 자동으로 본문에 포함합니다."""
+        """이슈 등록 시 해상도와 배율 정보를 본문에 포함하여 브라우저를 엽니다. (Scenario 20)"""
         info = get_sys_info()
         body = f"\n\n--- Debug Info ---\n- App Version: {APP_VERSION}\n- {info}"
         url = f"https://github.com/{GITHUB_REPO}/issues/new?body=" + urllib.parse.quote(body)
         webbrowser.open(url)
 
     def _check_versions_async(self):
-        """rclone 및 앱 버전을 비동기로 체크합니다."""
         def _task():
-            # 1. rclone 버전 체크
+            # rclone 체크
             exe = Path(self._rc_var.get())
             if exe.exists():
                 try:
                     r = subprocess.run([str(exe), "version"], capture_output=True, text=True, timeout=5)
                     m = re.search(r"rclone v([\d.]+)", r.stdout)
                     local_rc = m.group(1) if m else "Error"
-                    
                     res = requests.get("https://api.github.com/repos/rclone/rclone/releases/latest", timeout=5)
                     latest_rc = res.json().get("tag_name", "").lstrip("v")
                     self.after(0, lambda: self._rc_ver_label.config(text=f"rclone: v{local_rc} (최신: v{latest_rc})"))
-                except Exception:
-                    pass
-
-            # 2. 앱 업데이트 체크 (실제 릴리스 태그와 비교)
+                except Exception: pass
+            # 앱 업데이트 체크
             try:
                 res = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest", timeout=5)
                 latest_app = res.json().get("tag_name", "").lstrip("v")
                 if latest_app != APP_VERSION:
                     self.after(0, lambda: self._app_up_btn.pack(side="right"))
-            except Exception:
-                pass
-
+            except Exception: pass
         threading.Thread(target=_task, daemon=True).start()
 
     def _manual_app_update(self):
-        """최신 버전 릴리스 페이지를 엽니다."""
         webbrowser.open(f"https://github.com/{GITHUB_REPO}/releases/latest")
 
     def _refresh_list(self):
@@ -304,41 +296,31 @@ class App(tk.Tk):
             rpath = m.get("remote_path", "").replace("\\", "/").strip("/")
             remote_str = f"{rem_name}:{rpath}" if rpath else rem_name
             self._tree.insert("", "end", iid=m["id"], values=("💾 마운트", auto, m.get("drive","?"), remote_str, lbl))
-        
         if self._tray is not None:
-            try:
-                self._tray.update_menu()
-            except Exception:
-                pass
+            try: self._tray.update_menu()
+            except Exception: pass
 
     def _automount_all(self):
         for m in self._cfg.get("mounts", []):
             if m.get("auto_mount") and m["id"] not in active_mounts:
                 self._do_mount(m["id"], m)
 
-    def _toggle_st(self):
-        set_startup(self._st_var.get())
-
+    def _toggle_st(self): set_startup(self._st_var.get())
     def _toggle_am(self):
         self._cfg["auto_mount"] = self._am_var.get()
         save_config(self._cfg)
-
     def _browse_rc(self):
         p = filedialog.askopenfilename()
         if p:
-            self._rc_var.set(p)
-            self._cfg["rclone_path"] = p
-            save_config(self._cfg)
-            self._check_versions_async()
+            self._rc_var.set(p); self._cfg["rclone_path"] = p
+            save_config(self._cfg); self._check_versions_async()
 
     def _add(self):
         dlg = MountDialog(self, app_cfg=self._cfg)
         self.wait_window(dlg)
         if dlg.result:
             dlg.result["id"] = str(uuid.uuid4())
-            self._cfg["mounts"].append(dlg.result)
-            save_config(self._cfg)
-            self._refresh_list()
+            self._cfg["mounts"].append(dlg.result); save_config(self._cfg); self._refresh_list()
 
     def _edit(self):
         sel = self._tree.selection()
@@ -348,17 +330,14 @@ class App(tk.Tk):
         self.wait_window(dlg)
         if dlg.result:
             dlg.result["id"] = sel[0]
-            self._cfg["mounts"][idx] = dlg.result
-            save_config(self._cfg)
-            self._refresh_list()
+            self._cfg["mounts"][idx] = dlg.result; save_config(self._cfg); self._refresh_list()
 
     def _del(self):
         sel = self._tree.selection()
         if not sel: return
         if messagebox.askyesno("삭제", "선택한 마운트를 삭제하시겠습니까?"):
             self._cfg["mounts"] = [m for m in self._cfg["mounts"] if m["id"] != sel[0]]
-            save_config(self._cfg)
-            self._refresh_list()
+            save_config(self._cfg); self._refresh_list()
 
     def _move_up(self):
         sel = self._tree.selection()
@@ -384,28 +363,22 @@ class App(tk.Tk):
 
     def _do_mount(self, mid, m):
         exe = Path(self._cfg.get("rclone_path", ""))
-        if not exe.exists():
-            messagebox.showerror("오류", "rclone 실행 파일을 찾을 수 없습니다.")
-            return
-        self._status[mid] = "mounted"
-        self._refresh_list()
+        if not exe.exists(): return
+        self._status[mid] = "mounted"; self._refresh_list()
         threading.Thread(target=self._mount_task, args=(mid, exe, m), daemon=True).start()
 
     def _mount_task(self, mid, exe, m):
         cmd = build_cmd(exe, m)
         try:
             p = subprocess.Popen(cmd, creationflags=0x08000000)
-            active_mounts[mid] = p
-            p.wait()
+            active_mounts[mid] = p; p.wait()
         finally:
-            active_mounts.pop(mid, None)
-            self._status[mid] = "stopped"
+            active_mounts.pop(mid, None); self._status[mid] = "stopped"
             self.after(0, self._refresh_list)
 
     def _unmount_sel(self):
         sel = self._tree.selection()
-        if sel and sel[0] in active_mounts:
-            unmount(sel[0])
+        if sel and sel[0] in active_mounts: unmount(sel[0])
 
     def _start_tray(self):
         try:
@@ -417,83 +390,42 @@ class App(tk.Tk):
                                        menu=pystray.Menu(pystray.MenuItem("열기", lambda: self.after(0, self.show_window)), 
                                                          pystray.MenuItem("종료", lambda: self.after(0, self._quit_app))))
             threading.Thread(target=self._tray.run, daemon=True).start()
-        except Exception:
-            pass
+        except Exception: pass
 
     def hide_window(self): self.withdraw()
     def show_window(self): self.deiconify(); self.lift(); self.focus_force()
     def _quit_app(self):
-        for mid in list(active_mounts.keys()):
-            unmount(mid)
-        if self._tray:
-            self._tray.stop()
+        for mid in list(active_mounts.keys()): unmount(mid)
+        if self._tray: self._tray.stop()
         self.destroy()
 
 class MountDialog(tk.Toplevel):
     def __init__(self, parent, mount=None, app_cfg=None):
-        super().__init__(parent)
-        self.title("마운트 설정")
-        self.geometry("600x750")
-        self.grab_set()
-        self.result = None
-        self._m = mount or {}
-        self._app_cfg = app_cfg
-        self._build()
-
+        super().__init__(parent); self.title("마운트 설정"); self.geometry("600x750"); self.grab_set()
+        self.result = None; self._m = mount or {}; self._app_cfg = app_cfg; self._build()
     def _build(self):
-        c = tk.Frame(self, padx=25, pady=25)
-        c.pack(fill="both", expand=True)
-        
+        c = tk.Frame(self, padx=25, pady=25); c.pack(fill="both", expand=True)
         tk.Label(c, text="리모트 이름:").pack(anchor="w")
-        self._rem = tk.Entry(c)
-        self._rem.pack(fill="x", pady=5)
-        self._rem.insert(0, self._m.get("remote", ""))
-        
-        tk.Label(c, text="드라이브 문자 (예: Z:):").pack(anchor="w")
-        self._drv = tk.Entry(c)
-        self._drv.pack(fill="x", pady=5)
-        self._drv.insert(0, self._m.get("drive", ""))
-        
-        tk.Label(c, text="서브 경로 (필요시):").pack(anchor="w")
-        self._pth = tk.Entry(c)
-        self._pth.pack(fill="x", pady=5)
-        self._pth.insert(0, self._m.get("remote_path", ""))
-        
-        tk.Label(c, text="추가 플래그 (예: --read-only):").pack(anchor="w")
-        self._ext = tk.Text(c, height=5)
-        self._ext.pack(fill="x", pady=5)
-        self._ext.insert("1.0", self._m.get("extra_flags", ""))
-        
+        self._rem = tk.Entry(c); self._rem.pack(fill="x", pady=5); self._rem.insert(0, self._m.get("remote", ""))
+        tk.Label(c, text="드라이브 문자 (Z:):").pack(anchor="w")
+        self._drv = tk.Entry(c); self._drv.pack(fill="x", pady=5); self._drv.insert(0, self._m.get("drive", ""))
+        tk.Label(c, text="서브 경로:").pack(anchor="w")
+        self._pth = tk.Entry(c); self._pth.pack(fill="x", pady=5); self._pth.insert(0, self._m.get("remote_path", ""))
+        tk.Label(c, text="추가 플래그:").pack(anchor="w")
+        self._ext = tk.Text(c, height=5); self._ext.pack(fill="x", pady=5); self._ext.insert("1.0", self._m.get("extra_flags", ""))
         self._auto = tk.BooleanVar(value=self._m.get("auto_mount", False))
         tk.Checkbutton(c, text="이 항목 자동 마운트", variable=self._auto).pack(anchor="w", pady=10)
-        
         tk.Button(c, text="저장", bg="#cba6f7", command=self._save).pack(pady=20, fill="x")
-
     def _save(self):
-        rem = self._rem.get().strip()
-        drv = self._drv.get().strip()
-        if not rem:
-            messagebox.showwarning("오류", "리모트 이름 필수")
-            return
-        
-        # 중복 체크 로직
+        rem = self._rem.get().strip(); drv = self._drv.get().strip()
+        if not rem: return messagebox.showwarning("오류", "리모트 이름 필수")
         for m in self._app_cfg.get("mounts", []):
             if m.get("id") == self._m.get("id"): continue
-            if drv and m.get("drive") == drv:
-                messagebox.showerror("오류", "드라이브 문자 중복")
-                return
-        
-        self.result = {
-            "remote": rem,
-            "drive": drv,
-            "remote_path": self._pth.get().strip(),
-            "extra_flags": self._ext.get("1.0", tk.END).strip(),
-            "auto_mount": self._auto.get()
-        }
+            if drv and m.get("drive") == drv: return messagebox.showerror("오류", "드라이브 문자 중복")
+        self.result = {"remote": rem, "drive": drv, "remote_path": self._pth.get().strip(), 
+                       "extra_flags": self._ext.get("1.0", tk.END).strip(), "auto_mount": self._auto.get()}
         self.destroy()
 
 if __name__ == "__main__":
-    if activate_existing_window():
-        sys.exit(0)
-    app = App()
-    app.mainloop()
+    if activate_existing_window(): sys.exit(0)
+    app = App(); app.mainloop()
