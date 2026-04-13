@@ -272,7 +272,7 @@ class App(tk.Tk):
         self._cfg = load_config(); self._status = {}; self._latest_rc = ""; self._latest_app_info = None
         self._build_ui(); self._refresh_list(); self._start_tray(); self._check_versions_async()
         
-        # [Scenario 29] 창 활성화 시 재확인 바인딩
+        # [Scenario 29] 창 활성화 시 재확인
         self.bind("<FocusIn>", self._on_focus_in)
         
         if self._cfg.get("auto_mount"): self.after(1500, self._automount_all)
@@ -348,7 +348,10 @@ class App(tk.Tk):
             try:
                 res = requests.get("https://api.github.com/repos/rclone/rclone/releases/latest", timeout=5); data = res.json(); lat_rc = data.get("tag_name", "").lstrip("v"); self._latest_rc = lat_rc
             except: pass
-            if not exe.exists(): self.after(0, lambda: self._rc_ver_label.config(text="rclone 다운로드", fg="#f38ba8"))
+            
+            # [수정] rclone 미발견 시 'rclone 다운로드' 표시
+            if not exe.exists():
+                self.after(0, lambda: self._rc_ver_label.config(text="rclone 다운로드", fg="#f38ba8"))
             else:
                 try:
                     r = subprocess.run([str(exe), "version"], capture_output=True, text=True, timeout=5, creationflags=0x08000000); loc_match = re.search(r"rclone v([\d.]+)", r.stdout); loc_rc = loc_match.group(1) if loc_match else "알 수 없음"
@@ -362,15 +365,17 @@ class App(tk.Tk):
         threading.Thread(target=_task, daemon=True).start()
 
     def _show_app_update_confirm(self):
-        """업데이트 확인 다이얼로그 호출 (AttributeError 수정)"""
+        """업데이트 확인 다이얼로그 호출"""
         if self._latest_app_info:
             tag = self._latest_app_info.get("tag_name", "New Version"); body = self._latest_app_info.get("body", "No release notes."); dlg = UpdateDialog(self, tag, body); self.wait_window(dlg)
             if dlg.confirmed: webbrowser.open(f"https://github.com/{GITHUB_REPO}/releases/latest")
 
     def _handle_rc_click(self, event):
+        """[수정] 레이블 클릭 시 다운로드 트리거"""
         text = self._rc_ver_label.cget("text")
         if "다운로드" in text or "업데이트" in text:
-            if self._latest_rc and messagebox.askyesno("rclone", f"rclone v{self._latest_rc}를 설치/업데이트할까요?"): threading.Thread(target=self._do_rc_down, daemon=True).start()
+            if self._latest_rc and messagebox.askyesno("rclone", f"rclone v{self._latest_rc}를 설치/업데이트할까요?"): 
+                threading.Thread(target=self._do_rc_down, daemon=True).start()
 
     def _do_rc_down(self):
         self.after(0, lambda: self._rc_ver_label.config(text="다운로드 중... 0%")); res = download_rclone(APP_DIR, self._latest_rc, lambda p: self.after(0, lambda: self._rc_ver_label.config(text=f"다운로드 중... {p}%")))
@@ -388,9 +393,15 @@ class App(tk.Tk):
     def _toggle_st(self): set_startup(self._st_var.get())
     def _toggle_am(self): self._save_settings()
 
-    # [Scenario 19] 테스트 호환 메서드
+    # [Scenario 19, 17, 18] 테스트 대응용 별칭 및 메서드
     def _save_settings(self):
         self._cfg["auto_mount"] = self._am_var.get(); save_config(self._cfg)
+    
+    def _delete_mount(self, mid):
+        if messagebox.askyesno("삭제", "선택한 항목을 삭제할까요?"): unmount(mid); self._cfg["mounts"] = [m for m in self._cfg["mounts"] if m["id"] != mid]; save_config(self._cfg); self._refresh_list()
+
+    def _mount_single(self, mid):
+        m = next(m for m in self._cfg["mounts"] if m["id"] == mid); self._do_mount(mid, m)
 
     def _browse_rc(self):
         p = filedialog.askopenfilename()
@@ -426,10 +437,6 @@ class App(tk.Tk):
             return
         self._delete_mount(sel[0])
 
-    # [Scenario 17] 테스트 호환 메서드
-    def _delete_mount(self, mid):
-        if messagebox.askyesno("삭제", "선택한 항목을 삭제할까요?"): unmount(mid); self._cfg["mounts"] = [m for m in self._cfg["mounts"] if m["id"] != mid]; save_config(self._cfg); self._refresh_list()
-
     def _move_up(self):
         sel = self._tree.selection()
         if not sel: return
@@ -454,10 +461,6 @@ class App(tk.Tk):
         sel = self._tree.selection()
         if not sel or sel[0].startswith("remote_") or sel[0] in active_mounts: return
         self._mount_single(sel[0])
-
-    # [Scenario 18] 테스트 호환 메서드
-    def _mount_single(self, mid):
-        m = next(m for m in self._cfg["mounts"] if m["id"] == mid); self._do_mount(mid, m)
 
     def _do_mount(self, mid, m):
         exe = get_rclone_exe(self._cfg)
