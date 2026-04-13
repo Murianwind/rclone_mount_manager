@@ -21,7 +21,7 @@ import urllib.parse
 from pathlib import Path
 import ctypes
 
-# 테스트 및 런타임 호환성을 위해 모듈을 상단에서 임포트합니다.
+# 테스트 환경에서 winreg와 pystray를 Mocking하기 쉽도록 모듈 레벨에서 관리합니다.
 try:
     import winreg
 except ImportError:
