@@ -239,7 +239,7 @@ class TestRcloneManagerBDD(unittest.TestCase):
         # Given: 마운트할 항목이 있고 rclone.exe 파일이 존재할 때
         app = self._create_mocked_app()
         app._cfg["mounts"] = [{"id": "test-id", "remote": "test"}]
-        # When: 단일 마운트를 수행하면 (Scenario 18 실패 해결: Path.exists 패치)
+        # When: 단일 마운트를 수행하면
         with patch("subprocess.Popen") as mock_popen, \
              patch("pathlib.Path.exists", return_value=True):
             app._mount_single("test-id")
