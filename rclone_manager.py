@@ -197,7 +197,7 @@ class App(tk.Tk):
         super().__init__()
         self.title("RcloneManager")
         
-        # UI 출력 최적화: 고해상도 배율을 고려하여 충분한 크기 확보
+        # UI 출력 최적화: 2번째 이미지와 같이 리스트가 제대로 보이도록 충분한 공간 확보
         self.geometry("850x600")
         self.minsize(800, 550)
         self.resizable(True, True)
@@ -207,13 +207,13 @@ class App(tk.Tk):
         self._status = {}
         self._build_ui()
         
-        # 2번째 이미지와 같이 리스트가 제대로 보이도록 강제 레이아웃 업데이트
+        # 레이아웃 강제 업데이트 및 리스트 새로고침
         self.update_idletasks()
         self._refresh_list()
         self._start_tray()
         self._check_update_async()
         
-        # 창 중앙 배치 및 활성화
+        # 창 표시 및 활성화
         self.deiconify()
         self.lift()
         self.focus_force()
@@ -296,7 +296,7 @@ class App(tk.Tk):
             tag = "on" if st == "mounted" else "off"
             lbl = "🟢 실행중" if st == "mounted" else "⚫ 중지됨"
             rpath = m.get("remote_path", "").replace("\\", "/").strip("/")
-            # KeyError 방지: get() 사용
+            # KeyError 방지 로직
             rem_name = m.get('remote', 'Unknown')
             remote_str = f"{rem_name}:{rpath}" if rpath else rem_name
             self._tree.insert("", "end", iid=m["id"], values=("💾 마운트", auto, m.get("drive","?"), remote_str, lbl), tags=(tag,))
