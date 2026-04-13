@@ -42,9 +42,8 @@ jobs:
 
       - name: Run Pytest with Coverage
         run: |
-          # pytest가 실패해도 파일을 생성할 수 있게 || true를 붙입니다.
-          pytest tests/ \
-            --cov=custom_components.kma_weather \
+          pytest test_rclone_manager.py \
+            --cov=. \
             --cov-branch \
             --cov-report=term-missing \
             --cov-report=xml \
@@ -56,16 +55,14 @@ jobs:
       - name: Generate Detailed Statement Coverage Report
         if: always()
         run: |
-          # 파일이 없으면 리포트 단계를 조용히 넘깁니다.
           if [ ! -f pytest-coverage.txt ]; then exit 0; fi
-
           echo "### 📊 1. 구문 커버리지 상세 (Statement Coverage)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| 파일 경로 | 전체 라인 수 | 실행 가능 구문 | 실행 안 됨 | 구문 커버리지(%) | 누락된 구문 라인 |" >> $GITHUB_STEP_SUMMARY
           echo "|:---|---:|---:|---:|---:|:---|" >> $GITHUB_STEP_SUMMARY
           
-          # grep이 실패해도 CI가 멈추지 않게 || true를 추가합니다.
-          grep -E "^custom_components" pytest-coverage.txt | while read -r line; do
+          # rclone_manager.py를 필터링하도록 수정
+          grep -E "^rclone_manager\.py" pytest-coverage.txt | while read -r line; do
             FILE_PATH=$(echo $line | awk '{print $1}')
             STMTS=$(echo $line | awk '{print $2}')
             MISS=$(echo $line | awk '{print $3}')
