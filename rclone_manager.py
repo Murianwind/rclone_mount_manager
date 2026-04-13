@@ -259,12 +259,28 @@ class App(tk.Tk):
         self.title("RcloneManager"); self.geometry("1200x800"); self.configure(bg="#1e1e2e")
         self.protocol("WM_DELETE_WINDOW", self.hide_window)
         self._cfg = load_config(); self._status = {}; self._latest_rc = ""; self._latest_app_info = None
-        self._build_ui(); self._refresh_list(); self._start_tray(); self._check_versions_async()
+        # 버전 체크 중복 실행 방지 플래그
+        self._version_check_running = False
+        self._build_ui(); self._refresh_list(); self._start_tray()
         
+        # 초기 실행 시 즉시 rclone 존재 여부 확인 후 레이블 설정, 이후 비동기 버전 체크
+        self._init_rc_label()
+        self._check_versions_async()
+
         # [Scenario 29] 포커스 받을 때 rclone 상태 재확인
         self.bind("<FocusIn>", self._on_focus_in)
         
         if self._cfg.get("auto_mount"): self.after(1500, self._automount_all)
+
+    def _init_rc_label(self):
+        """초기 실행 시 rclone 존재 여부를 즉시 확인하여 레이블 초기값 설정"""
+        exe = get_rclone_exe(self._cfg)
+        if not exe.exists():
+            # rclone 없음 → 즉시 '다운로드' 문구 표시 (비동기 완료 전에도)
+            self._rc_ver_label.config(text="rclone 다운로드", fg="#f38ba8")
+        else:
+            # rclone 있음 → 체크 중 표시 후 비동기에서 버전 갱신
+            self._rc_ver_label.config(text="v체크 중...", fg="#94e2d5")
 
     def _build_ui(self):
         """image_abe4d4.png와 1:1 일치하는 UI 구성"""
@@ -287,8 +303,11 @@ class App(tk.Tk):
         tk.Entry(rcf, textvariable=self._rc_var, bg="#313244", fg="#cdd6f4", relief="flat", width=60).pack(side="left", padx=10, ipady=4)
         tk.Button(rcf, text="📂", bg="#45475a", fg="#cdd6f4", relief="flat", command=self._browse_rc).pack(side="left")
         
-        # [수정] rclone 버전 표시 레이블 (rclone 없을 시 'rclone 다운로드' 표시)
-        self._rc_ver_label = tk.Label(rcf, text="v체크 중...", bg="#1e1e2e", fg="#94e2d5", font=("Segoe UI", 10), cursor="hand2")
+        # rclone 버전/상태 레이블: 클릭 가능, 같은 위치에서 상태에 따라 문구 전환
+        # - rclone 없음  → "rclone 다운로드" (분홍, 클릭 시 최신 버전 다운로드)
+        # - rclone 있음, 최신  → "v{현재} (최신)" (초록)
+        # - rclone 있음, 구버전 → "v{현재} / v{최신} 업데이트" (주황, 클릭 시 업데이트)
+        self._rc_ver_label = tk.Label(rcf, text="", bg="#1e1e2e", fg="#94e2d5", font=("Segoe UI", 10), cursor="hand2")
         self._rc_ver_label.pack(side="left", padx=15)
         self._rc_ver_label.bind("<Button-1>", self._handle_rc_click)
         
@@ -320,58 +339,141 @@ class App(tk.Tk):
         body = urllib.parse.quote(f"\n\n--- Debug Info ---\n- App Version: {APP_VERSION}\n- {get_sys_info()} text"); webbrowser.open(f"https://github.com/{GITHUB_REPO}/issues/new?body={body}")
 
     def _check_rclone_presence(self):
-        """Scenario 28: rclone 파일 미발견 시 'rclone 다운로드' 문구 표시"""
-        exe = Path(self._rc_var.get())
+        """Scenario 28: rclone 파일 미발견 시 'rclone 다운로드' 문구 표시
+        rclone 존재 여부를 즉시 확인하고, 있으면 비동기 버전 체크를 (재)실행한다."""
+        exe = get_rclone_exe(self._cfg)
         if not exe.exists():
+            # rclone 없음 → 다운로드 문구로 즉시 전환
             self._rc_ver_label.config(text="rclone 다운로드", fg="#f38ba8")
         else:
+            # rclone 있음 → 버전 정보 비동기 갱신
+            self._rc_ver_label.config(text="v체크 중...", fg="#94e2d5")
             self._check_versions_async()
 
     def _on_focus_in(self, event):
-        """Scenario 29: 창 포커스 시 상태 재확인"""
-        self._check_rclone_presence()
+        """Scenario 29: 창 포커스 시 상태 재확인 (최상위 창 포커스 이벤트만 처리)"""
+        if event.widget is self:
+            self._check_rclone_presence()
 
-    def _check_versions_async(self, manual=False):
+    def _check_versions_async(self):
+        """rclone 및 앱 버전을 백그라운드에서 확인하고 레이블/버튼을 갱신한다.
+        이미 체크가 진행 중이면 중복 실행하지 않는다."""
+        if self._version_check_running:
+            return
+        self._version_check_running = True
+
         def _task():
-            exe = Path(self._rc_var.get()); lat_rc = ""
             try:
-                res = requests.get("https://api.github.com/repos/rclone/rclone/releases/latest", timeout=5); data = res.json(); lat_rc = data.get("tag_name", "").lstrip("v"); self._latest_rc = lat_rc
-            except: pass
-            
-            if not exe.exists():
-                # [중요] rclone 없을 때 무조건 'rclone 다운로드' 표시
-                self.after(0, lambda: self._rc_ver_label.config(text="rclone 다운로드", fg="#f38ba8"))
-            else:
+                exe = get_rclone_exe(self._cfg)
+                lat_rc = ""
+
+                # ── GitHub에서 rclone 최신 버전 조회 ──
                 try:
-                    r = subprocess.run([str(exe), "version"], capture_output=True, text=True, timeout=5, creationflags=0x08000000)
-                    loc_match = re.search(r"rclone v([\d.]+)", r.stdout); loc_rc = loc_match.group(1) if loc_match else "알 수 없음"
-                    if lat_rc and loc_rc < lat_rc: self.after(0, lambda: self._rc_ver_label.config(text=f"v{loc_rc} / v{lat_rc} 업데이트", fg="#fab387"))
-                    else: self.after(0, lambda: self._rc_ver_label.config(text=f"v{loc_rc} (최신)", fg="#94e2d5"))
-                except: self.after(0, lambda: self._rc_ver_label.config(text="v알 수 없음", fg="#f38ba8"))
-            
-            try:
-                res = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest", timeout=5); data = res.json(); latest_app = data.get("tag_name", "").lstrip("v"); self._latest_app_info = data
-                if latest_app > APP_VERSION: self.after(0, lambda: self._app_up_btn.pack(side="right"))
-            except: pass
+                    res = requests.get("https://api.github.com/repos/rclone/rclone/releases/latest", timeout=5)
+                    data = res.json()
+                    lat_rc = data.get("tag_name", "").lstrip("v")
+                    self._latest_rc = lat_rc
+                except Exception:
+                    pass
+
+                # ── rclone 존재 여부 및 로컬 버전 확인 ──
+                if not exe.exists():
+                    # rclone 없음 → '다운로드' 문구
+                    self.after(0, lambda: self._rc_ver_label.config(text="rclone 다운로드", fg="#f38ba8"))
+                else:
+                    try:
+                        r = subprocess.run(
+                            [str(exe), "version"],
+                            capture_output=True, text=True, timeout=5,
+                            creationflags=0x08000000
+                        )
+                        loc_match = re.search(r"rclone v([\d.]+)", r.stdout)
+                        loc_rc = loc_match.group(1) if loc_match else ""
+
+                        if loc_rc:
+                            if lat_rc and loc_rc < lat_rc:
+                                # 업데이트 있음 → '현재버전 / 최신버전 업데이트' (주황, 클릭 시 업데이트)
+                                txt = f"v{loc_rc} / v{lat_rc} 업데이트"
+                                self.after(0, lambda t=txt: self._rc_ver_label.config(text=t, fg="#fab387"))
+                            else:
+                                # 최신 상태
+                                txt = f"v{loc_rc} (최신)"
+                                self.after(0, lambda t=txt: self._rc_ver_label.config(text=t, fg="#94e2d5"))
+                        else:
+                            self.after(0, lambda: self._rc_ver_label.config(text="v알 수 없음", fg="#f38ba8"))
+                    except Exception:
+                        self.after(0, lambda: self._rc_ver_label.config(text="v알 수 없음", fg="#f38ba8"))
+
+                # ── 앱 자체 업데이트 확인 ──
+                try:
+                    res = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest", timeout=5)
+                    data = res.json()
+                    latest_app = data.get("tag_name", "").lstrip("v")
+                    self._latest_app_info = data
+                    if latest_app > APP_VERSION:
+                        self.after(0, lambda: self._app_up_btn.pack(side="right"))
+                except Exception:
+                    pass
+            finally:
+                self._version_check_running = False
+
         threading.Thread(target=_task, daemon=True).start()
 
     def _show_app_update_confirm(self):
         if self._latest_app_info:
-            tag = self._latest_app_info.get("tag_name", "New Version"); body = self._latest_app_info.get("body", "No release notes."); dlg = UpdateDialog(self, tag, body); self.wait_window(dlg)
-            if dlg.confirmed: webbrowser.open(f"https://github.com/{GITHUB_REPO}/releases/latest")
+            tag = self._latest_app_info.get("tag_name", "New Version")
+            body = self._latest_app_info.get("body", "No release notes.")
+            dlg = UpdateDialog(self, tag, body)
+            self.wait_window(dlg)
+            if dlg.confirmed:
+                webbrowser.open(f"https://github.com/{GITHUB_REPO}/releases/latest")
 
     def _handle_rc_click(self, event):
-        """[중요] 레이블 클릭 시 rclone 다운로드 트리거"""
+        """레이블 클릭 핸들러:
+        - 'rclone 다운로드' 문구: 최신 버전 rclone 다운로드
+        - '업데이트' 포함 문구: 최신 버전으로 rclone 업데이트
+        - 그 외: 무반응
+        """
         text = self._rc_ver_label.cget("text")
-        if "다운로드" in text or "업데이트" in text:
-            if self._latest_rc and messagebox.askyesno("rclone", f"rclone v{self._latest_rc}를 설치/업데이트할까요?"): 
-                threading.Thread(target=self._do_rc_down, daemon=True).start()
+
+        if "다운로드" in text:
+            # rclone 미설치 → 다운로드
+            if self._latest_rc:
+                if messagebox.askyesno("rclone", f"rclone v{self._latest_rc}를 설치할까요?"):
+                    threading.Thread(target=self._do_rc_down, daemon=True).start()
+            else:
+                # 아직 최신 버전 정보를 받지 못한 경우: 먼저 버전 정보를 가져온 뒤 재시도 안내
+                messagebox.showinfo("rclone", "최신 버전 정보를 확인 중입니다. 잠시 후 다시 시도해 주세요.")
+                self._check_versions_async()
+
+        elif "업데이트" in text:
+            # rclone 구버전 → 최신 버전으로 업데이트
+            if self._latest_rc:
+                if messagebox.askyesno("rclone", f"rclone v{self._latest_rc}로 업데이트할까요?"):
+                    threading.Thread(target=self._do_rc_down, daemon=True).start()
 
     def _do_rc_down(self):
-        self.after(0, lambda: self._rc_ver_label.config(text="다운로드 중... 0%"))
-        res = download_rclone(APP_DIR, self._latest_rc, lambda p: self.after(0, lambda: self._rc_ver_label.config(text=f"다운로드 중... {p}%")))
-        if res is True: messagebox.showinfo("완료", "rclone 설치 완료!"); self._check_versions_async()
-        else: messagebox.showerror("오류", res)
+        """rclone 다운로드/업데이트 실행 (백그라운드)"""
+        self.after(0, lambda: self._rc_ver_label.config(text="다운로드 중... 0%", fg="#89b4fa"))
+
+        def _progress(p):
+            self.after(0, lambda pct=p: self._rc_ver_label.config(text=f"다운로드 중... {pct}%", fg="#89b4fa"))
+
+        res = download_rclone(APP_DIR, self._latest_rc, _progress)
+        if res is True:
+            # 다운로드 성공 → rclone 경로를 APP_DIR/rclone.exe 로 자동 설정
+            new_path = str(APP_DIR / "rclone.exe")
+            self._rc_var.set(new_path)
+            self._cfg["rclone_path"] = new_path
+            save_config(self._cfg)
+            messagebox.showinfo("완료", "rclone 설치/업데이트 완료!")
+            # 설치 후 버전 레이블 갱신
+            self._version_check_running = False
+            self._check_versions_async()
+        else:
+            messagebox.showerror("오류", str(res))
+            # 실패 시 다시 '다운로드' 문구로 복구
+            self.after(0, lambda: self._rc_ver_label.config(text="rclone 다운로드", fg="#f38ba8"))
 
     def _refresh_list(self):
         for i in self._tree.get_children(): self._tree.delete(i)
@@ -396,7 +498,12 @@ class App(tk.Tk):
 
     def _browse_rc(self):
         p = filedialog.askopenfilename()
-        if p: self._rc_var.set(p); self._cfg["rclone_path"] = p; save_config(self._cfg); self._check_rclone_presence()
+        if p:
+            self._rc_var.set(p)
+            self._cfg["rclone_path"] = p
+            save_config(self._cfg)
+            # 파일 선택 후 즉시 존재 여부 확인 및 버전 레이블 갱신
+            self._check_rclone_presence()
 
     def _import_conf(self):
         p = find_default_rclone_conf(); path = filedialog.askopenfilename(initialdir=str(p.parent) if p else None)
