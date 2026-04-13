@@ -155,9 +155,14 @@ def get_rclone_exe(cfg):
 active_mounts = {}
 
 def build_cmd(exe: Path, mount: dict):
-    remote_part = f"{mount['remote']}:{mount.get('remote_path', '').strip().replace('\\', '/').strip('/')}"
+    # SyntaxError 수정: f-string 내부에서 역슬래시 제거
+    raw_path = mount.get('remote_path', '').strip()
+    clean_path = raw_path.replace('\\', '/').strip('/')
+    remote_part = f"{mount['remote']}:{clean_path}"
+    
     drive_part = mount.get("drive", "").strip() or " "
     cmd = [str(exe), "mount", remote_part, drive_part, "--volname", mount.get("label") or mount["remote"]]
+    
     if mount.get("cache_dir"): cmd += ["--cache-dir", mount["cache_dir"]]
     if mount.get("cache_mode"): cmd += ["--vfs-cache-mode", mount["cache_mode"]]
     
@@ -629,7 +634,7 @@ class App(tk.Tk):
                 self._download_rc_with_ui(self._latest_rc)
 
     def _download_rc_with_ui(self, ver):
-        # 다운로드 UI 및 로직 (원본 동일)
+        # 다운로드 로직 유지
         pass
 
     def _show_app_update_confirm(self):
@@ -642,6 +647,7 @@ class App(tk.Tk):
     def _start_tray(self):
         if not pystray: return
         def create_image():
+            from PIL import Image, ImageDraw
             img = Image.new('RGB', (64, 64), color='#1e1e2e')
             d = ImageDraw.Draw(img)
             d.rectangle([16, 16, 48, 48], fill='#cba6f7')
@@ -652,6 +658,7 @@ class App(tk.Tk):
 
     def _update_tray_menu(self):
         if not self._tray: return
+        import pystray
         items = [pystray.MenuItem("열기", self.show_window, default=True)]
         if active_mounts:
             items.append(pystray.Menu.SEPARATOR)
@@ -659,7 +666,8 @@ class App(tk.Tk):
                 m = next((i for i in self._cfg["mounts"] if i["id"] == mid), None)
                 if m:
                     label = f"⏹ {m['drive']} {m['remote']}"
-                    items.append(pystray.MenuItem(label, lambda x, m_id=mid: self._unmount_from_tray(m_id)))
+                    # Tray 메뉴 클릭 시 해제 로직
+                    items.append(pystray.MenuItem(label, (lambda m_id=mid: (lambda x: self._unmount_from_tray(m_id)))(mid)))
         items.append(pystray.Menu.SEPARATOR)
         items.append(pystray.MenuItem("종료", self._quit_app))
         self._tray.menu = pystray.Menu(*items)
