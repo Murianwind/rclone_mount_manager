@@ -13,7 +13,7 @@ class TestRcloneManagerBDD(unittest.TestCase):
         self.sample_cfg = {"remotes": [], "mounts": [], "rclone_path": "", "auto_mount": False}
 
     def _create_mocked_app(self, cfg=None):
-        """Mock 앱 인스턴스 생성 유틸리티 (RecursionError 방지)"""
+        """Mock 앱 인스턴스 생성 유틸리티 (원본 로직 100% 복구)"""
         app = rclone_manager.App.__new__(rclone_manager.App)
         app._cfg = cfg if cfg else self.sample_cfg
         app._status = {}
@@ -158,11 +158,11 @@ class TestRcloneManagerBDD(unittest.TestCase):
         self.assertEqual(dlg.result["drive"], "Z:")
         self.assertTrue(dlg.result["auto_mount"])
 
-    # 12. 마운트 다이얼로그 리모트 미입력 에러
+    # 12. 마운트 다이얼로그 리모트 미입력 에러 (원본 복구)
     def test_scenario_12_dialog_save_empty_remote(self):
         app = self._create_mocked_app()
         dlg = self._create_mocked_dialog(app)
-        dlg._rem.get.return_value = "" # 오타 수정됨
+        dlg._rem.get.return_value = ""
         with patch("tkinter.messagebox.showwarning") as mock_warn:
             dlg._save()
             mock_warn.assert_called_with("오류", "리모트 이름 필수")
@@ -300,15 +300,17 @@ class TestRcloneManagerBDD(unittest.TestCase):
         Scenario: rclone 실행 파일이 없을 때 UI에 다운로드 안내 문구 표시
         Given: rclone 실행 파일이 존재하지 않는 환경을 설정한다.
         When: rclone 존재 여부를 확인하는 로직이 수행될 때
-        Then: 레이블의 텍스트가 'rclone 다운로드'로 변경되어야 한다.
+        Then: 레이블의 텍스트가 'rclone 다운로드'로 표시되어야 한다.
         """
         app = self._create_mocked_app()
         app._cfg["rclone_path"] = "C:\\non_existent\\rclone.exe"
+        
         with patch("pathlib.Path.exists", return_value=False):
-            # 구현 로직 검증
-            rclone_exists = False
-            display_text = "rclone 다운로드" if not rclone_exists else "v1.60.0"
-            self.assertEqual(display_text, "rclone 다운로드")
+            # 구현할 메서드인 _check_rclone_presence를 호출
+            rclone_manager.App._check_rclone_presence(app)
+            
+            # 레이블의 config가 'rclone 다운로드'로 호출되었는지 확인
+            app._rc_ver_label.config.assert_called_with(text="rclone 다운로드", fg="#f38ba8")
 
     # 29. 창이 활성화될 때 rclone 존재 여부 재확인 테스트 (BDD 형식)
     def test_scenario_29_check_rclone_on_focus(self):
@@ -319,8 +321,11 @@ class TestRcloneManagerBDD(unittest.TestCase):
         Then: rclone 존재 여부를 확인하는 함수가 호출되어야 한다.
         """
         app = self._create_mocked_app()
-        with patch.object(rclone_manager.App, "bind", create=True):
-             pass
+        with patch.object(rclone_manager.App, "_check_rclone_presence") as mock_check:
+            # Tkinter의 bind 로직을 대신하여 FocusIn 발생 시뮬레이션
+            # 실제 구현에서는 self.bind("<FocusIn>", lambda e: self._check_rclone_presence()) 가 있어야 함
+            rclone_manager.App._on_focus_in(app, None)
+            mock_check.assert_called_once()
 
 if __name__ == "__main__":
     unittest.main()
