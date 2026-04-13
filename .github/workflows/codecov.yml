@@ -20,6 +20,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
         run: |
@@ -29,7 +30,7 @@ jobs:
       - name: Run Tests with Coverage
         shell: bash
         run: |
-          # 여기서만 커버리지 옵션을 명시적으로 사용
+          # 여기서 분기 커버리지 옵션을 주어 실행하며, 터미널 출력을 파일로 저장합니다.
           python -m pytest test_rclone_manager.py \
             --cov=rclone_manager \
             --cov-branch \
@@ -40,26 +41,33 @@ jobs:
       - name: Publish Coverage to Summary
         shell: bash
         run: |
+          # rclone_manager.py 데이터 행 추출
           RAW_DATA=$(grep -E "^rclone_manager\.py\s+" cov-output.txt | head -1 || true)
           TOTAL_DATA=$(grep -E "^TOTAL\s+" cov-output.txt | tail -1 || true)
 
+          # ── 📊 1. 구문 커버리지 상세 (Statement Coverage) ─────────────────
           echo "### 📊 1. 구문 커버리지 상세 (Statement Coverage)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| 파일 경로 | 전체 라인 수 | 실행 가능 구문 | 실행 안 됨 | 구문 커버리지(%) | 누락된 구문 라인 |" >> $GITHUB_STEP_SUMMARY
-          echo "|:---|---:|---:|---:|---:|:---|" >> $GITHUB_STEP_SUMMARY
-          echo "$RAW_DATA" | awk '{printf "| %s | 479 | %s | %s | **%.1f%%** | %s |\n", $1, $2, $3, (($2-$3)/$2)*100, $7}' >> $GITHUB_STEP_SUMMARY
+          echo "|:---|---:|---:|---:|---:|:---| " >> $GITHUB_STEP_SUMMARY
+          # awk 루프를 사용하여 7번째 필드(Missing)부터 끝까지 모든 데이터를 생략 없이 가져옵니다.
+          echo "$RAW_DATA" | awk '{missing=""; for(i=7;i<=NF;i++) missing=(missing==""?"":missing " ") $i; printf "| %s | 479 | %s | %s | **%.1f%%** | %s |\n", $1, $2, $3, (($2-$3)/$2)*100, missing}' >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
+          # ── 🌿 2. 분기 커버리지 상세 (Branch Coverage) ───────────────────
           echo "### 🌿 2. 분기 커버리지 상세 (Branch Coverage)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| 파일 경로 | 전체 분기 수 | 실행된 분기 | 실행 안 됨 | 분기 커버리지(%) | 누락된 분기 (화살표) |" >> $GITHUB_STEP_SUMMARY
-          echo "|:---|---:|---:|---:|---:|:---|" >> $GITHUB_STEP_SUMMARY
-          echo "$RAW_DATA" | awk '{printf "| %s | %s | %s | %s | **%.1f%%** | %s |\n", $1, $4, ($4-$5), $5, (($4-$5)/$4)*100, $7}' >> $GITHUB_STEP_SUMMARY
+          # 헤더 명칭 변경: 누락된 분기 (화살표) -> 누락된 분기
+          echo "| 파일 경로 | 전체 분기 수 | 실행된 분기 | 실행 안 됨 | 분기 커버리지(%) | 누락된 분기 |" >> $GITHUB_STEP_SUMMARY
+          echo "|:---|---:|---:|---:|---:|:---| " >> $GITHUB_STEP_SUMMARY
+          # awk 루프를 사용하여 누락된 분기 데이터를 모두 가져옵니다.
+          echo "$RAW_DATA" | awk '{missing=""; for(i=7;i<=NF;i++) missing=(missing==""?"":missing " ") $i; printf "| %s | %s | %s | %s | **%.1f%%** | %s |\n", $1, $4, ($4-$5), $5, (($4-$5)/$4)*100, missing}' >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
+          # ── 📈 최종 커버리지 요약 ─────────────────────────────────────────
           echo "### 📈 최종 커버리지 요약" >> $GITHUB_STEP_SUMMARY
           echo "| 측정 방식 | 커버리지율 | 상세 수치 (성공/전체) |" >> $GITHUB_STEP_SUMMARY
-          echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|---| " >> $GITHUB_STEP_SUMMARY
           echo "$TOTAL_DATA" | awk '{printf "| **구문(Statement)** | **%.2f%%** | %d / %d |\n", (($2-$3)/$2)*100, ($2-$3), $2}' >> $GITHUB_STEP_SUMMARY
           echo "$TOTAL_DATA" | awk '{printf "| **분기(Branch)** | **%.2f%%** | %d / %d |\n", (($4-$5)/$4)*100, ($4-$5), $4}' >> $GITHUB_STEP_SUMMARY
 
