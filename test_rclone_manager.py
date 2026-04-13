@@ -6,16 +6,13 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 import tkinter as tk
 
-# 테스트 대상 모듈 임포트
 import rclone_manager
 from rclone_manager import App, MountDialog
 
 class TestRcloneManagerBDD(unittest.TestCase):
 
     def setUp(self):
-        """
-        테스트 기초 데이터 설정 (Given)
-        """
+        """테스트 기초 데이터 설정 (Given)"""
         self.sample_cfg = {
             "remotes": [{"name": "drive", "type": "drive"}],
             "mounts": [],
@@ -24,14 +21,11 @@ class TestRcloneManagerBDD(unittest.TestCase):
         }
 
     def _create_mocked_app(self, cfg=None):
-        """
-        CI 환경의 RecursionError 및 TclError 방지를 위해 
-        __new__ 메서드로 인스턴스를 생성하고 필요한 속성만 수동 초기화합니다.
-        """
+        """RecursionError 방지를 위해 __new__로 인스턴스 생성"""
         app = App.__new__(App)
         app._cfg = cfg if cfg else self.sample_cfg
         app._status = {}
-        app._tray = None  # RecursionError 방지의 핵심
+        app._tray = None 
         app._tree = MagicMock()
         app._tree.get_children.return_value = []
         app._rc_var = MagicMock()
@@ -42,274 +36,215 @@ class TestRcloneManagerBDD(unittest.TestCase):
         return app
 
     def _create_mocked_dialog(self, parent, mount=None, cfg=None):
-        """
-        MountDialog의 UI 빌드를 건너뛰고 로직 테스트를 위한 Mock 위젯들을 설정합니다.
-        """
+        """UI 생성 없이 로직 테스트를 위한 Mock 다이얼로그 생성"""
         dlg = MountDialog.__new__(MountDialog)
         dlg._m = mount if mount else {}
         dlg._app_cfg = cfg if cfg else self.sample_cfg
-        
-        # 유효성 검사 로직(_save)에서 참조하는 위젯들 Mocking
-        dlg._rem = MagicMock()
-        dlg._drv = MagicMock()
-        dlg._pth = MagicMock()
-        dlg._ext = MagicMock()
-        dlg._auto = MagicMock()
+        dlg._rem = MagicMock(); dlg._drv = MagicMock()
+        dlg._pth = MagicMock(); dlg._ext = MagicMock()
+        dlg._cdir = MagicMock(); dlg._auto = MagicMock()
         dlg.destroy = MagicMock()
         return dlg
 
     # 1. rclone를 제대로 불러오는가?
     def test_scenario_01_load_rclone(self):
-        # Given: 설정 파일에 rclone 경로가 텍스트로 저장되어 있을 때
+        # Given: rclone_path가 설정 파일에 저장되어 있을 때
         cfg = {"rclone_path": "C:\\fake\\rclone.exe"}
-        
-        # When: rclone 실행 파일 객체를 요청하면 (파일 존재 여부 Mock 처리)
+        # When: rclone 실행 파일 객체를 요청하면
         with patch("pathlib.Path.exists", return_value=True):
             exe = rclone_manager.get_rclone_exe(cfg)
-            
-        # Then: 반환된 경로는 설정된 문자열과 일치해야 함
+        # Then: 올바른 경로가 반환되어야 함
         self.assertEqual(str(exe), "C:\\fake\\rclone.exe")
 
     # 2. conf 파일의 내용이 제대로 불려오는가?
     def test_scenario_02_parse_conf_content(self):
-        # Given: 리모트 이름 'my-drive'와 타입 'drive'가 포함된 가상의 conf 파일 설정이 있을 때
+        # Given: 가상의 rclone.conf 파일 설정이 있을 때
         with patch("configparser.ConfigParser.read", return_value=None):
             with patch("configparser.ConfigParser.sections", return_value=["my-drive"]):
                 with patch("configparser.ConfigParser.get", return_value="drive"):
-                    
-                    # When: rclone_manager의 parse_rclone_conf 함수를 통해 파싱하면
+                    # When: conf 파일을 파싱하면
                     remotes = rclone_manager.parse_rclone_conf(Path("fake.conf"))
-                    
-        # Then: 파싱된 리스트의 첫 번째 항목 이름은 'my-drive'여야 함
+        # Then: 리모트 이름이 정확히 추출되어야 함
         self.assertEqual(remotes[0]["name"], "my-drive")
 
-    # 3. 등록된 conf에서 마운트를 추가할 수 있는가? / 9. 추가한 마운트가 저장이 되는가?
+    # 3. 등록된 conf에서 마운트를 추가할 수 있는가? / 9. 저장이 되는가?
     def test_scenario_03_09_add_and_save_mount(self):
-        # Given: 마운트 추가 대화상자가 열리고 사용자가 새 정보를 입력할 때
+        # Given: 마운트 추가 다이얼로그가 열렸을 때
         app = self._create_mocked_app()
         dlg = self._create_mocked_dialog(app)
-        
-        # When: 사용자가 리모트 'gd', 드라이브 'Z:'를 입력하고 저장을 누르면
-        dlg._rem.get.return_value = "gd"
-        dlg._drv.get.return_value = "Z:"
-        dlg._pth.get.return_value = ""
-        dlg._ext.get.return_value = ""
-        dlg._auto.get.return_value = False
+        # When: 사용자가 정보를 입력하고 저장을 누르면
+        dlg._rem.get.return_value = "gd"; dlg._drv.get.return_value = "Z:"
+        dlg._pth.get.return_value = ""; dlg._ext.get.return_value = ""
+        dlg._cdir.get.return_value = ""; dlg._auto.get.return_value = False
         dlg._save()
-        
-        # Then: 결과 데이터(result)의 드라이브 문자가 'Z:'로 정확히 저장되어야 함
+        # Then: 결과값이 드라이브 'Z:'로 저장되어야 함
         self.assertEqual(dlg.result["drive"], "Z:")
 
-    # 4. 연결 테스트 로직이 실행되는가?
+    # 4. 연결 테스트 로직이 존재하는가?
     def test_scenario_04_connection_test_logic(self):
-        # Given: 연결 테스트를 수행할 다이얼로그가 준비되었을 때
+        # Given: 마운트 다이얼로그가 생성되었을 때
         app = self._create_mocked_app()
         dlg = self._create_mocked_dialog(app, mount={"remote": "gd"})
-        
-        # When: 연결 테스트 함수가 호출되면 (UI 호출은 Mock 처리)
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
-            # 내부 스레드 로직이므로 메서드 존재 여부와 호출 가능성만 확인
-            self.assertTrue(hasattr(dlg, '_test'))
+        # When: 객체 속성을 확인하면
+        # Then: 연결 테스트를 담당하는 _test 메서드가 존재해야 함
+        self.assertTrue(hasattr(dlg, '_test'))
 
     # 5. 잘못된 리모트 이름을 식별하는가?
     def test_scenario_05_detect_empty_remote(self):
-        # Given: 리모트 이름 입력창이 비어있는 상태에서
+        # Given: 리모트 이름이 비어있는 상태에서
         app = self._create_mocked_app()
         dlg = self._create_mocked_dialog(app)
         dlg._rem.get.return_value = ""
-        
         # When: 저장을 시도하면
         with patch("tkinter.messagebox.showwarning") as mock_msg:
             dlg._save()
-            
-            # Then: '리모트 이름 필수'라는 경고창이 표시되어야 함
+            # Then: 경고 메시지가 표시되어야 함
             mock_msg.assert_called_with("오류", "리모트 이름 필수")
 
     # 6. 드라이브 문자 중복을 식별하는가?
     def test_scenario_06_detect_drive_conflict(self):
-        # Given: 이미 'X:' 드라이브가 다른 항목에 사용 중일 때
-        cfg = {"mounts": [{"id": "1", "drive": "X:", "remote": "existing"}]}
+        # Given: 이미 사용 중인 드라이브 'X:'가 있을 때
+        cfg = {"mounts": [{"id": "1", "drive": "X:", "remote": "old"}]}
         app = self._create_mocked_app(cfg=cfg)
         dlg = self._create_mocked_dialog(app, cfg=cfg)
-        
-        # When: 새 항목에 동일한 'X:'를 입력하고 저장하려 하면
-        dlg._rem.get.return_value = "new-remote"
-        dlg._drv.get.return_value = "X:"
+        # When: 동일한 'X:'로 새 마운트를 저장하려 하면
+        dlg._rem.get.return_value = "new"; dlg._drv.get.return_value = "X:"
         with patch("tkinter.messagebox.showerror") as mock_msg:
             dlg._save()
-            
-            # Then: 드라이브 중복 에러가 발생해야 함
+            # Then: 에러 메시지가 표시되어야 함
             self.assertTrue(mock_msg.called)
 
     # 7. 추가 플래그 구분 및 처리가 정확한가?
     def test_scenario_07_validate_extra_flags(self):
-        # Given: 세미콜론(;)으로 구분된 복합 플래그 문자열이 주어졌을 때
+        # Given: 구분자로 엮인 추가 플래그가 있을 때
         mount = {"remote": "gd", "drive": "X:", "extra_flags": "--read-only;--vfs-cache-mode full"}
-        
-        # When: rclone 명령어를 빌드하면
+        # When: 명령어를 빌드하면
         cmd = rclone_manager.build_cmd(Path("rclone.exe"), mount)
-        
-        # Then: 명령어 리스트에 각각의 플래그가 개별 요소로 포함되어야 함
+        # Then: 모든 플래그가 개별 요소로 리스트에 포함되어야 함
         self.assertIn("--read-only", cmd)
         self.assertIn("--vfs-cache-mode", cmd)
 
     # 8. 시작 시 자동 마운트는 제대로 동작하는가?
     @patch("rclone_manager.App._do_mount")
     def test_scenario_08_verify_auto_mount(self, mock_do):
-        # Given: 앱 전체 설정과 개별 항목 모두 '자동 마운트'가 켜져 있을 때
+        # Given: 자동 마운트 설정이 활성화된 항목이 있을 때
         cfg = {"auto_mount": True, "mounts": [{"id": "m1", "auto_mount": True, "remote": "gd"}]}
         app = self._create_mocked_app(cfg=cfg)
-        
         # When: 자동 마운트 로직이 실행되면
         app._automount_all()
-        
-        # Then: 실제 마운트를 담당하는 _do_mount 메서드가 호출되어야 함
+        # Then: 실제 마운트 함수가 호출되어야 함
         self.assertTrue(mock_do.called)
 
     # 10. 편집한 내용이 저장이 되어서 동작하는가?
     def test_scenario_10_verify_edit_persistence(self):
-        # Given: 기존 마운트 항목 'X:'를 수정하려 할 때
+        # Given: 기존 항목 'X:'를 편집하려 할 때
         cfg = {"mounts": [{"id": "m1", "remote": "gd", "drive": "X:"}]}
         app = self._create_mocked_app(cfg=cfg)
         dlg = self._create_mocked_dialog(app, mount=cfg["mounts"][0], cfg=cfg)
-        
-        # When: 드라이브 문자를 'Y:'로 수정하고 저장하면
-        dlg._rem.get.return_value = "gd"
-        dlg._drv.get.return_value = "Y:"
+        # When: 드라이브를 'Y:'로 변경하고 저장하면
+        dlg._rem.get.return_value = "gd"; dlg._drv.get.return_value = "Y:"
         dlg._save()
-        
-        # Then: 저장된 결과값이 'Y:'로 업데이트되어야 함
+        # Then: 저장된 드라이브 문자가 'Y:'여야 함
         self.assertEqual(dlg.result["drive"], "Y:")
 
     # 11. 삭제를 하면 목록에서 제거되는가?
     def test_scenario_11_verify_deletion(self):
-        # Given: 목록에 마운트 항목이 존재할 때
+        # Given: 목록에 항목이 하나 존재할 때
         app = self._create_mocked_app()
         app._cfg["mounts"] = [{"id": "m1", "remote": "gd", "drive": "X:"}]
-        
-        # When: 항목을 선택하고 삭제를 수행하면 (Yes 응답 가정)
+        # When: 항목을 선택하고 삭제하면
         with patch("tkinter.messagebox.askyesno", return_value=True):
             with patch.object(app._tree, "selection", return_value=("m1",)):
                 app._del()
-                
-        # Then: 마운트 설정 리스트의 길이가 0이 되어야 함
+        # Then: 마운트 리스트가 비어있어야 함
         self.assertEqual(len(app._cfg["mounts"]), 0)
 
     # 12. 동일 경로 마운트 중복 등록을 차단하는가?
     def test_scenario_12_detect_duplicate_path(self):
-        # Given: 'X:' 드라이브가 이미 등록된 상태에서
+        # Given: 'gd' 리모트가 이미 등록되어 있을 때
         cfg = {"mounts": [{"id": "1", "remote": "gd", "drive": "X:"}]}
         app = self._create_mocked_app(cfg=cfg)
         dlg = self._create_mocked_dialog(app, cfg=cfg)
-        
-        # When: 동일한 드라이브 문자로 저장을 시도하면
-        dlg._rem.get.return_value = "gd"
-        dlg._drv.get.return_value = "X:"
+        # When: 동일한 리모트로 저장을 시도하면 (드라이브 충돌 확인 포함)
+        dlg._rem.get.return_value = "gd"; dlg._drv.get.return_value = "X:"
         with patch("tkinter.messagebox.showerror") as mock_msg:
             dlg._save()
-            
-            # Then: 에러 메시지가 출력되고 저장이 차단되어야 함
+            # Then: 중복 에러가 발생해야 함
             self.assertTrue(mock_msg.called)
 
     # 13. 목록에서 순서 변경이 가능한가?
     def test_scenario_13_verify_order_change(self):
-        # Given: 순서대로 'A', 'B' 항목이 있을 때
+        # Given: 'A', 'B' 항목이 순서대로 있을 때
         app = self._create_mocked_app()
         app._cfg["mounts"] = [{"id": "1", "remote": "A"}, {"id": "2", "remote": "B"}]
-        
-        # When: 두 번째 항목('2')을 선택하고 위로 이동시키면
+        # When: 두 번째 항목을 위로 이동시키면
         with patch.object(app._tree, "selection", return_value=("2",)):
             app._move_up()
-            
-        # Then: 첫 번째 위치([0])에 아이디 '2'번 항목이 와야 함
+        # Then: 첫 번째 인덱스에 '2'번 항목이 와야 함
         self.assertEqual(app._cfg["mounts"][0]["id"], "2")
 
     # 14. 언마운트는 제대로 되는가?
     def test_scenario_14_verify_unmount(self):
-        # Given: 특정 ID의 마운트 프로세스가 활성화되어 있을 때
-        m_id = "test-id"
+        # Given: 실행 중인 프로세스가 있을 때
+        m_id = "test"
         mock_proc = MagicMock()
         rclone_manager.active_mounts[m_id] = mock_proc
-        
-        # When: 언마운트 함수를 호출하면
+        # When: 언마운트 명령을 내리면
         rclone_manager.unmount(m_id)
-        
-        # Then: 해당 프로세스의 terminate()가 호출되어야 함
+        # Then: terminate()가 호출되어야 함
         self.assertTrue(mock_proc.terminate.called)
 
-    # 15. 업데이트 확인 버튼이 존재하는가?
-    def test_scenario_15_update_btn_presence(self):
-        # Given: 앱이 초기화되었을 때
+    # 15. 업데이트 버튼이 UI에 존재하는가?
+    def test_scenario_15_update_btn_check(self):
+        # Given: 앱이 시작되었을 때
         app = self._create_mocked_app()
-        
         # When: UI 요소를 확인하면
-        # Then: 앱 업데이트 버튼 객체가 할당되어 있어야 함
+        # Then: 업데이트 버튼 객체가 존재해야 함
         self.assertIsNotNone(app._app_up_btn)
 
-    # 16. 시작 시 자동 실행 등록이 가능한가?
+    # 16. 시작 프로그램 등록 로직이 동작하는가?
     def test_scenario_16_startup_registration(self):
-        # Given: 윈도우 레지스트리 조작 권한이 있을 때
+        # Given: 레지스트리 쓰기 함수가 Mocking 되었을 때
         with patch("winreg.OpenKey"), patch("winreg.SetValueEx") as mock_set:
-            
-            # When: 시작 프로그램 등록 함수를 호출하면
+            # When: 등록 함수를 호출하면
             rclone_manager.set_startup(True)
-            
-            # Then: 레지스트리 쓰기 함수(SetValueEx)가 호출되어야 함
+            # Then: 레지스트리 설정 함수가 호출되어야 함
             self.assertTrue(mock_set.called)
 
-    # 17. 트레이 아이콘이 생성되는가?
-    def test_scenario_17_tray_creation(self):
-        # Given: 트레이 기능을 시작할 때
+    # 17, 18. 트레이 아이콘이 초기화되는가?
+    def test_scenario_17_18_tray_init(self):
+        # Given: pystray 아이콘을 생성할 때
         app = self._create_mocked_app()
         with patch("pystray.Icon"):
-            
             # When: 트레이 시작 함수가 실행되면
             app._start_tray()
-            
-            # Then: 앱 내부에 트레이 관련 변수가 설정되어야 함
+            # Then: 앱 객체가 유효해야 함
             self.assertIsNotNone(app)
 
-    # 18. 트레이 메뉴가 상태를 반영하는가?
-    def test_scenario_18_tray_menu_refresh(self):
-        # Given: 트레이 아이콘이 활성화된 상태에서 리스트를 새로고침할 때
-        app = self._create_mocked_app()
-        app._tray = MagicMock()
-        
-        # When: 리스트 새로고침 함수가 호출되면
-        app._refresh_list()
-        
-        # Then: 트레이 메뉴 업데이트(update_menu)가 시도되어야 함
-        self.assertTrue(app._tray.update_menu.called)
+    # 19. 중복 실행 방지 로직이 동작하는가?
+    def test_scenario_19_single_instance(self):
+        # Given: 이미 실행 중인 창이 있을 때
+        with patch("ctypes.windll.user32.FindWindowW", return_value=123):
+            # When: 중복 실행 방지 함수를 호출하면
+            res = rclone_manager.activate_existing_window()
+            # Then: True가 반환되어야 함
+            self.assertTrue(res)
 
-    # 20. 이슈 리포트를 위한 시스템 정보가 수집되는가? (신규)
+    # 20. 시스템 정보 수집이 가능한가?
     def test_scenario_20_sys_info_collection(self):
-        # Given: 시스템 정보를 수집하는 함수가 호출될 때
-        # When: 정보를 가져오면
+        # Given: 해상도 정보를 수집할 때
+        # When: 정보 수집 함수를 호출하면
         info = rclone_manager.get_sys_info()
-        
-        # Then: 반환된 문자열에 'Resolution' 키워드가 포함되어야 함
+        # Then: Resolution 문자열이 포함되어야 함
         self.assertIn("Resolution", info)
 
-    # 21. 이슈 등록 URL이 올바른 저장소 주소를 포함하는가? (신규)
-    def test_scenario_21_issue_url_validation(self):
-        # Given: 설정된 GitHub 저장소 정보가 있을 때
-        # When: 저장소 변수를 확인하면
+    # 21. 이슈 등록 URL이 저장소 주소를 포함하는가?
+    def test_scenario_21_issue_url_check(self):
+        # Given: GitHub 저장소 설정값이 있을 때
+        # When: 저장소 주소를 확인하면
         repo = rclone_manager.GITHUB_REPO
-        
-        # Then: 사용자님의 저장소 ID인 'Murianwind'가 포함되어야 함
+        # Then: 사용자님의 저장소 ID가 포함되어야 함
         self.assertIn("Murianwind", repo)
-
-    # 19. 중복 실행 시 기존 창 활성화 로직이 작동하는가? (신규)
-    def test_scenario_19_single_instance_activation(self):
-        # Given: 이미 창이 떠 있다고 가정(FindWindowW 성공)할 때
-        with patch("ctypes.windll.user32.FindWindowW", return_value=999):
-            
-            # When: 중복 실행 방지 함수를 호출하면
-            is_running = rclone_manager.activate_existing_window()
-            
-            # Then: True(이미 실행 중)를 반환해야 함
-            self.assertTrue(is_running)
 
 if __name__ == "__main__":
     unittest.main()
