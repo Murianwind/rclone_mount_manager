@@ -33,7 +33,7 @@ except ImportError:
     pystray = None
 
 # ── 프로그램 설정 ──
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 GITHUB_REPO = "Murianwind/rclone_mount_manager"
 
 # ── 1. 시스템 환경 설정 ──
