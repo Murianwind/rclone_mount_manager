@@ -27,10 +27,10 @@ except Exception:
     pass
 
 def activate_existing_window():
-    """이미 실행 중인 창을 찾아 화면 앞으로 가져옵니다."""
+    """이미 실행 중인 창을 찾아 활성화합니다. (Scenario 19 대응)"""
     hwnd = ctypes.windll.user32.FindWindowW(None, "RcloneManager")
     if hwnd:
-        ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        ctypes.windll.user32.ShowWindow(hwnd, 9) # SW_RESTORE
         ctypes.windll.user32.SetForegroundWindow(hwnd)
         return True
     return False
@@ -65,12 +65,13 @@ def save_config(cfg):
     CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
 def get_rclone_exe(cfg):
+    """rclone를 제대로 불러오는가? (Scenario 1)"""
     custom = cfg.get("rclone_path", "").strip()
     if custom and Path(custom).exists(): 
         return Path(custom)
     return APP_DIR / "rclone.exe"
 
-# ── Windows 시작 프로그램 등록 ──
+# ── Windows 시작 프로그램 등록 (Scenario 16) ──
 STARTUP_REG = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 def is_startup_enabled():
@@ -91,16 +92,14 @@ def set_startup(enable: bool):
             exe_cmd = f'"{APP_EXE}"' if getattr(sys, 'frozen', False) else f'pythonw "{Path(__file__).resolve()}"'
             winreg.SetValueEx(key, STARTUP_NAME, 0, winreg.REG_SZ, exe_cmd)
         else:
-            try:
-                winreg.DeleteValue(key, STARTUP_NAME)
-            except FileNotFoundError:
-                pass
+            try: winreg.DeleteValue(key, STARTUP_NAME)
+            except FileNotFoundError: pass
         winreg.CloseKey(key)
         return True
     except Exception as e: 
         return str(e)
 
-# ── rclone 유틸리티 ──
+# ── rclone 유틸리티 (Scenario 2) ──
 def parse_rclone_conf(conf_path: Path):
     remotes = []
     try:
@@ -129,6 +128,7 @@ def get_latest_version():
         return None
 
 def download_rclone(dest_dir: Path, version: str, progress_cb=None):
+    """업데이트는 제대로 되는가? (Scenario 15)"""
     url = f"https://github.com/rclone/rclone/releases/download/v{version}/rclone-v{version}-windows-amd64.zip"
     try:
         r = requests.get(url, stream=True, timeout=60)
@@ -180,6 +180,7 @@ def do_mount(m_id, rclone_exe, mount, status_cb=None):
         if status_cb: status_cb(m_id, "stopped")
 
 def unmount(m_id):
+    """언마운트는 제대로 되는가? (Scenario 14)"""
     p = active_mounts.get(m_id)
     if p:
         p.terminate()
@@ -196,29 +197,24 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("RcloneManager")
-        
-        # UI 출력 최적화: 2번째 이미지와 같이 리스트가 제대로 보이도록 충분한 공간 확보
         self.geometry("850x600")
         self.minsize(800, 550)
         self.resizable(True, True)
-        
         self.protocol("WM_DELETE_WINDOW", self.hide_window)
         self._cfg = load_config()
         self._status = {}
         self._build_ui()
-        
-        # 레이아웃 강제 업데이트 및 리스트 새로고침
         self.update_idletasks()
         self._refresh_list()
         self._start_tray()
         self._check_update_async()
         
-        # 창 표시 및 활성화
+        # 창 중앙 배치 및 강제 활성화 (사용자 피드백 반영)
         self.deiconify()
         self.lift()
         self.focus_force()
 
-        if self._cfg.get("auto_mount"):
+        if self._cfg.get("auto_mount"): # 시작 시 자동 마운트 (Scenario 8)
             self.after(1500, self._automount_all)
 
     def _build_ui(self):
@@ -296,8 +292,7 @@ class App(tk.Tk):
             tag = "on" if st == "mounted" else "off"
             lbl = "🟢 실행중" if st == "mounted" else "⚫ 중지됨"
             rpath = m.get("remote_path", "").replace("\\", "/").strip("/")
-            # KeyError 방지 로직
-            rem_name = m.get('remote', 'Unknown')
+            rem_name = m.get('remote', 'Unknown') # KeyError 방지
             remote_str = f"{rem_name}:{rpath}" if rpath else rem_name
             self._tree.insert("", "end", iid=m["id"], values=("💾 마운트", auto, m.get("drive","?"), remote_str, lbl), tags=(tag,))
         self._tree.tag_configure("remote_tag", foreground="#8fa0b5")
@@ -344,6 +339,7 @@ class App(tk.Tk):
             self._refresh_list()
 
     def _move_up(self):
+        """목록에서 순서는 제대로 변경되는가? (Scenario 13)"""
         mid = self._sel_id()
         if not mid: return
         if mid.startswith("remote_"):
@@ -386,6 +382,7 @@ class App(tk.Tk):
             save_config(self._cfg); self._refresh_list()
 
     def _add(self):
+        """등록된 conf에서 마운트를 추가할 수 있는가? (Scenario 3)"""
         mid = self._sel_id()
         pre = mid.split("remote_", 1)[1] if mid and mid.startswith("remote_") else ""
         dlg = MountDialog(self, {"remote": pre}, self._cfg)
@@ -396,6 +393,7 @@ class App(tk.Tk):
             save_config(self._cfg); self._refresh_list()
 
     def _edit(self):
+        """편집한 내용이 저장이 되어서 동작하는가? (Scenario 10)"""
         mid = self._sel_id()
         if not mid or mid.startswith("remote_"): return
         idx, m = self._get_m(mid)
@@ -407,6 +405,7 @@ class App(tk.Tk):
             save_config(self._cfg); self._refresh_list()
 
     def _del(self):
+        """삭제를 하면 mount.json에 내용이 삭제되는가? (Scenario 11)"""
         mid = self._sel_id()
         if not mid: return
         if mid.startswith("remote_"):
@@ -431,12 +430,14 @@ class App(tk.Tk):
         threading.Thread(target=do_mount, args=(mid, exe, m, cb), daemon=True).start()
 
     def _mount_sel(self):
+        """트레이/목록에서 마운트 (Scenario 17)"""
         mid = self._sel_id()
         if not mid or mid.startswith("remote_") or mid in active_mounts: return
         idx, m = self._get_m(mid)
         if m: self._do_mount(mid, m)
 
     def _unmount_sel(self):
+        """언마운트 제대로 되는가 (Scenario 17)"""
         mid = self._sel_id()
         if not mid or mid.startswith("remote_"): return
         unmount(mid); self._status[mid] = "stopped"; self._refresh_list()
@@ -465,6 +466,7 @@ class App(tk.Tk):
         threading.Thread(target=_do, daemon=True).start()
 
     def _start_tray(self):
+        """트레이 아이콘 상태 반영 (Scenario 17, 18)"""
         try:
             import pystray
             from PIL import Image, ImageDraw
@@ -562,6 +564,7 @@ class MountDialog(tk.Toplevel):
         tk.Button(bf, text="취소", bg="#45475a", fg=FG, width=12, command=self.destroy).pack(side="right", padx=5)
 
     def _test(self):
+        """연결 테스트 (Scenario 4)"""
         t = f"{self._remote.get().strip()}:{self._rpath.get().strip().strip('/')}"
         exe = get_rclone_exe(self._app_cfg)
         def r():
@@ -577,24 +580,30 @@ class MountDialog(tk.Toplevel):
         if d: self._cdir.set(d)
 
     def _save(self):
+        """저장 시 유효성 검사 (Scenario 5, 6, 7, 9, 12)"""
         rem = self._remote.get().strip()
         drv = self._drive.get().strip()
         path = self._rpath.get().strip().strip("/")
-        if not rem: return messagebox.showwarning("오류", "리모트 이름 필수")
+        if not rem: return messagebox.showwarning("오류", "리모트 이름 필수") # Scenario 5
+        
+        # 중복 체크 (Scenario 6, 12)
         for m in self._app_cfg.get("mounts", []):
             if m.get("id") == self._m.get("id"): continue
-            if drv and m.get("drive") == drv: return messagebox.showerror("오류", f"드라이브 문자 {drv}가 이미 등록되어 있습니다.")
+            if drv and m.get("drive") == drv: return messagebox.showerror("오류", f"드라이브 문자 {drv}가 이미 등록되어 있습니다.") # Scenario 6
             if m.get("remote") == rem and m.get("remote_path", "").strip("/") == path:
-                return messagebox.showerror("오류", f"동일한 마운트({rem}:{path})가 이미 존재합니다.")
+                return messagebox.showerror("오류", f"동일한 마운트({rem}:{path})가 이미 존재합니다.") # Scenario 12
+
+        # 플래그 유효성 검사 (Scenario 7)
         extra_val = self._extra_text.get("1.0", tk.END).strip()
         clean_flags = []
         for f in re.split(r"[\s;]+", extra_val):
             f = f.strip()
             if not f: continue
             if any(f.startswith(forbidden) for forbidden in self.FORBIDDEN_FLAGS):
-                return messagebox.showerror("오류", f"금지된 플래그가 포함되어 있습니다: {f}\n(UI 설정 항목과 중복됩니다.)")
-            if not f.startswith("-"): f = "--" + f
+                return messagebox.showerror("오류", f"금지된 플래그가 포함되어 있습니다: {f}")
+            if not f.startswith("-"): f = "--" + f # 자동 수정
             clean_flags.append(f)
+
         self.result = {
             "remote": rem, "remote_path": path, "drive": drv,
             "cache_dir": self._cdir.get().strip(), "cache_mode": self._cmode.get(),
