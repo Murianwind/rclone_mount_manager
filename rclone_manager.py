@@ -21,10 +21,9 @@ import ctypes
 
 # ── 1. 윈도우 고해상도(DPI) 대응 보강 ──
 try:
-    import ctypes
-    # 프로세스가 DPI를 인식하도록 설정 (Windows 8.1 이상)
-    ctypes.windll.shcore.SetProcessDpiAwareness(1) 
-    # 하위 호환성을 위한 설정 (Windows 7/8)
+    # Windows 8.1 이상에서 프로세스 DPI 인식을 설정합니다.
+    ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    # Windows 7/8 하위 호환성을 위해 추가 설정합니다.
     ctypes.windll.user32.SetProcessDPIAware()
 except Exception:
     pass
@@ -566,8 +565,9 @@ class MountDialog(tk.Toplevel):
         super().__init__(parent)
         self.title("마운트 편집" if mount and "id" in mount else "마운트 추가")
         
-        # ── 수정 1: 세로 리사이즈 허용 (False -> True) ──
+        # ── 고해상도 대응: 세로 리사이즈 허용 및 최소 크기 설정 ──
         self.resizable(True, True) 
+        self.minsize(600, 700)
         
         self.grab_set()
         self.configure(bg="#1e1e2e")
@@ -576,11 +576,7 @@ class MountDialog(tk.Toplevel):
         self._app_cfg = app_cfg
         self._build()
         
-        # ── 수정 2: 최소 크기 지정 (창이 너무 작아지는 것 방지) ──
-        self.minsize(600, 700) 
-        
-        # ── 수정 3: 기본 실행 크기를 더 크게 변경 ──
-        # 175% 배율 환경을 고려하여 넉넉하게 설정합니다.
+        # 기본 실행 크기 (고해상도 배율 175% 고려)
         self.geometry("700x850")
 
     def _build(self):
@@ -613,7 +609,6 @@ class MountDialog(tk.Toplevel):
         self._cmode = tk.StringVar(value=self._m.get("cache_mode", "full"))
         ttk.Combobox(c, textvariable=self._cmode, values=self.CACHE_MODES, state="readonly", width=12).pack(anchor="w")
         
-        # ★ 수정된 부분: 멀티라인(Text) 박스로 변경 및 빈 공간 자동 채우기(expand=True)
         lbl("추가 플래그 (; 또는 줄바꿈으로 구분)")
         self._extra_text = tk.Text(c, bg=EBG, fg=FG, insertbackground=FG, relief="flat", font=("Segoe UI", 9), 
                                    highlightthickness=1, highlightbackground="#585b70", highlightcolor=HL, 
@@ -647,10 +642,7 @@ class MountDialog(tk.Toplevel):
     def _save(self):
         rem = self._remote.get().strip()
         if not rem: return messagebox.showwarning("오류", "리모트 이름 필수")
-        
-        # ★ 수정된 부분: Text 위젯에서 텍스트를 가져오도록 변경
         extra_val = self._extra_text.get("1.0", tk.END).strip()
-        
         self.result = {
             "remote": rem, 
             "remote_path": self._rpath.get().strip().strip("/"), 
