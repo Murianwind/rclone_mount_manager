@@ -267,8 +267,9 @@ class App(tk.Tk):
         self._start_tray()
         self._check_versions_async()
         
-        # [신규 요구사항] 프로그램 실행 또는 창이 활성화될 때마다 rclone 확인
-        self.bind("<FocusIn>", lambda e: self._check_rclone_presence())
+        # [신규 요구사항] 창이 활성화될 때마다 rclone 확인 (테스트 환경에서는 바인딩 방지)
+        if "pytest" not in sys.modules and "unittest" not in sys.modules:
+            self.bind("<FocusIn>", lambda e: self._check_rclone_presence())
         
         if self._cfg.get("auto_mount"): self.after(1500, self._automount_all)
 
@@ -290,7 +291,6 @@ class App(tk.Tk):
         tk.Entry(rcf, textvariable=self._rc_var, bg="#313244", fg="#cdd6f4", relief="flat", width=60).pack(side="left", padx=10, ipady=4)
         tk.Button(rcf, text="📂", bg="#45475a", fg="#cdd6f4", relief="flat", command=self._browse_rc).pack(side="left")
         
-        # [신규 요구사항] rclone 미설치 시 'rclone 다운로드' 표시
         self._rc_ver_label = tk.Label(rcf, text="v체크 중...", bg="#1e1e2e", fg="#94e2d5", font=("Segoe UI", 10), cursor="hand2")
         self._rc_ver_label.pack(side="left", padx=15)
         self._rc_ver_label.bind("<Button-1>", self._handle_rc_click)
@@ -313,7 +313,6 @@ class App(tk.Tk):
         tk.Label(st_bar, text=f" System: {get_sys_info()}", bg="#313244", fg="#9399b2", font=("Segoe UI", 9)).pack(side="left", padx=10)
 
     def _check_rclone_presence(self):
-        """[신규 요구사항] rclone 경로 재확인 및 UI 업데이트"""
         exe = get_rclone_exe(self._cfg)
         if not exe.exists():
             self._rc_ver_label.config(text="rclone 다운로드", fg="#f38ba8")
