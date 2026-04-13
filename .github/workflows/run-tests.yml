@@ -1,0 +1,32 @@
+name: BDD Functional Tests
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch: # 수동 실행 가능
+
+jobs:
+  test:
+    name: Run BDD Tests on Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Execute BDD Tests
+        run: |
+          # unittest를 사용하여 작성한 테스트 스크립트 실행
+          python test_rclone_manager.py
