@@ -27,11 +27,14 @@ try:
 except ImportError:
     winreg = None
 
+# pystray + PIL: 함께 import, 실패 시 둘 다 비활성
 try:
     import pystray
     from PIL import Image, ImageDraw
+    _PIL_AVAILABLE = True
 except ImportError:
     pystray = None
+    _PIL_AVAILABLE = False
 
 # ── 프로그램 설정 ──
 APP_VERSION = "1.1.0"
@@ -78,33 +81,44 @@ def get_sys_info():
         return "N/A"
 
 
-def calc_window_size(base_w, base_h):
+def get_logical_screen_size():
     """
-    해상도와 DPI 배율을 고려해 창 크기를 계산한다.
-    기준: 1920x1080 @ 100% = base 크기
-    - 높은 해상도 + 높은 배율(예: 2736x1824 @ 175%)에서는 논리 픽셀이 작으므로
-      물리 해상도 대비 비율만 반영해 적절히 키움
-    - 화면의 85%를 넘지 않도록 제한
+    Tkinter 기준 논리 해상도 반환.
+    Tkinter 창 크기는 논리 픽셀 단위이므로
+    물리 해상도를 DPI 배율로 나눈 값을 사용한다.
+
+    예시:
+      1920x1080 @100% → 논리 1920x1080
+      1920x1080 @125% → 논리 1536x 864
+      2560x1440 @150% → 논리 1706x 960
+      2736x1824 @175% → 논리 1563x1042
+      3840x2160 @200% → 논리 1920x1080
+      3840x2160 @150% → 논리 2560x1440
     """
     sw, sh = get_screen_size()
     scale = get_dpi_scale()
+    return int(sw / scale), int(sh / scale)
 
-    # 논리 해상도 = 물리 해상도 / 배율
-    logical_w = sw / scale
-    logical_h = sh / scale
 
-    # 1920x1080 논리 해상도 기준 비율
-    ratio = min(logical_w / 1920, logical_h / 1080)
-    # 비율 범위 제한 (너무 크거나 작아지지 않도록)
-    ratio = max(0.70, min(1.15, ratio))
+def calc_window_size(w_pct, h_pct, min_w=400, min_h=300):
+    """
+    현재 화면의 논리 해상도에서 w_pct%, h_pct% 크기의 창을 계산한다.
+    1920×1080 기준값 없이, 실행 중인 화면에 맞게 직접 계산한다.
 
-    w = int(base_w * ratio)
-    h = int(base_h * ratio)
+    인수:
+      w_pct : 논리 화면 너비 대비 창 너비 비율 (0~100)
+      h_pct : 논리 화면 높이 대비 창 높이 비율 (0~100)
+      min_w : 최소 너비 (px)
+      min_h : 최소 높이 (px)
 
-    # 화면의 85% 초과 방지 (논리 픽셀 기준)
-    w = min(w, int(logical_w * 0.85))
-    h = min(h, int(logical_h * 0.85))
-
+    사용 예:
+      메인 창      → calc_window_size(58, 72)
+      마운트 다이얼 → calc_window_size(32, 80)
+      업데이트 다이얼→ calc_window_size(32, 52)
+    """
+    lw, lh = get_logical_screen_size()
+    w = max(min_w, int(lw * w_pct / 100))
+    h = max(min_h, int(lh * h_pct / 100))
     return w, h
 
 
@@ -197,18 +211,27 @@ def download_rclone(dest_dir: Path, version: str, progress_cb=None):
 
 def download_app_release(asset_url: str, progress_cb=None):
     """
-    앱 자체 업데이트:
-    GitHub Release asset(exe 또는 zip)을 내려받아 현재 실행 파일 위치에 배치한다.
-    zip이면 압축 해제 후 zip 삭제.
-    frozen(PyInstaller) 환경에서만 파일 교체가 의미 있다.
+    앱 자체 업데이트.
+
+    [권한 문제 해결]
+    실행 중인 .exe는 Windows에서 직접 교체 불가.
+    → 임시 배치 스크립트를 별도 프로세스로 실행 후 현재 프로세스 종료.
+
+    반환값:
+      "restart" - 배치 스크립트 실행됨, 호출자는 프로세스를 종료해야 함
+      True       - zip 배포 교체 완료 (재시작 필요)
+      str        - 오류 메시지
     """
     try:
+        suffix = "." + asset_url.rsplit(".", 1)[-1] if "." in asset_url else ".zip"
+        tmp_dir = Path(tempfile.mkdtemp())
+        tmp_file = tmp_dir / f"update{suffix}"
+
+        # 다운로드
         r = requests.get(asset_url, stream=True, timeout=60)
         total = int(r.headers.get("content-length", 0))
         downloaded = 0
-        suffix = "." + asset_url.rsplit(".", 1)[-1] if "." in asset_url else ".zip"
-        tmp = tempfile.mktemp(suffix=suffix)
-        with open(tmp, "wb") as f:
+        with open(tmp_file, "wb") as f:
             for chunk in r.iter_content(65536):
                 f.write(chunk)
                 downloaded += len(chunk)
@@ -218,20 +241,45 @@ def download_app_release(asset_url: str, progress_cb=None):
         dest_dir = Path(sys.executable).parent if getattr(sys, 'frozen', False) else APP_DIR
 
         if suffix.lower() == ".zip":
-            with zipfile.ZipFile(tmp, "r") as z:
+            with zipfile.ZipFile(tmp_file, "r") as z:
                 z.extractall(dest_dir)
-            os.unlink(tmp)
-        else:
-            # 실행 중인 exe 교체: 기존 파일 .old로 백업 후 이동
-            if getattr(sys, 'frozen', False):
-                cur = Path(sys.executable)
-            else:
-                cur = dest_dir / "rclone_mount_manager.exe"
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return True
+
+        # exe 교체: 개발 모드는 직접 복사, frozen은 배치 스크립트
+        if not getattr(sys, 'frozen', False):
+            cur = dest_dir / "rclone_mount_manager.exe"
             if cur.exists():
                 cur.rename(cur.with_suffix(".old"))
-            shutil.move(tmp, str(cur))
+            shutil.move(str(tmp_file), str(cur))
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return True
 
-        return True
+        cur_exe = Path(sys.executable)
+        old_exe = cur_exe.with_suffix(".old")
+        bat_path = tmp_dir / "updater.bat"
+
+        bat_content = (
+            f"@echo off\n"
+            f"ping -n 3 127.0.0.1 > nul\n"
+            f"if exist \"{old_exe}\" del /f /q \"{old_exe}\"\n"
+            f"move /y \"{cur_exe}\" \"{old_exe}\"\n"
+            f"if errorlevel 1 ( echo 백업 실패 & pause & exit /b 1 )\n"
+            f"copy /y \"{tmp_file}\" \"{cur_exe}\"\n"
+            f"if errorlevel 1 ( move /y \"{old_exe}\" \"{cur_exe}\" & echo 업데이트 실패 & pause & exit /b 1 )\n"
+            f"del /f /q \"{tmp_file}\"\n"
+            f"rmdir /s /q \"{tmp_dir}\"\n"
+            f"start \"\" \"{cur_exe}\"\n"
+            f"exit /b 0\n"
+        )
+        bat_path.write_text(bat_content, encoding="utf-8")
+
+        subprocess.Popen(
+            ["cmd.exe", "/c", str(bat_path)],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            close_fds=True,
+        )
+        return "restart"
     except Exception as e:
         return str(e)
 
@@ -261,11 +309,7 @@ def save_config(cfg):
 
 
 def get_rclone_exe(cfg):
-    """
-    등록된 rclone 경로만 반환.
-    등록이 없거나 파일이 없으면 None 반환.
-    (APP_DIR 자동 탐색 제거 - 항목 6 대응)
-    """
+    """등록된 rclone 경로만 반환. 없거나 파일 없으면 None."""
     p = cfg.get("rclone_path", "").strip()
     if p and Path(p).exists():
         return Path(p)
@@ -321,7 +365,6 @@ def _make_circle_icon(color="#cba6f7", size=64):
 
 
 def _make_dot_icon(color, size=16):
-    """작은 원형 상태 아이콘 (트레이 메뉴용)"""
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     d.ellipse([1, 1, size - 2, size - 2], fill=color)
@@ -361,9 +404,9 @@ class ConfImportDialog(tk.Toplevel):
 class UpdateDialog(tk.Toplevel):
     """
     앱 업데이트 확인 다이얼로그.
-    - 업데이트 내역 스크롤바 추가
-    - 해상도/배율에 따라 창 크기 자동 조절 → 취소/업데이트 버튼 항상 보임
-    - 업데이트 버튼 클릭 시 자동 다운로드/교체 (asset_url 있을 때)
+    - 업데이트 내역 필드에만 스크롤바 표시 (내용이 필드보다 길 때만 자동 표시)
+    - 창 크기는 현재 화면 논리 해상도의 비율로 계산
+    - grid 레이아웃으로 버튼 영역 항상 하단 고정
     """
 
     def __init__(self, parent, tag, body, assets=None):
@@ -374,18 +417,16 @@ class UpdateDialog(tk.Toplevel):
         self.confirmed = False
         self._asset_url = self._pick_asset(assets or [])
 
-        # ── 창 크기: 해상도/배율 동적 계산 ──
-        w, h = calc_window_size(620, 460)
-        w = max(w, 480)
-        h = max(h, 360)
+        # 현재 화면 논리 해상도의 32% × 52%
+        w, h = calc_window_size(32, 52, min_w=480, min_h=360)
         self.geometry(f"{w}x{h}")
         self.minsize(480, 360)
         self.resizable(True, True)
 
-        # ── grid 레이아웃: 버튼행은 항상 하단 고정 ──
-        self.rowconfigure(0, weight=0)   # 제목
-        self.rowconfigure(1, weight=1)   # 본문 (늘어남)
-        self.rowconfigure(2, weight=0)   # 버튼 (고정)
+        # grid: 제목(고정) / 본문(늘어남) / 버튼(고정)
+        self.rowconfigure(0, weight=0)
+        self.rowconfigure(1, weight=1)
+        self.rowconfigure(2, weight=0)
         self.columnconfigure(0, weight=1)
 
         # 제목
@@ -396,22 +437,35 @@ class UpdateDialog(tk.Toplevel):
                  wraplength=w - 40).grid(row=0, column=0, sticky="ew",
                                          padx=20, pady=(16, 8))
 
-        # 본문 + 스크롤바
+        # 업데이트 내역 텍스트 + 조건부 스크롤바
+        # → 내용이 표시 영역보다 길 때만 스크롤바 자동 표시
         txt_frame = tk.Frame(self, bg="#1e1e2e")
         txt_frame.grid(row=1, column=0, sticky="nsew", padx=20, pady=4)
         txt_frame.rowconfigure(0, weight=1)
         txt_frame.columnconfigure(0, weight=1)
 
         vsb = tk.Scrollbar(txt_frame)
-        vsb.grid(row=0, column=1, sticky="ns")
 
         txt = tk.Text(txt_frame, bg="#313244", fg="#cdd6f4", relief="flat",
                       font=("Segoe UI", 10), padx=10, pady=10,
-                      yscrollcommand=vsb.set, wrap="word")
+                      wrap="word")
         txt.grid(row=0, column=0, sticky="nsew")
-        vsb.config(command=txt.yview)
         txt.insert("1.0", body)
         txt.config(state="disabled")
+
+        # 렌더링 완료 후 스크롤 필요 여부 판단
+        def _maybe_show_scrollbar(event=None):
+            # yview() → (first, last): last < 1.0 이면 내용이 잘림 → 스크롤 필요
+            first, last = txt.yview()
+            if last < 1.0:
+                vsb.grid(row=0, column=1, sticky="ns")
+                txt.config(yscrollcommand=vsb.set)
+                vsb.config(command=txt.yview)
+            else:
+                vsb.grid_remove()
+
+        txt.bind("<Configure>", _maybe_show_scrollbar)
+        self.after(100, _maybe_show_scrollbar)
 
         # 버튼 (항상 보임)
         btn_f = tk.Frame(self, bg="#1e1e2e")
@@ -438,15 +492,20 @@ class UpdateDialog(tk.Toplevel):
 
 
 class MountDialog(tk.Toplevel):
+    """
+    마운트 추가/편집 다이얼로그.
+    현재 화면 논리 해상도의 비율로 창 크기를 계산하여
+    스크롤바 없이 모든 내용이 보이도록 한다.
+    """
+
     def __init__(self, parent, mount=None, app_cfg=None):
         super().__init__(parent)
         self.title("마운트 추가" if not mount or "id" not in mount else "마운트 설정")
-        # ── 창 크기: 해상도/배율 동적 계산 ──
-        w, h = calc_window_size(640, 800)
-        w = max(w, 500)
-        h = max(h, 560)
+
+        # 현재 화면 논리 해상도의 32% × 80%
+        w, h = calc_window_size(32, 80, min_w=500, min_h=600)
         self.geometry(f"{w}x{h}")
-        self.minsize(500, 560)
+        self.minsize(500, 600)
         self.resizable(True, True)
         self.configure(bg="#1e1e2e")
         self.grab_set()
@@ -456,27 +515,8 @@ class MountDialog(tk.Toplevel):
         self._build()
 
     def _build(self):
-        # 낮은 해상도/높은 배율 환경에서도 모든 항목을 볼 수 있도록
-        # Canvas + Scrollbar 로 감쌈
-        canvas = tk.Canvas(self, bg="#1e1e2e", highlightthickness=0)
-        vsb = tk.Scrollbar(self, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-
-        c = tk.Frame(canvas, padx=26, pady=18, bg="#1e1e2e")
-        win_id = canvas.create_window((0, 0), window=c, anchor="nw")
-
-        def _on_frame_conf(e):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-
-        def _on_canvas_conf(e):
-            canvas.itemconfig(win_id, width=e.width)
-
-        c.bind("<Configure>", _on_frame_conf)
-        canvas.bind("<Configure>", _on_canvas_conf)
-        canvas.bind_all("<MouseWheel>",
-                        lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+        c = tk.Frame(self, padx=26, pady=16, bg="#1e1e2e")
+        c.pack(fill="both", expand=True)
 
         lbl_s = {"bg": "#1e1e2e", "fg": "#cba6f7", "font": ("Segoe UI", 10, "bold")}
         ent_s = {"bg": "#313244", "fg": "#cdd6f4", "insertbackground": "#cdd6f4",
@@ -484,12 +524,12 @@ class MountDialog(tk.Toplevel):
 
         tk.Label(c, text="리모트 이름", **lbl_s).pack(anchor="w")
         self._rem = tk.Entry(c, **ent_s)
-        self._rem.pack(fill="x", pady=(5, 13), ipady=4)
+        self._rem.pack(fill="x", pady=(4, 11), ipady=4)
         self._rem.insert(0, self._m.get("remote", ""))
 
         tk.Label(c, text="서브 디렉토리", **lbl_s).pack(anchor="w")
         pth_f = tk.Frame(c, bg="#1e1e2e")
-        pth_f.pack(fill="x", pady=(5, 13))
+        pth_f.pack(fill="x", pady=(4, 11))
         self._pth = tk.Entry(pth_f, **ent_s)
         self._pth.pack(side="left", fill="x", expand=True, ipady=4)
         self._pth.insert(0, self._m.get("remote_path", ""))
@@ -501,12 +541,12 @@ class MountDialog(tk.Toplevel):
         drive_values = [""] + [f"{chr(i)}:" for i in range(ord('D'), ord('Z') + 1)]
         self._drv = ttk.Combobox(c, values=drive_values, font=("Segoe UI", 10),
                                   state="readonly")
-        self._drv.pack(fill="x", pady=(5, 13))
+        self._drv.pack(fill="x", pady=(4, 11))
         self._drv.set(self._m.get("drive", ""))
 
         tk.Label(c, text="캐시 디렉토리", **lbl_s).pack(anchor="w")
         cdir_f = tk.Frame(c, bg="#1e1e2e")
-        cdir_f.pack(fill="x", pady=(5, 13))
+        cdir_f.pack(fill="x", pady=(4, 11))
         self._cdir = tk.Entry(cdir_f, **ent_s)
         self._cdir.pack(side="left", fill="x", expand=True, ipady=4)
         self._cdir.insert(0, self._m.get("cache_dir", ""))
@@ -516,21 +556,21 @@ class MountDialog(tk.Toplevel):
         tk.Label(c, text="캐시 모드", **lbl_s).pack(anchor="w")
         self._cmode = ttk.Combobox(c, values=["off", "minimal", "writes", "full"],
                                     font=("Segoe UI", 10), state="readonly")
-        self._cmode.pack(fill="x", pady=(5, 13))
+        self._cmode.pack(fill="x", pady=(4, 11))
         self._cmode.set(self._m.get("cache_mode", "full"))
 
         tk.Label(c, text="추가 플래그", **lbl_s).pack(anchor="w")
-        self._ext = tk.Text(c, height=5, **ent_s)
-        self._ext.pack(fill="x", pady=(5, 13))
+        self._ext = tk.Text(c, height=4, **ent_s)
+        self._ext.pack(fill="x", pady=(4, 11))
         self._ext.insert("1.0", self._m.get("extra_flags", ""))
 
         self._auto = tk.BooleanVar(value=self._m.get("auto_mount", False))
         tk.Checkbutton(c, text="시작 시 자동 마운트", variable=self._auto,
                        bg="#1e1e2e", fg="#cdd6f4", selectcolor="#313244",
-                       font=("Segoe UI", 10)).pack(anchor="w", pady=6)
+                       font=("Segoe UI", 10)).pack(anchor="w", pady=5)
 
         btn_f = tk.Frame(c, bg="#1e1e2e")
-        btn_f.pack(fill="x", pady=(16, 4))
+        btn_f.pack(fill="x", pady=(14, 0))
         tk.Button(btn_f, text="저장", bg="#cba6f7", fg="#1e1e2e",
                   font=("Segoe UI", 11, "bold"), relief="flat",
                   command=self._save, width=13).pack(side="right", padx=(10, 0), ipady=5)
@@ -592,10 +632,8 @@ class App(tk.Tk):
         super().__init__()
         self.title("RcloneManager")
 
-        # ── 메인 창 크기: 해상도/배율 동적 계산 ──
-        mw, mh = calc_window_size(1080, 700)
-        mw = max(mw, 780)
-        mh = max(mh, 520)
+        # 현재 화면 논리 해상도의 58% × 72%
+        mw, mh = calc_window_size(58, 72, min_w=780, min_h=520)
         self.geometry(f"{mw}x{mh}")
         self.minsize(780, 520)
         self.resizable(True, True)
@@ -607,17 +645,18 @@ class App(tk.Tk):
         self._latest_rc = ""
         self._latest_app_info = None
         self._version_check_running = False
+        self._app_check_running = False   # 앱 버전 체크 별도 플래그
 
         self._build_ui()
         self._refresh_list()
         self._start_tray()
 
-        # 초기: 등록된 rclone 존재 여부를 즉시 반영
+        # 초기: 등록된 rclone 존재 여부 즉시 반영
         self._init_rc_label()
-        # 비동기로 버전 정보 조회
+        # 비동기로 버전 정보 조회 (rclone + 앱)
         self._check_versions_async()
 
-        # 창 활성화(포커스) 시 버전 재확인
+        # 창 활성화(포커스) 시 재확인
         self.bind("<FocusIn>", self._on_focus_in)
 
         if self._cfg.get("auto_mount"):
@@ -651,7 +690,7 @@ class App(tk.Tk):
                   font=("Segoe UI", 9, "bold"), relief="flat", width=2,
                   command=self._open_issue).pack(side="left", padx=5, pady=(5, 0))
 
-        # 앱 업데이트 버튼 (새 버전 있을 때만 표시)
+        # 앱 업데이트 버튼 (새 버전 확인됐을 때만 표시)
         self._app_up_btn = tk.Button(
             hdr, text="✨ 새 버전 업데이트 가능", bg="#a6e3a1", fg="#1e1e2e",
             font=("Segoe UI", 9, "bold"), relief="flat",
@@ -669,10 +708,6 @@ class App(tk.Tk):
                   command=self._browse_rc).pack(side="left")
 
         # rclone 버전/상태 레이블 (클릭 가능)
-        # 상태별 표시:
-        #   등록 없음  → "rclone 다운로드" (분홍, 클릭 → 다운로드)
-        #   최신       → "v{현재} (최신)"  (초록)
-        #   구버전     → "v{현재} / v{최신} 업데이트" (주황, 클릭 → 업데이트)
         self._rc_ver_label = tk.Label(
             rcf, text="", bg="#1e1e2e", fg="#94e2d5",
             font=("Segoe UI", 10), cursor="hand2")
@@ -735,10 +770,7 @@ class App(tk.Tk):
             self._rc_ver_label.config(text="v체크 중...", fg="#94e2d5")
 
     def _check_rclone_presence(self):
-        """
-        등록된 rclone 존재 여부 즉시 확인.
-        없으면 '다운로드' 표시, 있으면 비동기 버전 체크 (재)실행.
-        """
+        """등록된 rclone 존재 여부 즉시 확인. 없으면 다운로드 표시, 있으면 버전 체크."""
         exe = get_rclone_exe(self._cfg)
         if exe is None:
             self._rc_ver_label.config(text="rclone 다운로드", fg="#f38ba8")
@@ -748,7 +780,7 @@ class App(tk.Tk):
             self._check_versions_async()
 
     def _on_focus_in(self, event):
-        """창 활성화(포커스) 시 rclone 상태 및 앱 버전 재확인 (최상위 창 이벤트만)"""
+        """창 활성화(포커스) 시 rclone + 앱 버전 재확인 (최상위 창 이벤트만)"""
         if event.widget is self:
             self._check_rclone_presence()
 
@@ -756,7 +788,7 @@ class App(tk.Tk):
         """
         백그라운드에서:
         1) 등록된 rclone 버전 확인 + GitHub rclone 최신 버전 조회
-        2) 앱 자체 최신 버전 조회
+        2) 앱 자체 최신 버전 조회 → 업데이트 있으면 버튼 표시
         중복 실행 방지.
         """
         if self._version_check_running:
@@ -778,7 +810,7 @@ class App(tk.Tk):
                 except Exception:
                     pass
 
-                # 등록된 rclone 없음 → 다운로드 문구
+                # rclone 버전 레이블 갱신
                 if exe is None:
                     self.after(0, lambda: self._rc_ver_label.config(
                         text="rclone 다운로드", fg="#f38ba8"))
@@ -814,7 +846,11 @@ class App(tk.Tk):
                     latest_app = data.get("tag_name", "").lstrip("v")
                     self._latest_app_info = data
                     if latest_app > APP_VERSION:
-                        self.after(0, lambda: self._app_up_btn.pack(side="right"))
+                        # 업데이트 버튼 표시 (이미 표시 중이면 중복 pack 방지)
+                        self.after(0, self._show_app_update_btn)
+                    else:
+                        # 최신 버전이면 버튼 숨김
+                        self.after(0, self._hide_app_update_btn)
                 except Exception:
                     pass
             finally:
@@ -822,27 +858,41 @@ class App(tk.Tk):
 
         threading.Thread(target=_task, daemon=True).start()
 
+    def _show_app_update_btn(self):
+        """앱 업데이트 버튼 표시 (중복 방지)"""
+        if not self._app_up_btn.winfo_ismapped():
+            self._app_up_btn.pack(side="right")
+
+    def _hide_app_update_btn(self):
+        """앱 업데이트 버튼 숨김"""
+        if self._app_up_btn.winfo_ismapped():
+            self._app_up_btn.pack_forget()
+
     # ────────────────────────────────────────────
     # 앱 업데이트
     # ────────────────────────────────────────────
     def _show_app_update_confirm(self):
+        """업데이트 버튼 클릭 → 업데이트 내역 다이얼로그 표시 → 자동 업데이트"""
         if not self._latest_app_info:
             return
         tag = self._latest_app_info.get("tag_name", "New Version")
         body = self._latest_app_info.get("body", "No release notes.")
         assets = self._latest_app_info.get("assets", [])
+
         dlg = UpdateDialog(self, tag, body, assets=assets)
         self.wait_window(dlg)
+
         if not dlg.confirmed:
+            # 취소 → 아무것도 하지 않음
             return
 
         asset_url = dlg._asset_url
         if not asset_url:
-            # 다운로드 가능한 asset 없으면 브라우저로 열기
+            # 다운로드 가능한 asset 없으면 브라우저로
             webbrowser.open(f"https://github.com/{GITHUB_REPO}/releases/latest")
             return
 
-        # 자동 다운로드 → 파일 교체
+        # 자동 다운로드 → 파일 교체 실행
         self._app_up_btn.config(text="앱 업데이트 중... 0%", state="disabled")
 
         def _do():
@@ -851,10 +901,18 @@ class App(tk.Tk):
                     text=f"앱 업데이트 중... {pv}%"))
 
             res = download_app_release(asset_url, _prog)
-            if res is True:
+
+            if res == "restart":
+                # 배치 스크립트 실행 완료 → 종료 안내 후 종료
+                self.after(0, lambda: messagebox.showinfo(
+                    "업데이트",
+                    "업데이트 파일을 내려받았습니다.\n"
+                    "프로그램이 종료된 후 자동으로 교체되고 재시작됩니다."))
+                self.after(500, self._quit_app)
+            elif res is True:
                 self.after(0, lambda: messagebox.showinfo(
                     "업데이트 완료",
-                    "업데이트 파일 교체가 완료되었습니다.\n프로그램을 재시작해 주세요."))
+                    "업데이트가 완료되었습니다.\n프로그램을 재시작해 주세요."))
                 self.after(0, lambda: self._app_up_btn.config(
                     text="✅ 재시작 필요", state="normal"))
             else:
@@ -868,11 +926,7 @@ class App(tk.Tk):
     # rclone 다운로드/업데이트
     # ────────────────────────────────────────────
     def _handle_rc_click(self, event):
-        """
-        레이블 클릭:
-        - 'rclone 다운로드': 최신 버전 다운로드 후 자동 등록
-        - '업데이트' 포함 : 등록된 rclone를 최신 버전으로 업데이트
-        """
+        """레이블 클릭: 다운로드 또는 업데이트"""
         text = self._rc_ver_label.cget("text")
 
         if "다운로드" in text:
@@ -891,18 +945,9 @@ class App(tk.Tk):
                 threading.Thread(target=self._do_rc_down, daemon=True).start()
 
     def _do_rc_down(self):
-        """
-        rclone 다운로드/업데이트 실행 (백그라운드).
-        다운로드 위치:
-        - 등록된 경로가 있으면 해당 디렉토리에 덮어쓰기
-        - 없으면 APP_DIR 에 다운로드 후 자동 등록
-        """
-        # 다운로드 대상 디렉토리 결정
+        """rclone 다운로드/업데이트 (백그라운드)"""
         registered = self._cfg.get("rclone_path", "").strip()
-        if registered:
-            dest_dir = Path(registered).parent
-        else:
-            dest_dir = APP_DIR
+        dest_dir = Path(registered).parent if registered else APP_DIR
 
         self.after(0, lambda: self._rc_ver_label.config(
             text="다운로드 중... 0%", fg="#89b4fa"))
@@ -937,34 +982,27 @@ class App(tk.Tk):
     # 트레이
     # ────────────────────────────────────────────
     def _start_tray(self):
-        if not pystray:
+        """pystray + PIL 모두 사용 가능할 때만 트레이 초기화"""
+        if not pystray or not _PIL_AVAILABLE:
             return
         try:
             main_icon = _make_circle_icon("#cba6f7", 64)
-            self._tray = pystray.Icon("RcloneManager", main_icon, "RcloneManager",
-                                      menu=self._build_tray_menu())
+            self._tray = pystray.Icon(
+                "RcloneManager", main_icon, "RcloneManager",
+                menu=self._build_tray_menu())
             threading.Thread(target=self._tray.run, daemon=True).start()
         except Exception:
-            pass
+            self._tray = None
 
     def _build_tray_menu(self):
-        """
-        트레이 우클릭 메뉴:
-        🪟 열기
-        ─────────────────
-        🟢/⚫ [드라이브/리모트] (remote:path)   ← 클릭 시 마운트/언마운트 토글
-        ... (등록된 마운트 전체)
-        (등록된 마운트 없음) ← 마운트 없을 때
-        ─────────────────
-        🚪 종료
-        """
-        if not pystray:
+        """트레이 우클릭 메뉴 구성"""
+        if not pystray or not _PIL_AVAILABLE:
             return None
 
-        icon_open = _make_dot_icon("#89b4fa")   # 파란
-        icon_quit = _make_dot_icon("#f38ba8")   # 빨간
-        icon_on   = _make_dot_icon("#a6e3a1")   # 초록
-        icon_off  = _make_dot_icon("#585b70")   # 회색
+        icon_open = _make_dot_icon("#89b4fa")
+        icon_quit = _make_dot_icon("#f38ba8")
+        icon_on   = _make_dot_icon("#a6e3a1")
+        icon_off  = _make_dot_icon("#585b70")
 
         items = [
             pystray.MenuItem("🪟 열기", lambda: self.after(0, self.show_window),
@@ -1024,7 +1062,6 @@ class App(tk.Tk):
             rstr = f"{m['remote']}:{m.get('remote_path', '')}".strip(":")
             self._tree.insert("", "end", iid=m["id"],
                               values=("💾 마운트", auto, m.get("drive", ""), rstr, lbl))
-        # 트레이 메뉴 동기화
         if self._tray:
             try:
                 self._tray.menu = self._build_tray_menu()
