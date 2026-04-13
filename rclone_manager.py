@@ -21,6 +21,18 @@ import urllib.parse
 from pathlib import Path
 import ctypes
 
+# 테스트 및 런타임 호환성을 위해 모듈을 상단에서 임포트합니다.
+try:
+    import winreg
+except ImportError:
+    winreg = None
+
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+except ImportError:
+    pystray = None
+
 # ── 프로그램 설정 ──
 APP_VERSION = "1.0.8"
 GITHUB_REPO = "Murianwind/rclone_mount_manager"
@@ -45,9 +57,9 @@ def get_sys_info():
 
 # ── 2. 시작 프로그램 및 유틸리티 ──
 def is_startup_enabled():
-    """시작 프로그램 등록 여부 확인 (Scenario 16)"""
+    """시작 프로그램 등록 여부 확인 (Scenario 08, 16)"""
+    if not winreg: return False
     try:
-        import winreg
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
         winreg.QueryValueEx(key, "RcloneManager")
         winreg.CloseKey(key)
@@ -56,8 +68,8 @@ def is_startup_enabled():
 
 def set_startup(enable: bool):
     """시작 프로그램 등록/해제 (Scenario 16)"""
+    if not winreg: return False
     try:
-        import winreg
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE)
         if enable:
             path = f'"{sys.executable}"' if getattr(sys, 'frozen', False) else f'pythonw "{Path(__file__).resolve()}"'
@@ -71,6 +83,7 @@ def set_startup(enable: bool):
 
 # ── 요구사항 1: conf 불러오기 유틸리티 복구 (1.0.0 로직) ──
 def parse_rclone_conf(conf_path: Path):
+    """(Scenario 24) rclone.conf 파일을 파싱하여 리모트 목록 반환"""
     remotes = []
     try:
         cfg = configparser.ConfigParser()
@@ -81,6 +94,7 @@ def parse_rclone_conf(conf_path: Path):
     return remotes
 
 def find_default_rclone_conf():
+    """시스템 기본 rclone.conf 경로 탐색"""
     for p in [Path(os.environ.get("APPDATA", "")) / "rclone" / "rclone.conf", Path.home() / ".config" / "rclone" / "rclone.conf", APP_DIR / "rclone.conf"]:
         if p.exists(): return p
     return None
@@ -114,6 +128,7 @@ else: APP_DIR = Path(__file__).parent
 CONFIG_FILE = APP_DIR / "mounts.json"
 
 def load_config():
+    """(Scenario 05, 06) 설정 로드"""
     if CONFIG_FILE.exists():
         try:
             cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
@@ -124,10 +139,11 @@ def load_config():
     return {"remotes": [], "mounts": [], "rclone_path": "", "auto_mount": False}
 
 def save_config(cfg):
+    """(Scenario 07) 설정 저장"""
     CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
 def get_rclone_exe(cfg):
-    """rclone 경로 확인 (Scenario 1)"""
+    """(Scenario 01) rclone 경로 확인"""
     p = cfg.get("rclone_path", "").strip()
     if p and Path(p).exists(): return Path(p)
     return APP_DIR / "rclone.exe"
@@ -135,7 +151,7 @@ def get_rclone_exe(cfg):
 active_mounts = {}
 
 def build_cmd(exe: Path, mount: dict):
-    """명령어 빌드 (Scenario 7)"""
+    """(Scenario 02, 03, 04) 명령어 빌드"""
     rpath = mount.get("remote_path", "").strip().replace("\\", "/").strip("/")
     drive_target = mount.get("drive", "").strip() or " "
     cmd = [str(exe), "mount", f"{mount['remote']}:{rpath}", drive_target, "--volname", mount.get("label") or mount["remote"]]
@@ -148,6 +164,7 @@ def build_cmd(exe: Path, mount: dict):
     return cmd
 
 def unmount(mid):
+    """(Scenario 09) 언마운트 수행"""
     p = active_mounts.get(mid)
     if p:
         p.terminate()
@@ -156,6 +173,7 @@ def unmount(mid):
         active_mounts.pop(mid, None)
 
 def activate_existing_window():
+    """(Scenario 10) 중복 실행 시 기존 창 활성화"""
     hwnd = ctypes.windll.user32.FindWindowW(None, "RcloneManager")
     if hwnd:
         ctypes.windll.user32.ShowWindow(hwnd, 9)
@@ -176,51 +194,34 @@ class ConfImportDialog(tk.Toplevel):
         tk.Button(self, text="가져오기", bg="#cba6f7", fg="#1e1e2e", font=("Segoe UI", 10, "bold"), relief="flat", command=self._ok).pack(pady=10, ipady=3, ipadx=10)
     def _ok(self): self.selected = [(r["name"], r["type"]) for v, r in self._vars if v.get()]; self.destroy()
 
-# ── 요구사항 3: UpdateDialog 클래스 추가 ──
+# ── 요구사항 3: UpdateDialog 클래스 추가 (업데이트 상세 확인) ──
 class UpdateDialog(tk.Toplevel):
     def __init__(self, parent, tag, body):
         super().__init__(parent)
-        self.title(f"업데이트 확인 - {tag}")
-        self.geometry("600x500")
-        self.configure(bg="#1e1e2e")
-        self.grab_set()
-        self.confirmed = False
-        c = tk.Frame(self, padx=25, pady=20, bg="#1e1e2e")
-        c.pack(fill="both", expand=True)
+        self.title(f"업데이트 확인 - {tag}"); self.geometry("600x500"); self.configure(bg="#1e1e2e"); self.grab_set(); self.confirmed = False
+        c = tk.Frame(self, padx=25, pady=20, bg="#1e1e2e"); c.pack(fill="both", expand=True)
         tk.Label(c, text=f"✨ 새 버전({tag})으로 업데이트하시겠습니까?", bg="#1e1e2e", fg="#cba6f7", font=("Segoe UI", 12, "bold")).pack(pady=(0, 15))
-        txt = tk.Text(c, bg="#313244", fg="#cdd6f4", relief="flat", font=("Segoe UI", 10), height=15, padx=10, pady=10)
-        txt.pack(fill="both", expand=True, pady=10)
-        txt.insert("1.0", body)
-        txt.config(state="disabled")
-        btn_f = tk.Frame(c, bg="#1e1e2e")
-        btn_f.pack(fill="x", pady=(15, 0))
+        txt = tk.Text(c, bg="#313244", fg="#cdd6f4", relief="flat", font=("Segoe UI", 10), height=15, padx=10, pady=10); txt.pack(fill="both", expand=True, pady=10); txt.insert("1.0", body); txt.config(state="disabled")
+        btn_f = tk.Frame(c, bg="#1e1e2e"); btn_f.pack(fill="x", pady=(15, 0))
         tk.Button(btn_f, text="업데이트", bg="#a6e3a1", fg="#1e1e2e", font=("Segoe UI", 10, "bold"), relief="flat", command=self._ok, width=15).pack(side="right", padx=5, ipady=5)
         tk.Button(btn_f, text="취소", bg="#45475a", fg="#cdd6f4", font=("Segoe UI", 10, "bold"), relief="flat", command=self.destroy, width=15).pack(side="right", padx=5, ipady=5)
     def _ok(self): self.confirmed = True; self.destroy()
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  마운트 다이얼로그 (1:1 복원 유지)
+#  마운트 다이얼로그 (1.0.8 레이아웃 1:1 유지)
 # ══════════════════════════════════════════════════════════════════════════════
 class MountDialog(tk.Toplevel):
     def __init__(self, parent, mount=None, app_cfg=None):
         super().__init__(parent)
         self.title("마운트 추가" if not mount or "id" not in mount else "마운트 설정")
-        self.geometry("650x850")
-        self.configure(bg="#1e1e2e")
-        self.grab_set()
-        self.result = None
-        self._m = mount or {}
-        self._app_cfg = app_cfg
-        self._build()
+        self.geometry("650x850"); self.configure(bg="#1e1e2e"); self.grab_set(); self.result = None; self._m = mount or {}; self._app_cfg = app_cfg; self._build()
     
     def _build(self):
-        c = tk.Frame(self, padx=30, pady=25, bg="#1e1e2e")
-        c.pack(fill="both", expand=True)
+        c = tk.Frame(self, padx=30, pady=25, bg="#1e1e2e"); c.pack(fill="both", expand=True)
         lbl_style = {"bg": "#1e1e2e", "fg": "#cba6f7", "font": ("Segoe UI", 10, "bold")}
         ent_style = {"bg": "#313244", "fg": "#cdd6f4", "insertbackground": "#cdd6f4", "relief": "flat", "font": ("Segoe UI", 10)}
         tk.Label(c, text="리모트 이름 (rclone.conf의 [이름])", **lbl_style).pack(anchor="w")
-        self._rem = tk.Entry(c, **ent_style); self._rem.pack(fill="x", pady=(5, 15), ipady=3)
-        self._rem.insert(0, self._m.get("remote", ""))
+        self._rem = tk.Entry(c, **ent_style); self._rem.pack(fill="x", pady=(5, 15), ipady=3); self._rem.insert(0, self._m.get("remote", ""))
         tk.Label(c, text="서브 디렉토리 (예: sub/folder — 비워두면 루트 전체)", **lbl_style).pack(anchor="w")
         pth_f = tk.Frame(c, bg="#1e1e2e"); pth_f.pack(fill="x", pady=(5, 15))
         self._pth = tk.Entry(pth_f, **ent_style); self._pth.pack(side="left", fill="x", expand=True, ipady=3); self._pth.insert(0, self._m.get("remote_path", ""))
@@ -274,10 +275,7 @@ class App(tk.Tk):
     def __init__(self):
         self._tray = None 
         super().__init__()
-        self.title("RcloneManager")
-        self.geometry("1200x800")
-        self.configure(bg="#1e1e2e")
-        self.protocol("WM_DELETE_WINDOW", self.hide_window)
+        self.title("RcloneManager"); self.geometry("1200x800"); self.configure(bg="#1e1e2e"); self.protocol("WM_DELETE_WINDOW", self.hide_window)
         self._cfg = load_config(); self._status = {}; self._latest_rc = ""; self._latest_app_info = None
         self._build_ui(); self._refresh_list(); self._start_tray(); self._check_versions_async()
         if self._cfg.get("auto_mount"): self.after(1500, self._automount_all)
@@ -293,7 +291,6 @@ class App(tk.Tk):
         ttk.Label(ttl_f, text="🚀 RcloneManager", style="Header.TLabel").pack(side="left")
         ttk.Label(ttl_f, text=f"v{APP_VERSION}", foreground="#fab387", font=("Segoe UI", 10, "bold")).pack(side="left", padx=8, pady=(5,0))
         tk.Button(ttl_f, text="!", bg="#f38ba8", fg="#1e1e2e", font=("Segoe UI", 9, "bold"), relief="flat", width=2, command=self._open_issue).pack(side="left", padx=5, pady=(5,0))
-        # 요구사항 3: 업데이트 버튼 커맨드 수정
         self._app_up_btn = tk.Button(hdr, text="✨ 새 버전 업데이트 가능", bg="#a6e3a1", fg="#1e1e2e", font=("Segoe UI", 9, "bold"), relief="flat", command=self._show_app_update_confirm)
         rcf = tk.Frame(self, bg="#1e1e2e"); rcf.pack(fill="x", padx=20, pady=5)
         tk.Label(rcf, text="rclone 경로:", bg="#1e1e2e", fg="#cba6f7", font=("Segoe UI", 10, "bold")).pack(side="left")
@@ -313,7 +310,6 @@ class App(tk.Tk):
         ttk.Button(btn_f, text="🗑️ 삭제", command=self._del).pack(side="left", padx=2)
         ttk.Button(btn_f, text="🔼", width=4, command=self._move_up).pack(side="left", padx=2)
         ttk.Button(btn_f, text="🔽", width=4, command=self._move_down).pack(side="left", padx=2)
-        # 요구사항 1: conf 불러오기 버튼 복구
         ttk.Button(btn_f, text="📥 conf 가져오기", command=self._import_conf).pack(side="left", padx=2)
         ttk.Button(btn_f, text="▶ 마운트", command=self._mount_sel).pack(side="left", padx=15)
         ttk.Button(btn_f, text="■ 언마운트", command=self._unmount_sel).pack(side="left")
@@ -336,13 +332,11 @@ class App(tk.Tk):
                     else: self.after(0, lambda: self._rc_ver_label.config(text=f"v{loc_rc} (최신)", fg="#94e2d5"))
                 except: self.after(0, lambda: self._rc_ver_label.config(text="v알 수 없음", fg="#f38ba8"))
             try:
-                # 요구사항 3: 앱 업데이트 데이터 저장
                 res = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest", timeout=5); data = res.json(); latest_app = data.get("tag_name", "").lstrip("v"); self._latest_app_info = data
                 if latest_app > APP_VERSION: self.after(0, lambda: self._app_up_btn.pack(side="right"))
             except: pass
         threading.Thread(target=_task, daemon=True).start()
 
-    # 요구사항 3: 업데이트 상세 확인창 메서드
     def _show_app_update_confirm(self):
         if self._latest_app_info:
             tag = self._latest_app_info.get("tag_name", "New Version"); body = self._latest_app_info.get("body", "No release notes."); dlg = UpdateDialog(self, tag, body); self.wait_window(dlg)
@@ -360,7 +354,6 @@ class App(tk.Tk):
 
     def _refresh_list(self):
         for i in self._tree.get_children(): self._tree.delete(i)
-        # 요구사항 1: 원본 리모트 목록 표시 복구
         for r in self._cfg.get("remotes", []): self._tree.insert("", "end", iid=f"remote_{r['name']}", values=("☁️ 원본", "—", "—", f"[{r['type']}] {r['name']}", "설정 대기"), tags=("remote_tag",))
         for m in self._cfg.get("mounts", []):
             st = self._status.get(m["id"], "stopped"); auto = "✅" if m.get("auto_mount") else "—"; lbl = "🟢 실행중" if st == "mounted" else "⚫ 중지됨"; rstr = f"{m['remote']}:{m.get('remote_path','')}".strip(":")
@@ -373,7 +366,6 @@ class App(tk.Tk):
         p = filedialog.askopenfilename()
         if p: self._rc_var.set(p); self._cfg["rclone_path"] = p; save_config(self._cfg); self._check_versions_async()
 
-    # 요구사항 1: conf 불러오기 메서드 복구
     def _import_conf(self):
         p = find_default_rclone_conf(); path = filedialog.askopenfilename(initialdir=str(p.parent) if p else None)
         if not path: return
@@ -447,10 +439,9 @@ class App(tk.Tk):
         if sel and not sel[0].startswith("remote_"): unmount(sel[0])
 
     def _start_tray(self):
+        if not pystray: return
         try:
-            import pystray; from PIL import Image, ImageDraw
             img = Image.new("RGBA", (64,64), (0,0,0,0)); d = ImageDraw.Draw(img); d.ellipse([2,2,62,62], fill="#cba6f7")
-            # 요구사항 2: '열기' 메뉴에 default=True 설정 (더블클릭 지원)
             self._tray = pystray.Icon("RcloneManager", img, "RcloneManager", 
                                        menu=pystray.Menu(pystray.MenuItem("열기", lambda: self.after(0, self.show_window), default=True), 
                                                          pystray.MenuItem("종료", lambda: self.after(0, self._quit_app))))
