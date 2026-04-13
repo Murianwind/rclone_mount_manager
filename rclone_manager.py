@@ -19,14 +19,22 @@ import uuid
 from pathlib import Path
 import ctypes
 
-# ── 1. 윈도우 고해상도(DPI) 대응 보강 ──
+# ── 1. 고해상도(DPI) 대응 및 단일 인스턴스 활성화 ──
 try:
-    # Windows 8.1 이상에서 프로세스 DPI 인식을 설정합니다.
     ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    # Windows 7/8 하위 호환성을 위해 추가 설정합니다.
     ctypes.windll.user32.SetProcessDPIAware()
 except Exception:
     pass
+
+def activate_existing_window():
+    """이미 실행 중인 창을 찾아 화면 앞으로 가져옵니다."""
+    hwnd = ctypes.windll.user32.FindWindowW(None, "RcloneManager")
+    if hwnd:
+        # 최소화 상태면 복구하고 포커스 제공
+        ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        ctypes.windll.user32.SetForegroundWindow(hwnd)
+        return True
+    return False
 
 # ── 경로 설정 ──
 if getattr(sys, 'frozen', False):
@@ -45,10 +53,9 @@ def load_config():
         try:
             cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
             for m in cfg.get("mounts", []):
-                if "id" not in m:
-                    m["id"] = str(uuid.uuid4())
-            if "remotes" not in cfg:
-                cfg["remotes"] = []
+                if "id" not in m: m["id"] = str(uuid.uuid4())
+            if "remotes" not in cfg: cfg["remotes"] = []
+            if "auto_mount" not in cfg: cfg["auto_mount"] = False
             return cfg
         except Exception: 
             pass
@@ -205,8 +212,12 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("RcloneManager")
+        
+        # 고해상도에서의 메인 창 출력 문제 해결: 크기 상향 및 레이아웃 강제 갱신
+        self.geometry("850x600")
+        self.minsize(800, 550)
         self.resizable(True, True)
-        self.minsize(750, 460)
+        
         self.protocol("WM_DELETE_WINDOW", self.hide_window)
         self._cfg = load_config()
         self._status = {}
@@ -214,6 +225,12 @@ class App(tk.Tk):
         self._refresh_list()
         self._start_tray()
         self._check_update_async()
+        
+        # 창이 화면에 즉시 나타나도록 설정
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
         if self._cfg.get("auto_mount"):
             self.after(1500, self._automount_all)
 
@@ -240,7 +257,7 @@ class App(tk.Tk):
         rcf.pack(fill="x", padx=12, pady=4)
         tk.Label(rcf, text="rclone 경로:", bg="#1e1e2e", fg="#cba6f7", font=("Segoe UI", 9, "bold")).pack(side="left")
         self._rc_var = tk.StringVar(value=self._cfg.get("rclone_path", ""))
-        tk.Entry(rcf, textvariable=self._rc_var, bg="#313244", fg="#cdd6f4", insertbackground="#cdd6f4", relief="flat", font=("Segoe UI", 9), highlightthickness=1, highlightbackground="#585b70", highlightcolor="#cba6f7", width=35).pack(side="left", padx=6, ipady=3)
+        tk.Entry(rcf, textvariable=self._rc_var, bg="#313244", fg="#cdd6f4", insertbackground="#cdd6f4", relief="flat", font=("Segoe UI", 9), highlightthickness=1, highlightbackground="#585b70", highlightcolor="#cba6f7", width=50).pack(side="left", padx=6, ipady=3)
         tk.Button(rcf, text="📂", bg="#45475a", fg="#cdd6f4", relief="flat", command=self._browse_rc).pack(side="left")
 
         opt = tk.Frame(self, bg="#1e1e2e")
@@ -251,20 +268,20 @@ class App(tk.Tk):
         ttk.Checkbutton(opt, text="시작 시 자동 마운트", variable=self._am_var, command=self._toggle_am).pack(side="left")
 
         cols = ("type", "auto", "drive", "remote", "status")
-        self._tree = ttk.Treeview(self, columns=cols, show="headings", height=8, selectmode="browse")
+        self._tree = ttk.Treeview(self, columns=cols, show="headings", height=10, selectmode="browse")
         self._tree.heading("type", text="구분")
         self._tree.heading("auto", text="자동")
         self._tree.heading("drive", text="드라이브")
         self._tree.heading("remote", text="리모트 (서브경로)")
         self._tree.heading("status", text="상태")
         
-        self._tree.column("type", width=80, anchor="center")
-        self._tree.column("auto", width=40, anchor="center")
-        self._tree.column("drive", width=60, anchor="center")
-        self._tree.column("remote", width=250)
-        self._tree.column("status", width=90, anchor="center")
+        self._tree.column("type", width=100, anchor="center")
+        self._tree.column("auto", width=60, anchor="center")
+        self._tree.column("drive", width=80, anchor="center")
+        self._tree.column("remote", width=350)
+        self._tree.column("status", width=110, anchor="center")
         
-        self._tree.pack(fill="both", expand=True, padx=12)
+        self._tree.pack(fill="both", expand=True, padx=12, pady=5)
         self._tree.bind("<Double-1>", lambda e: self._toggle_row_auto())
 
         btn = ttk.Frame(self)
@@ -281,14 +298,13 @@ class App(tk.Tk):
 
         self._sbar = ttk.Label(self, text="준비", foreground="#a6e3a1")
         self._sbar.pack(fill="x", padx=12, pady=(2, 8))
-        self.geometry("750x460")
 
     def _refresh_list(self):
         for i in self._tree.get_children():
             self._tree.delete(i)
         for r in self._cfg.get("remotes", []):
             self._tree.insert("", "end", iid=f"remote_{r['name']}", values=("☁️ 원본", "—", "—", f"[{r['type']}] {r['name']}", "설정 대기"), tags=("remote_tag",))
-        for m in self._cfg["mounts"]:
+        for m in self._cfg.get("mounts", []):
             st = self._status.get(m["id"], "stopped")
             auto = "✅" if m.get("auto_mount") else "—"
             tag = "on" if st == "mounted" else "off"
@@ -299,18 +315,11 @@ class App(tk.Tk):
         self._tree.tag_configure("remote_tag", foreground="#8fa0b5")
         self._tree.tag_configure("on", foreground="#a6e3a1")
         self._tree.tag_configure("off", foreground="#cdd6f4")
-        
-        # 트레이 아이콘 강제 새로고침
-        if hasattr(self, '_tray') and self._tray is not None:
-            try:
-                self._tray.update_menu()
-            except Exception:
-                pass
+        if hasattr(self, '_tray'): self._tray.update_menu()
 
     def _get_m(self, mid):
         for i, m in enumerate(self._cfg["mounts"]):
-            if m.get("id") == mid:
-                return i, m
+            if m.get("id") == mid: return i, m
         return None, None
 
     def _sel_id(self):
@@ -324,15 +333,13 @@ class App(tk.Tk):
             self._cfg["rclone_path"] = p
             save_config(self._cfg)
 
-    def _toggle_st(self):
-        set_startup(self._st_var.get())
-
+    def _toggle_st(self): set_startup(self._st_var.get())
     def _toggle_am(self):
         self._cfg["auto_mount"] = self._am_var.get()
         save_config(self._cfg)
 
     def _automount_all(self):
-        for m in self._cfg["mounts"]:
+        for m in self._cfg.get("mounts", []):
             if m.get("auto_mount") and m["id"] not in active_mounts:
                 self._do_mount(m["id"], m)
 
@@ -355,16 +362,12 @@ class App(tk.Tk):
             idx = next((i for i, r in enumerate(self._cfg.get("remotes", [])) if f"remote_{r['name']}" == mid), None)
             if idx is not None and idx > 0:
                 self._cfg["remotes"][idx], self._cfg["remotes"][idx-1] = self._cfg["remotes"][idx-1], self._cfg["remotes"][idx]
-                save_config(self._cfg)
-                self._refresh_list()
-                self._tree.selection_set(mid)
+                save_config(self._cfg); self._refresh_list(); self._tree.selection_set(mid)
         else:
             idx, m = self._get_m(mid)
             if idx is not None and idx > 0:
                 self._cfg["mounts"][idx], self._cfg["mounts"][idx-1] = self._cfg["mounts"][idx-1], self._cfg["mounts"][idx]
-                save_config(self._cfg)
-                self._refresh_list()
-                self._tree.selection_set(mid)
+                save_config(self._cfg); self._refresh_list(); self._tree.selection_set(mid)
 
     def _move_down(self):
         mid = self._sel_id()
@@ -373,16 +376,12 @@ class App(tk.Tk):
             idx = next((i for i, r in enumerate(self._cfg.get("remotes", [])) if f"remote_{r['name']}" == mid), None)
             if idx is not None and idx < len(self._cfg["remotes"])-1:
                 self._cfg["remotes"][idx], self._cfg["remotes"][idx+1] = self._cfg["remotes"][idx+1], self._cfg["remotes"][idx]
-                save_config(self._cfg)
-                self._refresh_list()
-                self._tree.selection_set(mid)
+                save_config(self._cfg); self._refresh_list(); self._tree.selection_set(mid)
         else:
             idx, m = self._get_m(mid)
             if idx is not None and idx < len(self._cfg["mounts"])-1:
                 self._cfg["mounts"][idx], self._cfg["mounts"][idx+1] = self._cfg["mounts"][idx+1], self._cfg["mounts"][idx]
-                save_config(self._cfg)
-                self._refresh_list()
-                self._tree.selection_set(mid)
+                save_config(self._cfg); self._refresh_list(); self._tree.selection_set(mid)
 
     def _import_conf(self):
         p = find_default_rclone_conf()
@@ -396,8 +395,7 @@ class App(tk.Tk):
             for r_name, r_type in dlg.selected:
                 if r_name not in exist:
                     self._cfg.setdefault("remotes", []).append({"name": r_name, "type": r_type})
-            save_config(self._cfg)
-            self._refresh_list()
+            save_config(self._cfg); self._refresh_list()
 
     def _add(self):
         mid = self._sel_id()
@@ -407,8 +405,7 @@ class App(tk.Tk):
         if dlg.result:
             dlg.result["id"] = str(uuid.uuid4())
             self._cfg["mounts"].append(dlg.result)
-            save_config(self._cfg)
-            self._refresh_list()
+            save_config(self._cfg); self._refresh_list()
 
     def _edit(self):
         mid = self._sel_id()
@@ -419,8 +416,7 @@ class App(tk.Tk):
         if dlg.result:
             dlg.result["id"] = mid
             self._cfg["mounts"][idx] = dlg.result
-            save_config(self._cfg)
-            self._refresh_list()
+            save_config(self._cfg); self._refresh_list()
 
     def _del(self):
         mid = self._sel_id()
@@ -429,16 +425,12 @@ class App(tk.Tk):
             r_name = mid.split("remote_", 1)[1]
             if messagebox.askyesno("삭제", f"원본 '{r_name}'을 삭제할까요?"):
                 self._cfg["remotes"] = [r for r in self._cfg.get("remotes", []) if r["name"] != r_name]
-                save_config(self._cfg)
-                self._refresh_list()
+                save_config(self._cfg); self._refresh_list()
             return
         idx, m = self._get_m(mid)
         if messagebox.askyesno("삭제", "마운트를 삭제할까요?"):
-            unmount(mid)
-            self._status.pop(mid, None)
-            self._cfg["mounts"].pop(idx)
-            save_config(self._cfg)
-            self._refresh_list()
+            unmount(mid); self._status.pop(mid, None); self._cfg["mounts"].pop(idx)
+            save_config(self._cfg); self._refresh_list()
 
     def _do_mount(self, mid, m):
         exe = get_rclone_exe(self._cfg)
@@ -454,15 +446,12 @@ class App(tk.Tk):
         mid = self._sel_id()
         if not mid or mid.startswith("remote_") or mid in active_mounts: return
         idx, m = self._get_m(mid)
-        if m:
-            self._do_mount(mid, m)
+        if m: self._do_mount(mid, m)
 
     def _unmount_sel(self):
         mid = self._sel_id()
         if not mid or mid.startswith("remote_"): return
-        unmount(mid)
-        self._status[mid] = "stopped"
-        self._refresh_list()
+        unmount(mid); self._status[mid] = "stopped"; self._refresh_list()
 
     def _check_update_async(self):
         def _c():
@@ -484,56 +473,33 @@ class App(tk.Tk):
             if res is True: 
                 self.after(0, lambda: self._sbar.config(text="업데이트 완료."))
                 self.after(0, self._check_update_async)
-            else: 
-                self.after(0, lambda: self._sbar.config(text=f"실패: {res}"))
+            else: self.after(0, lambda: self._sbar.config(text=f"실패: {res}"))
         threading.Thread(target=_do, daemon=True).start()
 
     def _start_tray(self):
         try:
             import pystray
             from PIL import Image, ImageDraw
-            
-            img = Image.new("RGBA", (64,64), (0,0,0,0))
-            d = ImageDraw.Draw(img)
-            d.ellipse([2,2,62,62], fill="#cba6f7")
-            d.text((14,20), "RC", fill="#1e1e2e")
-            
-            def on_show(icon, item): 
-                self.after(0, self.show_window)
-            
-            def on_quit(icon, item): 
-                self.after(0, self._quit_app)
-            
+            img = Image.new("RGBA", (64,64), (0,0,0,0)); d = ImageDraw.Draw(img)
+            d.ellipse([2,2,62,62], fill="#cba6f7"); d.text((14,20), "RC", fill="#1e1e2e")
+            def on_show(icon, item): self.after(0, self.show_window)
+            def on_quit(icon, item): self.after(0, self._quit_app)
             def on_toggle_mount(m):
                 mid = m["id"]
-                if mid in active_mounts:
-                    unmount(mid)
-                    self._status[mid] = "stopped"
-                else:
-                    self._do_mount(mid, m)
+                if mid in active_mounts: unmount(mid); self._status[mid] = "stopped"
+                else: self._do_mount(mid, m)
                 self.after(0, self._refresh_list)
-
             def get_menu_items():
                 items = [pystray.MenuItem("📂 창 열기", on_show, default=True), pystray.Menu.SEPARATOR]
-                
                 for m in self._cfg.get("mounts", []):
                     is_active = self._status.get(m["id"]) == "mounted"
-                    status_icon = "■ (중지)" if is_active else "▶ (시작)"
-                    label = f"{status_icon} {m['remote']} ({m.get('drive','')})"
-                    
-                    items.append(pystray.MenuItem(
-                        label, 
-                        (lambda m_obj: lambda icon, item: on_toggle_mount(m_obj))(m)
-                    ))
-                    
+                    label = f"{'■' if is_active else '▶'} {m['remote']} ({m.get('drive','')})"
+                    items.append(pystray.MenuItem(label, (lambda m_obj: lambda icon, item: on_toggle_mount(m_obj))(m)))
                 items += [pystray.Menu.SEPARATOR, pystray.MenuItem("❌ 종료", on_quit)]
                 return items
-
             self._tray = pystray.Icon("RcloneManager", img, "RcloneManager", menu=pystray.Menu(get_menu_items))
             threading.Thread(target=self._tray.run, daemon=True).start()
-        except Exception as e: 
-            print("Tray icon error:", e)
-            pass
+        except Exception: pass
 
     def hide_window(self): self.withdraw()
     def show_window(self): self.deiconify(); self.lift(); self.focus_force()
@@ -542,7 +508,6 @@ class App(tk.Tk):
         try: self._tray.stop()
         except Exception: pass
         self.destroy()
-
 
 class ConfImportDialog(tk.Toplevel):
     def __init__(self, parent, remotes):
@@ -556,33 +521,20 @@ class ConfImportDialog(tk.Toplevel):
         tk.Button(self, text="가져오기", bg="#cba6f7", command=self._ok).pack(pady=10)
     def _ok(self): self.selected = [(r["name"], r["type"]) for v, r in self._vars if v.get()]; self.destroy()
 
-
 class MountDialog(tk.Toplevel):
     CACHE_MODES = ["off", "minimal", "writes", "full"]
     DRIVES = [""] + [f"{c}:" for c in "DEFGHIJKLMNOPQRSTUVWXYZ"]
-    
+    FORBIDDEN_FLAGS = ["--volname", "--cache-dir", "--vfs-cache-mode"]
+
     def __init__(self, parent, mount=None, app_cfg=None):
-        super().__init__(parent)
-        self.title("마운트 편집" if mount and "id" in mount else "마운트 추가")
-        
-        # ── 고해상도 대응: 세로 리사이즈 허용 및 최소 크기 설정 ──
-        self.resizable(True, True) 
-        self.minsize(600, 700)
-        
-        self.grab_set()
-        self.configure(bg="#1e1e2e")
-        self.result = None
-        self._m = mount or {}
-        self._app_cfg = app_cfg
-        self._build()
-        
-        # 기본 실행 크기 (고해상도 배율 175% 고려)
+        super().__init__(parent); self.title("마운트 편집" if mount and "id" in mount else "마운트 추가")
+        self.resizable(True, True); self.minsize(600, 700); self.grab_set(); self.configure(bg="#1e1e2e")
+        self.result = None; self._m = mount or {}; self._app_cfg = app_cfg; self._build()
         self.geometry("700x850")
 
     def _build(self):
         BG, FG, HL, EBG = "#1e1e2e", "#cdd6f4", "#cba6f7", "#313244"
-        c = tk.Frame(self, bg=BG)
-        c.pack(fill="both", expand=True, padx=20, pady=10)
+        c = tk.Frame(self, bg=BG); c.pack(fill="both", expand=True, padx=20, pady=10)
         def lbl(t): tk.Label(c, text=t, bg=BG, fg=HL, font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(5, 1))
         
         lbl("리모트 이름 (rclone.conf의 [이름])")
@@ -610,17 +562,14 @@ class MountDialog(tk.Toplevel):
         ttk.Combobox(c, textvariable=self._cmode, values=self.CACHE_MODES, state="readonly", width=12).pack(anchor="w")
         
         lbl("추가 플래그 (; 또는 줄바꿈으로 구분)")
-        self._extra_text = tk.Text(c, bg=EBG, fg=FG, insertbackground=FG, relief="flat", font=("Segoe UI", 9), 
-                                   highlightthickness=1, highlightbackground="#585b70", highlightcolor=HL, 
-                                   wrap="word", height=4)
+        self._extra_text = tk.Text(c, bg=EBG, fg=FG, insertbackground=FG, relief="flat", font=("Segoe UI", 9), highlightthickness=1, highlightbackground="#585b70", highlightcolor=HL, wrap="word", height=4)
         self._extra_text.pack(fill="both", expand=True, pady=2)
         self._extra_text.insert("1.0", self._m.get("extra_flags", ""))
         
         self._auto = tk.BooleanVar(value=self._m.get("auto_mount", False))
         tk.Checkbutton(c, text="시작 시 자동 마운트", variable=self._auto, bg=BG, fg=FG, selectcolor=EBG, font=("Segoe UI", 9)).pack(anchor="w", pady=(5, 0))
         
-        bf = tk.Frame(c, bg=BG)
-        bf.pack(fill="x", side="bottom", pady=(10, 0))
+        bf = tk.Frame(c, bg=BG); bf.pack(fill="x", side="bottom", pady=(10, 0))
         tk.Button(bf, text="저장", bg=HL, fg="#1e1e2e", font=("Segoe UI", 10, "bold"), width=12, command=self._save).pack(side="right", padx=5)
         tk.Button(bf, text="취소", bg="#45475a", fg=FG, width=12, command=self.destroy).pack(side="right", padx=5)
 
@@ -641,22 +590,41 @@ class MountDialog(tk.Toplevel):
 
     def _save(self):
         rem = self._remote.get().strip()
+        drv = self._drive.get().strip()
+        path = self._rpath.get().strip().strip("/")
         if not rem: return messagebox.showwarning("오류", "리모트 이름 필수")
+        
+        # 중복 체크 로직 강화 (드라이브 중복 및 동일 경로 중복)
+        for m in self._app_cfg.get("mounts", []):
+            if m.get("id") == self._m.get("id"): continue
+            if drv and m.get("drive") == drv: return messagebox.showerror("오류", f"드라이브 문자 {drv}가 이미 등록되어 있습니다.")
+            if m.get("remote") == rem and m.get("remote_path", "").strip("/") == path:
+                return messagebox.showerror("오류", f"동일한 마운트({rem}:{path})가 이미 존재합니다.")
+
+        # 플래그 유효성 검사 및 자동 수정
         extra_val = self._extra_text.get("1.0", tk.END).strip()
+        clean_flags = []
+        for f in re.split(r"[\s;]+", extra_val):
+            f = f.strip()
+            if not f: continue
+            if any(f.startswith(forbidden) for forbidden in self.FORBIDDEN_FLAGS):
+                return messagebox.showerror("오류", f"금지된 플래그가 포함되어 있습니다: {f}\n(UI 설정 항목과 중복됩니다.)")
+            if not f.startswith("-"): f = "--" + f # 자동 수정 로직
+            clean_flags.append(f)
+
         self.result = {
-            "remote": rem, 
-            "remote_path": self._rpath.get().strip().strip("/"), 
-            "drive": self._drive.get().strip(), 
-            "cache_dir": self._cdir.get().strip(), 
-            "cache_mode": self._cmode.get(), 
-            "extra_flags": extra_val, 
-            "auto_mount": self._auto.get()
+            "remote": rem, "remote_path": path, "drive": drv,
+            "cache_dir": self._cdir.get().strip(), "cache_mode": self._cmode.get(),
+            "extra_flags": " ".join(clean_flags), "auto_mount": self._auto.get()
         }
         self.destroy()
 
 if __name__ == "__main__":
+    # 중복 실행 시 기존 창 활성화 로직
+    if activate_existing_window(): sys.exit(0)
+    
     mutex_name = "RcloneManager_SingleInstance_Mutex"
     mutex = ctypes.windll.kernel32.CreateMutexW(None, False, mutex_name)
-    if ctypes.windll.kernel32.GetLastError() == 183: 
-        sys.exit(0)
+    if ctypes.windll.kernel32.GetLastError() == 183: sys.exit(0)
+    
     app = App(); app.mainloop()
