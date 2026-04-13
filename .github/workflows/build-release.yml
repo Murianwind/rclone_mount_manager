@@ -60,6 +60,22 @@ jobs:
           (Get-Content $filePath) -replace 'APP_VERSION = ".*"', "APP_VERSION = `"$newVersion`"" | Set-Content $filePath
           echo "Updated APP_VERSION to $newVersion"
 
+      # ── 2-1. 변경된 소스 코드를 저장소로 다시 Push ──
+      - name: Commit and Push Version Change
+        if: env.SHOULD_UPDATE_VERSION == 'true'
+        shell: pwsh
+        run: |
+          # Git 사용자 설정
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # 변경사항 커밋
+          git add rclone_manager.py
+          git commit -m "chore: update version to ${{ env.CLEAN_VERSION }} [skip ci]"
+          
+          # 현재 브랜치로 푸시 (권한이 필요합니다)
+          git push origin HEAD:${{ github.event.release.target_commitish }}
+          
       - name: Build with PyInstaller
         run: |
           pyinstaller --clean --noconfirm --onefile --windowed `
