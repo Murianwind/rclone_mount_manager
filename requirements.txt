@@ -2,3 +2,4 @@ requests
 pystray
 Pillow
 pyinstaller
+pytest-cov
