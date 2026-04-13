@@ -85,19 +85,28 @@ jobs:
           echo "| 파일 경로 | 전체 분기 수 | 실행된 분기 | 실행 안 됨 | 분기 커버리지(%) | 누락된 분기 (화살표) |" >> $GITHUB_STEP_SUMMARY
           echo "|:---|---:|---:|---:|---:|:---|" >> $GITHUB_STEP_SUMMARY
           
-          grep -E "^custom_components" pytest-coverage.txt | while read -r line; do
+          # 필터링 대상을 custom_components에서 rclone_manager로 변경
+          grep -E "rclone_manager\.py" pytest-coverage.txt | while read -r line; do
             FILE_PATH=$(echo $line | awk '{print $1}')
+            # pytest-cov --cov-branch 출력 형식에 맞춰 열 번호 재조정
+            STMTS=$(echo $line | awk '{print $2}')
+            MISS=$(echo $line | awk '{print $3}')
             BRANCH=$(echo $line | awk '{print $4}')
             BR_MISS=$(echo $line | awk '{print $5}')
+            
+            # 분기 커버리지 계산 (분기가 있는 경우에만)
             PER=$(awk -v b="$BRANCH" -v m="$BR_MISS" 'BEGIN {if (b > 0) printf "%.1f%%", ((b - m) / b) * 100; else print "-"}')
-            MISSING_RAW=$(echo $line | awk '{for(i=7;i<=NF;i++) printf "%s ", $i}')
+            
+            # 누락된 분기 정보 추출 (-> 화살표 포함된 부분만 필터링)
+            MISSING_RAW=$(echo $line | awk '{for(i=6;i<=NF;i++) printf "%s ", $i}')
             MISSING_BRANCHES=$(echo $MISSING_RAW | tr ' ' '\n' | grep "\->" | tr '\n' ' ' | sed 's/ $//')
             if [ -z "$MISSING_BRANCHES" ]; then MISSING_BRANCHES="-"; fi
             
-            if [ "$BRANCH" -eq 0 ]; then
+            if [ "$BRANCH" = "0" ] || [ -z "$BRANCH" ] || [ "$BRANCH" = "-" ]; then
               echo "| $FILE_PATH | 0 | 0 | 0 | - | - |" >> $GITHUB_STEP_SUMMARY
             else
-              echo "| $FILE_PATH | $BRANCH | $(($BRANCH - $BR_MISS)) | $BR_MISS | **$PER** | $MISSING_BRANCHES |" >> $GITHUB_STEP_SUMMARY
+              EXEC_BR=$((BRANCH - BR_MISS))
+              echo "| $FILE_PATH | $BRANCH | $EXEC_BR | $BR_MISS | **$PER** | $MISSING_BRANCHES |" >> $GITHUB_STEP_SUMMARY
             fi
           done || true
 
