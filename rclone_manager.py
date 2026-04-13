@@ -19,10 +19,13 @@ import uuid
 from pathlib import Path
 import ctypes
 
-# ── 1. 윈도우 고해상도(DPI) 대응 ──
+# ── 1. 윈도우 고해상도(DPI) 대응 보강 ──
 try:
-    from ctypes import windll
-    windll.shcore.SetProcessDpiAwareness(1)
+    import ctypes
+    # 프로세스가 DPI를 인식하도록 설정 (Windows 8.1 이상)
+    ctypes.windll.shcore.SetProcessDpiAwareness(1) 
+    # 하위 호환성을 위한 설정 (Windows 7/8)
+    ctypes.windll.user32.SetProcessDPIAware()
 except Exception:
     pass
 
@@ -562,14 +565,23 @@ class MountDialog(tk.Toplevel):
     def __init__(self, parent, mount=None, app_cfg=None):
         super().__init__(parent)
         self.title("마운트 편집" if mount and "id" in mount else "마운트 추가")
-        self.resizable(True, False)
+        
+        # ── 수정 1: 세로 리사이즈 허용 (False -> True) ──
+        self.resizable(True, True) 
+        
         self.grab_set()
         self.configure(bg="#1e1e2e")
         self.result = None
         self._m = mount or {}
         self._app_cfg = app_cfg
         self._build()
-        self.geometry("550x580")
+        
+        # ── 수정 2: 최소 크기 지정 (창이 너무 작아지는 것 방지) ──
+        self.minsize(600, 700) 
+        
+        # ── 수정 3: 기본 실행 크기를 더 크게 변경 ──
+        # 175% 배율 환경을 고려하여 넉넉하게 설정합니다.
+        self.geometry("700x850")
 
     def _build(self):
         BG, FG, HL, EBG = "#1e1e2e", "#cdd6f4", "#cba6f7", "#313244"
