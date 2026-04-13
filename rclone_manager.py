@@ -16,8 +16,7 @@ import urllib.parse
 from pathlib import Path
 import ctypes
 
-# --- 선택적 임포트 처리 (테스트 및 환경 호환성 보강) ---
-# winreg, pystray, PIL 등이 없는 환경에서도 변수는 선언되어야 NameError가 나지 않습니다.
+# --- 선택적 임포트 처리 ---
 try:
     import winreg
 except ImportError:
@@ -67,7 +66,7 @@ def is_startup_enabled():
     if not winreg: return False
     try:
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
-        winreg.QueryValueEx(key, "RcloneManager")
+        _, _ = winreg.QueryValueEx(key, "RcloneManager")
         winreg.CloseKey(key)
         return True
     except Exception:
@@ -467,23 +466,30 @@ class App(tk.Tk):
         tk.Label(footer, text="Report Issue", bg="#1e1e2e", fg="#89b4fa", font=("Segoe UI", 9, "underline"), cursor="hand2").pack(side="right")
         footer.winfo_children()[-1].bind("<Button-1>", lambda e: self._open_issue())
 
-    def _delete_mount(self):
-        sel = self._tree.selection()
-        if not sel: return
-        if messagebox.askyesno("삭제", "정말 삭제하시겠습니까?"):
+    def _delete_mount(self, mid=None):
+        """삭제 메서드 - 인자 mid를 선택적으로 받도록 수정"""
+        if not mid:
+            sel = self._tree.selection()
+            if not sel: return
             mid = sel[0]
+        
+        if messagebox.askyesno("삭제", "정말 삭제하시겠습니까?"):
             self._cfg["mounts"] = [m for m in self._cfg["mounts"] if m.get("id") != mid]
             save_config(self._cfg)
             self._refresh_list()
 
-    def _mount_single(self):
-        sel = self._tree.selection()
-        if not sel: return
-        mid = sel[0]
+    def _mount_single(self, mid=None):
+        """마운트 시작 메서드 - 인자 mid를 선택적으로 받도록 수정"""
+        if not mid:
+            sel = self._tree.selection()
+            if not sel: return
+            mid = sel[0]
+        
         m = next((i for i in self._cfg["mounts"] if i["id"] == mid), None)
         if m: self._do_mount(mid, m)
 
-    def _open_issue(self):
+    def _open_issue(self, event=None):
+        """이슈 보고 - 이벤트 인자를 무시하도록 수정"""
         webbrowser.open(f"https://github.com/{GITHUB_REPO}/issues/new")
 
     def _on_focus_in(self, event):
@@ -646,7 +652,6 @@ class App(tk.Tk):
                 self._download_rc_with_ui(self._latest_rc)
 
     def _download_rc_with_ui(self, ver):
-        # 다운로드 로직 유지
         pass
 
     def _show_app_update_confirm(self):
