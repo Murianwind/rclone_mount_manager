@@ -30,7 +30,6 @@ def activate_existing_window():
     """이미 실행 중인 창을 찾아 화면 앞으로 가져옵니다."""
     hwnd = ctypes.windll.user32.FindWindowW(None, "RcloneManager")
     if hwnd:
-        # 최소화 상태면 복구하고 포커스 제공
         ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
         ctypes.windll.user32.SetForegroundWindow(hwnd)
         return True
@@ -54,6 +53,7 @@ def load_config():
             cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
             for m in cfg.get("mounts", []):
                 if "id" not in m: m["id"] = str(uuid.uuid4())
+                if "remote" not in m: m["remote"] = "Unknown"
             if "remotes" not in cfg: cfg["remotes"] = []
             if "auto_mount" not in cfg: cfg["auto_mount"] = False
             return cfg
@@ -112,11 +112,6 @@ def parse_rclone_conf(conf_path: Path):
         pass
     return remotes
 
-def find_default_rclone_conf():
-    for p in [Path(os.environ.get("APPDATA", "")) / "rclone" / "rclone.conf", Path.home() / ".config" / "rclone" / "rclone.conf", APP_DIR / "rclone.conf"]:
-        if p.exists(): return p
-    return None
-
 def get_local_version(rclone_exe: Path):
     if not rclone_exe.exists(): return None
     try:
@@ -153,30 +148,22 @@ def download_rclone(dest_dir: Path, version: str, progress_cb=None):
                     dest = dest_dir / "rclone.exe"
                     tmp_exe = dest_dir / "rclone_new.exe"
                     tmp_exe.write_bytes(data)
-                    if dest.exists():
-                        dest.unlink()
+                    if dest.exists(): dest.unlink()
                     tmp_exe.rename(dest)
                     break
         os.unlink(tmp)
         return True
-    except Exception as e:
-        return str(e)
-
-# ── 마운트 프로세스 관리 ──
-active_mounts = {}
+    except Exception as e: return str(e)
 
 def build_cmd(rclone_exe: Path, mount: dict):
     rpath = mount.get("remote_path", "").strip().replace("\\", "/").strip("/")
     cmd = [str(rclone_exe), "mount", f"{mount['remote']}:{rpath}", mount["drive"], "--volname", mount.get("label") or mount["remote"]]
-    if mount.get("cache_dir"):
-        cmd += ["--cache-dir", mount["cache_dir"]]
-    if mount.get("cache_mode"):
-        cmd += ["--vfs-cache-mode", mount["cache_mode"]]
+    if mount.get("cache_dir"): cmd += ["--cache-dir", mount["cache_dir"]]
+    if mount.get("cache_mode"): cmd += ["--vfs-cache-mode", mount["cache_mode"]]
     extra = mount.get("extra_flags", "").strip()
     if extra:
         for f in re.split(r"[\s;]+", extra):
-            if f.strip():
-                cmd.append(f.strip())
+            if f.strip(): cmd.append(f.strip())
     return cmd
 
 def do_mount(m_id, rclone_exe, mount, status_cb=None):
@@ -184,26 +171,23 @@ def do_mount(m_id, rclone_exe, mount, status_cb=None):
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=0x08000000)
         active_mounts[m_id] = proc
-        if status_cb:
-            status_cb(m_id, "mounted")
+        if status_cb: status_cb(m_id, "mounted")
         proc.wait()
         active_mounts.pop(m_id, None)
-        if status_cb:
-            status_cb(m_id, "stopped")
+        if status_cb: status_cb(m_id, "stopped")
     except Exception:
         active_mounts.pop(m_id, None)
-        if status_cb:
-            status_cb(m_id, "stopped")
+        if status_cb: status_cb(m_id, "stopped")
 
 def unmount(m_id):
     p = active_mounts.get(m_id)
     if p:
         p.terminate()
-        try:
-            p.wait(timeout=3)
-        except Exception:
-            p.kill()
+        try: p.wait(timeout=3)
+        except Exception: p.kill()
         active_mounts.pop(m_id, None)
+
+active_mounts = {}
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  메인 앱 클래스
@@ -213,7 +197,7 @@ class App(tk.Tk):
         super().__init__()
         self.title("RcloneManager")
         
-        # 고해상도에서의 메인 창 출력 문제 해결: 크기 상향 및 레이아웃 강제 갱신
+        # UI 출력 최적화: 고해상도 배율을 고려하여 충분한 크기 확보
         self.geometry("850x600")
         self.minsize(800, 550)
         self.resizable(True, True)
@@ -222,11 +206,14 @@ class App(tk.Tk):
         self._cfg = load_config()
         self._status = {}
         self._build_ui()
+        
+        # 2번째 이미지와 같이 리스트가 제대로 보이도록 강제 레이아웃 업데이트
+        self.update_idletasks()
         self._refresh_list()
         self._start_tray()
         self._check_update_async()
         
-        # 창이 화면에 즉시 나타나도록 설정
+        # 창 중앙 배치 및 활성화
         self.deiconify()
         self.lift()
         self.focus_force()
@@ -268,7 +255,7 @@ class App(tk.Tk):
         ttk.Checkbutton(opt, text="시작 시 자동 마운트", variable=self._am_var, command=self._toggle_am).pack(side="left")
 
         cols = ("type", "auto", "drive", "remote", "status")
-        self._tree = ttk.Treeview(self, columns=cols, show="headings", height=10, selectmode="browse")
+        self._tree = ttk.Treeview(self, columns=cols, show="headings", height=12, selectmode="browse")
         self._tree.heading("type", text="구분")
         self._tree.heading("auto", text="자동")
         self._tree.heading("drive", text="드라이브")
@@ -300,8 +287,7 @@ class App(tk.Tk):
         self._sbar.pack(fill="x", padx=12, pady=(2, 8))
 
     def _refresh_list(self):
-        for i in self._tree.get_children():
-            self._tree.delete(i)
+        for i in self._tree.get_children(): self._tree.delete(i)
         for r in self._cfg.get("remotes", []):
             self._tree.insert("", "end", iid=f"remote_{r['name']}", values=("☁️ 원본", "—", "—", f"[{r['type']}] {r['name']}", "설정 대기"), tags=("remote_tag",))
         for m in self._cfg.get("mounts", []):
@@ -310,7 +296,9 @@ class App(tk.Tk):
             tag = "on" if st == "mounted" else "off"
             lbl = "🟢 실행중" if st == "mounted" else "⚫ 중지됨"
             rpath = m.get("remote_path", "").replace("\\", "/").strip("/")
-            remote_str = f"{m['remote']}:{rpath}" if rpath else m["remote"]
+            # KeyError 방지: get() 사용
+            rem_name = m.get('remote', 'Unknown')
+            remote_str = f"{rem_name}:{rpath}" if rpath else rem_name
             self._tree.insert("", "end", iid=m["id"], values=("💾 마운트", auto, m.get("drive","?"), remote_str, lbl), tags=(tag,))
         self._tree.tag_configure("remote_tag", foreground="#8fa0b5")
         self._tree.tag_configure("on", foreground="#a6e3a1")
@@ -384,8 +372,9 @@ class App(tk.Tk):
                 save_config(self._cfg); self._refresh_list(); self._tree.selection_set(mid)
 
     def _import_conf(self):
-        p = find_default_rclone_conf()
-        path = filedialog.askopenfilename(initialdir=str(p.parent) if p else None)
+        p = [Path(os.environ.get("APPDATA", "")) / "rclone" / "rclone.conf", Path.home() / ".config" / "rclone" / "rclone.conf", APP_DIR / "rclone.conf"]
+        p_exist = next((x for x in p if x.exists()), None)
+        path = filedialog.askopenfilename(initialdir=str(p_exist.parent) if p_exist else None)
         if not path: return
         remotes = parse_rclone_conf(Path(path))
         dlg = ConfImportDialog(self, remotes)
@@ -393,8 +382,7 @@ class App(tk.Tk):
         if dlg.selected:
             exist = [r["name"] for r in self._cfg.get("remotes", [])]
             for r_name, r_type in dlg.selected:
-                if r_name not in exist:
-                    self._cfg.setdefault("remotes", []).append({"name": r_name, "type": r_type})
+                if r_name not in exist: self._cfg.setdefault("remotes", []).append({"name": r_name, "type": r_type})
             save_config(self._cfg); self._refresh_list()
 
     def _add(self):
@@ -493,7 +481,7 @@ class App(tk.Tk):
                 items = [pystray.MenuItem("📂 창 열기", on_show, default=True), pystray.Menu.SEPARATOR]
                 for m in self._cfg.get("mounts", []):
                     is_active = self._status.get(m["id"]) == "mounted"
-                    label = f"{'■' if is_active else '▶'} {m['remote']} ({m.get('drive','')})"
+                    label = f"{'■' if is_active else '▶'} {m.get('remote', 'Unknown')} ({m.get('drive','')})"
                     items.append(pystray.MenuItem(label, (lambda m_obj: lambda icon, item: on_toggle_mount(m_obj))(m)))
                 items += [pystray.Menu.SEPARATOR, pystray.MenuItem("❌ 종료", on_quit)]
                 return items
@@ -593,15 +581,11 @@ class MountDialog(tk.Toplevel):
         drv = self._drive.get().strip()
         path = self._rpath.get().strip().strip("/")
         if not rem: return messagebox.showwarning("오류", "리모트 이름 필수")
-        
-        # 중복 체크 로직 강화 (드라이브 중복 및 동일 경로 중복)
         for m in self._app_cfg.get("mounts", []):
             if m.get("id") == self._m.get("id"): continue
             if drv and m.get("drive") == drv: return messagebox.showerror("오류", f"드라이브 문자 {drv}가 이미 등록되어 있습니다.")
             if m.get("remote") == rem and m.get("remote_path", "").strip("/") == path:
                 return messagebox.showerror("오류", f"동일한 마운트({rem}:{path})가 이미 존재합니다.")
-
-        # 플래그 유효성 검사 및 자동 수정
         extra_val = self._extra_text.get("1.0", tk.END).strip()
         clean_flags = []
         for f in re.split(r"[\s;]+", extra_val):
@@ -609,9 +593,8 @@ class MountDialog(tk.Toplevel):
             if not f: continue
             if any(f.startswith(forbidden) for forbidden in self.FORBIDDEN_FLAGS):
                 return messagebox.showerror("오류", f"금지된 플래그가 포함되어 있습니다: {f}\n(UI 설정 항목과 중복됩니다.)")
-            if not f.startswith("-"): f = "--" + f # 자동 수정 로직
+            if not f.startswith("-"): f = "--" + f
             clean_flags.append(f)
-
         self.result = {
             "remote": rem, "remote_path": path, "drive": drv,
             "cache_dir": self._cdir.get().strip(), "cache_mode": self._cmode.get(),
@@ -620,11 +603,8 @@ class MountDialog(tk.Toplevel):
         self.destroy()
 
 if __name__ == "__main__":
-    # 중복 실행 시 기존 창 활성화 로직
     if activate_existing_window(): sys.exit(0)
-    
     mutex_name = "RcloneManager_SingleInstance_Mutex"
     mutex = ctypes.windll.kernel32.CreateMutexW(None, False, mutex_name)
     if ctypes.windll.kernel32.GetLastError() == 183: sys.exit(0)
-    
     app = App(); app.mainloop()
