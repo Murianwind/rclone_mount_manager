@@ -27,6 +27,39 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller pystray pillow requests
 
+      # ── 1. 상태 변수 설정 (수동/자동 완벽 분기) ──
+      - name: Set Build Context
+        id: context
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            # [수동 실행] 타임스탬프 태그 생성 / 버전 업데이트 안 함 / 프리 릴리스
+            $tag = "v" + (Get-Date -Format "yyyyMMdd-HHmmss")
+            echo "TAG_NAME=$tag" >> $env:GITHUB_ENV
+            echo "SHOULD_UPDATE_VERSION=false" >> $env:GITHUB_ENV
+            echo "PRERELEASE=true" >> $env:GITHUB_ENV
+            echo "Mode: Manual (No version update, Pre-release)"
+          } else {
+            # [릴리스 발행] 태그 사용 / 버전 업데이트 수행 / 정식 릴리스
+            $tag = "${{ github.event.release.tag_name }}"
+            $cleanVer = $tag.TrimStart('v')
+            echo "TAG_NAME=$tag" >> $env:GITHUB_ENV
+            echo "CLEAN_VERSION=$cleanVer" >> $env:GITHUB_ENV
+            echo "SHOULD_UPDATE_VERSION=true" >> $env:GITHUB_ENV
+            echo "PRERELEASE=false" >> $env:GITHUB_ENV
+            echo "Mode: Release (Version update to $cleanVer, Official)"
+          }
+
+      # ── 2. 소스 코드 내 APP_VERSION 수정 (릴리스 발행 시에만 실행) ──
+      - name: Update APP_VERSION in Python Script
+        if: env.SHOULD_UPDATE_VERSION == 'true'
+        shell: pwsh
+        run: |
+          $filePath = "rclone_manager.py"
+          $newVersion = "${{ env.CLEAN_VERSION }}"
+          (Get-Content $filePath) -replace 'APP_VERSION = ".*"', "APP_VERSION = `"$newVersion`"" | Set-Content $filePath
+          echo "Updated APP_VERSION to $newVersion"
+
       - name: Build with PyInstaller
         run: |
           pyinstaller --clean --noconfirm --onefile --windowed `
@@ -39,17 +72,10 @@ jobs:
         run: |
           Compress-Archive -Path dist\RcloneManager.exe -DestinationPath RcloneManager.zip
 
-      - name: Generate Tag Name for Manual Run
-        if: github.event_name == 'workflow_dispatch'
-        id: generate_tag
-        run: |
-          $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-          echo "TAG_NAME=v$timestamp" >> $env:GITHUB_ENV
-
+      # ── 3. 릴리스 업로드 (기존 프리 릴리스 로직 유지) ──
       - name: Upload Asset to Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event_name == 'workflow_dispatch' && env.TAG_NAME || github.event.release.tag_name }}
+          tag_name: ${{ env.TAG_NAME }}
           files: RcloneManager.zip
-          # ★ 추가된 부분: 수동 실행일 때만 Pre-release로 체크되도록 설정
-          prerelease: ${{ github.event_name == 'workflow_dispatch' }}
+          prerelease: ${{ env.PRERELEASE }}
