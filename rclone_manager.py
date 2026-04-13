@@ -33,7 +33,7 @@ except Exception:
     pass
 
 def get_sys_info():
-    """사용자의 해상도 및 배율 정보를 문자열로 반환 (Scenario 20)"""
+    """사용자의 해상도 및 배율 정보 반환 (Scenario 20)"""
     try:
         user32 = ctypes.windll.user32
         w, h = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
@@ -60,25 +60,14 @@ def set_startup(enable: bool):
         import winreg
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE)
         if enable:
-            exe_path = f'"{sys.executable}"' if getattr(sys, 'frozen', False) else f'pythonw "{Path(__file__).resolve()}"'
-            winreg.SetValueEx(key, "RcloneManager", 0, winreg.REG_SZ, exe_path)
+            path = f'"{sys.executable}"' if getattr(sys, 'frozen', False) else f'pythonw "{Path(__file__).resolve()}"'
+            winreg.SetValueEx(key, "RcloneManager", 0, winreg.REG_SZ, path)
         else:
             try: winreg.DeleteValue(key, "RcloneManager")
             except: pass
         winreg.CloseKey(key)
         return True
     except Exception as e: return str(e)
-
-def parse_rclone_conf(conf_path: Path):
-    """rclone.conf 파싱 (Scenario 2)"""
-    remotes = []
-    try:
-        cfg = configparser.ConfigParser()
-        cfg.read(str(conf_path), encoding="utf-8")
-        for s in cfg.sections():
-            remotes.append({"name": s, "type": cfg.get(s, "type", fallback="")})
-    except: pass
-    return remotes
 
 def download_rclone(dest_dir: Path, version: str, progress_cb=None):
     """rclone 다운로드 및 설치 (Scenario 15)"""
@@ -129,9 +118,11 @@ def get_rclone_exe(cfg):
 active_mounts = {}
 
 def build_cmd(exe: Path, mount: dict):
-    """마운트 명령어 빌드 (Scenario 7)"""
+    """명령어 빌드 (Scenario 7)"""
     rpath = mount.get("remote_path", "").strip().replace("\\", "/").strip("/")
-    cmd = [str(exe), "mount", f"{mount['remote']}:{rpath}", mount["drive"], "--volname", mount.get("label") or mount["remote"]]
+    # 드라이브 문자가 비어있는 경우 대응 (빈칸이면 rclone 기본 마운트 지점 사용 시도)
+    drive_target = mount.get("drive", "").strip() or " "
+    cmd = [str(exe), "mount", f"{mount['remote']}:{rpath}", drive_target, "--volname", mount.get("label") or mount["remote"]]
     if mount.get("cache_dir"): cmd += ["--cache-dir", mount["cache_dir"]]
     if mount.get("cache_mode"): cmd += ["--vfs-cache-mode", mount["cache_mode"]]
     extra = mount.get("extra_flags", "").strip()
@@ -141,7 +132,6 @@ def build_cmd(exe: Path, mount: dict):
     return cmd
 
 def unmount(mid):
-    """언마운트 (Scenario 14)"""
     p = active_mounts.get(mid)
     if p:
         p.terminate()
@@ -150,7 +140,6 @@ def unmount(mid):
         active_mounts.pop(mid, None)
 
 def activate_existing_window():
-    """중복 실행 방지 (Scenario 19)"""
     hwnd = ctypes.windll.user32.FindWindowW(None, "RcloneManager")
     if hwnd:
         ctypes.windll.user32.ShowWindow(hwnd, 9)
@@ -195,11 +184,12 @@ class MountDialog(tk.Toplevel):
         self._pth.insert(0, self._m.get("remote_path", ""))
         tk.Button(pth_f, text="연결 테스트", bg="#89b4fa", fg="#1e1e2e", font=("Segoe UI", 9, "bold"), relief="flat", command=self._test).pack(side="left", padx=(10, 0), ipady=2)
         
-        # 3. 드라이브 문자 (Combobox)
+        # 3. 드라이브 문자 (Combobox - 빈칸 추가 및 기본값 빈칸 설정)
         tk.Label(c, text="드라이브 문자", **lbl_style).pack(anchor="w")
-        self._drv = ttk.Combobox(c, values=[f"{chr(i)}:" for i in range(ord('D'), ord('Z')+1)], font=("Segoe UI", 10))
+        drive_values = [""] + [f"{chr(i)}:" for i in range(ord('D'), ord('Z')+1)]
+        self._drv = ttk.Combobox(c, values=drive_values, font=("Segoe UI", 10), state="readonly")
         self._drv.pack(fill="x", pady=(5, 15))
-        self._drv.set(self._m.get("drive", "Z:"))
+        self._drv.set(self._m.get("drive", "")) # 기본값 빈칸
         
         # 4. 캐시 디렉토리
         tk.Label(c, text="캐시 디렉토리 (--cache-dir)", **lbl_style).pack(anchor="w")
@@ -210,9 +200,9 @@ class MountDialog(tk.Toplevel):
         self._cdir.insert(0, self._m.get("cache_dir", ""))
         tk.Button(cdir_f, text="📂", bg="#45475a", fg="#cdd6f4", relief="flat", command=self._browse_cache).pack(side="left", padx=(5, 0))
 
-        # 5. 캐시 모드 (Combobox)
+        # 5. 캐시 모드
         tk.Label(c, text="캐시 모드 (--vfs-cache-mode)", **lbl_style).pack(anchor="w")
-        self._cmode = ttk.Combobox(c, values=["off", "minimal", "writes", "full"], font=("Segoe UI", 10))
+        self._cmode = ttk.Combobox(c, values=["off", "minimal", "writes", "full"], font=("Segoe UI", 10), state="readonly")
         self._cmode.pack(fill="x", pady=(5, 15))
         self._cmode.set(self._m.get("cache_mode", "full"))
 
@@ -226,7 +216,7 @@ class MountDialog(tk.Toplevel):
         self._auto = tk.BooleanVar(value=self._m.get("auto_mount", False))
         tk.Checkbutton(c, text="시작 시 자동 마운트", variable=self._auto, bg="#1e1e2e", fg="#cdd6f4", selectcolor="#313244", font=("Segoe UI", 10), activebackground="#1e1e2e", activeforeground="#cdd6f4").pack(anchor="w", pady=5)
         
-        # 8. 취소/저장 버튼 (이미지와 동일 배치)
+        # 8. 취소/저장 버튼
         btn_f = tk.Frame(c, bg="#1e1e2e")
         btn_f.pack(fill="x", side="bottom", pady=(20, 0))
         tk.Button(btn_f, text="저장", bg="#cba6f7", fg="#1e1e2e", font=("Segoe UI", 11, "bold"), relief="flat", command=self._save, width=15).pack(side="right", padx=(10, 0), ipady=5)
@@ -252,6 +242,7 @@ class MountDialog(tk.Toplevel):
         if not rem: return messagebox.showwarning("오류", "리모트 이름 필수")
         for m in self._app_cfg.get("mounts", []):
             if m.get("id") == self._m.get("id"): continue
+            # 드라이브 문자가 비어있지 않은 경우에만 중복 체크
             if drv and m.get("drive") == drv: return messagebox.showerror("오류", "드라이브 문자 중복")
             if m.get("remote") == rem and m.get("remote_path", "") == pth: return messagebox.showerror("오류", "동일한 리모트/경로가 이미 등록되어 있습니다.")
         self.result = {"remote": rem, "drive": drv, "remote_path": pth, "cache_dir": self._cdir.get().strip(), "cache_mode": self._cmode.get(), "extra_flags": self._ext.get("1.0", tk.END).strip(), "auto_mount": self._auto.get()}
@@ -295,17 +286,18 @@ class App(tk.Tk):
         ttk.Label(ttl_f, text=f"v{APP_VERSION}", foreground="#fab387", font=("Segoe UI", 10, "bold")).pack(side="left", padx=8, pady=(5,0))
         tk.Button(ttl_f, text="!", bg="#f38ba8", fg="#1e1e2e", font=("Segoe UI", 9, "bold"), relief="flat", width=2, command=self._open_issue).pack(side="left", padx=5, pady=(5,0))
 
-        self._rc_ver_label = tk.Label(hdr, text="v체크 중...", bg="#1e1e2e", fg="#94e2d5", font=("Segoe UI", 11, "bold"), cursor="hand2")
-        self._rc_ver_label.pack(side="right", padx=10)
-        self._rc_ver_label.bind("<Button-1>", self._handle_rc_click)
-
         self._app_up_btn = tk.Button(hdr, text="✨ 새 버전 업데이트 가능", bg="#a6e3a1", fg="#1e1e2e", font=("Segoe UI", 9, "bold"), relief="flat", command=lambda: webbrowser.open(f"https://github.com/{GITHUB_REPO}/releases/latest"))
 
         rcf = tk.Frame(self, bg="#1e1e2e"); rcf.pack(fill="x", padx=20, pady=5)
         tk.Label(rcf, text="rclone 경로:", bg="#1e1e2e", fg="#cba6f7", font=("Segoe UI", 10, "bold")).pack(side="left")
         self._rc_var = tk.StringVar(value=self._cfg.get("rclone_path", ""))
-        tk.Entry(rcf, textvariable=self._rc_var, bg="#313244", fg="#cdd6f4", relief="flat", width=70).pack(side="left", padx=10, ipady=4)
+        tk.Entry(rcf, textvariable=self._rc_var, bg="#313244", fg="#cdd6f4", relief="flat", width=60).pack(side="left", padx=10, ipady=4)
         tk.Button(rcf, text="📂", bg="#45475a", fg="#cdd6f4", relief="flat", command=self._browse_rc).pack(side="left")
+
+        # rclone 버전 레이블 위치 복원 (경로 입력창 옆)
+        self._rc_ver_label = tk.Label(rcf, text="v체크 중...", bg="#1e1e2e", fg="#94e2d5", font=("Segoe UI", 10), cursor="hand2")
+        self._rc_ver_label.pack(side="left", padx=15)
+        self._rc_ver_label.bind("<Button-1>", self._handle_rc_click)
 
         opt = tk.Frame(self, bg="#1e1e2e"); opt.pack(fill="x", padx=20, pady=10)
         self._st_var = tk.BooleanVar(value=is_startup_enabled())
@@ -343,6 +335,7 @@ class App(tk.Tk):
             except: pass
 
             if not exe.exists():
+                # 사용자 지침 복원: v없음 / 최신 vX.X.X
                 msg = f"v없음 / 최신 v{lat_rc}" if lat_rc else "v없음"
                 self.after(0, lambda: self._rc_ver_label.config(text=msg, fg="#f38ba8"))
             else:
@@ -351,6 +344,7 @@ class App(tk.Tk):
                     loc_match = re.search(r"rclone v([\d.]+)", r.stdout)
                     loc_rc = loc_match.group(1) if loc_match else "알 수 없음"
                     if lat_rc and loc_rc < lat_rc:
+                        # 사용자 지침 복원: v현재 / v최신 업데이트
                         self.after(0, lambda: self._rc_ver_label.config(text=f"v{loc_rc} / v{lat_rc} 업데이트", fg="#fab387"))
                     else:
                         self.after(0, lambda: self._rc_ver_label.config(text=f"v{loc_rc} (최신)", fg="#94e2d5"))
@@ -384,7 +378,8 @@ class App(tk.Tk):
             auto = "✅" if m.get("auto_mount") else "—"
             lbl = "🟢 실행중" if st == "mounted" else "⚫ 중지됨"
             rstr = f"{m['remote']}:{m.get('remote_path','')}".strip(":")
-            self._tree.insert("", "end", iid=m["id"], values=("💾 마운트", auto, m.get("drive","?"), rstr, lbl))
+            # 드라이브 문자가 빈칸이면 '해제' 등으로 표시 가능하나, 일단 드라이브 문자 그대로 출력
+            self._tree.insert("", "end", iid=m["id"], values=("💾 마운트", auto, m.get("drive",""), rstr, lbl))
         if self._tray: self._tray.update_menu()
 
     def _toggle_st(self): set_startup(self._st_var.get())
