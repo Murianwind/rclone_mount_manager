@@ -1,0 +1,15 @@
+# Codecov 설정 파일
+coverage:
+  status:
+    project:
+      default:
+        target: 85%      # 전체 프로젝트 커버리지 목표
+        threshold: 2%    # 목표치보다 2%까지 낮아지는 것은 허용 (Pass 처리)
+    patch:
+      default:
+        target: 80%      # 새로 추가된 코드(Patch)에 대한 커버리지 목표
+
+comment:
+  layout: "header, diff, flags, files"
+  behavior: default
+  require_changes: false  # 커버리지 변화가 없어도 댓글을 게시
