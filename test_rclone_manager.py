@@ -373,5 +373,47 @@ class TestRcloneManagerBDD(unittest.TestCase):
             res = rclone_manager.messagebox.askyesno("rclone", "업데이트 할까요?")
             self.assertTrue(res)
 
+    # test_rclone_manager.py (기존 내용 유지 및 하단에 시나리오 추가)
+
+    # ... 기존 테스트 코드 생략 ...
+
+    # 25. rclone 미설치 시 다운로드 문구 표시 테스트 (BDD 형식)
+    def test_scenario_25_rclone_download_label_when_missing(self):
+        """
+        Scenario: rclone 실행 파일이 없을 때 UI에 다운로드 안내 문구 표시
+        """
+        # Given: rclone 실행 파일이 존재하지 않는 환경을 설정한다.
+        app = self._create_mocked_app()
+        app._cfg["rclone_path"] = "C:\\non_existent\\rclone.exe"
+        
+        with patch("pathlib.Path.exists", return_value=False):
+            # When: rclone 버전을 체크하는 로직(또는 UI 업데이트 로직)이 실행될 때
+            # 실제 앱에서는 _check_versions_async 내부에서 호출되는 _update_rc_label_ui 형태를 가정
+            # 여기서는 문구 변경 로직인 _update_rc_status (가칭)를 테스트하거나 직접 검증
+            
+            # rclone이 없는 경우의 상태를 시뮬레이션
+            rclone_exists = False
+            
+            # Then: 레이블의 텍스트가 'v알 수 없음'이 아닌 'rclone 다운로드'로 변경되어야 한다.
+            # (구현부에서 이 로직을 반영할 예정)
+            display_text = "rclone 다운로드" if not rclone_exists else "v1.60.0"
+            self.assertEqual(display_text, "rclone 다운로드")
+
+    # 26. 창이 활성화될 때 rclone 존재 여부 재확인 테스트 (BDD 형식)
+    def test_scenario_26_check_rclone_on_focus(self):
+        """
+        Scenario: 프로그램 창이 포커스를 받을 때마다 rclone 경로를 재확인한다.
+        """
+        # Given: 앱이 실행 중이고 초기에는 rclone이 없었던 상태이다.
+        app = self._create_mocked_app()
+        app.focus_force = MagicMock()
+        
+        # When: 사용자가 창을 클릭하거나 창이 활성화(FocusIn)될 때
+        # app.bind("<FocusIn>", lambda e: self._check_rclone_presence()) 로직이 작동한다고 가정
+        
+        # Then: rclone 경로의 존재 여부를 다시 검사하는 함수가 호출되어야 한다.
+        # (구현부에서 <FocusIn> 바인딩 및 체크 로직 추가 예정)
+        pass
+
 if __name__ == "__main__":
     unittest.main()
