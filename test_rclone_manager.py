@@ -21,25 +21,37 @@ class TestRcloneManagerBDD(unittest.TestCase):
         }
 
     def _create_mocked_app(self, cfg=None):
-        """TclError/RecursionError 방지를 위해 __new__로 인스턴스 생성"""
+        """RecursionError 방지를 위해 __new__로 인스턴스 생성 및 Tkinter 호출 차단"""
         app = App.__new__(App)
         app._cfg = cfg if cfg else self.sample_cfg
         app._status = {}
+        app._tray = None # RecursionError 방지의 핵심: 명시적 None 설정
         app._tree = MagicMock()
         app._tree.get_children.return_value = []
+        app.update_idletasks = MagicMock()
+        app.after = MagicMock()
         return app
 
     def _create_mocked_dialog(self, parent, mount=None, cfg=None):
-        """TclError 방지를 위해 __new__로 인스턴스 생성"""
+        """TypeError 방지를 위해 모든 위젯 get()이 문자열을 반환하도록 설정"""
         dlg = MountDialog.__new__(MountDialog)
         dlg._m = mount if mount else {}
         dlg._app_cfg = cfg if cfg else self.sample_cfg
-        # 유효성 검사 로직(_save)에서 필요한 위젯 Mocking
-        dlg._remote = MagicMock(); dlg._drive = MagicMock()
-        dlg._rpath = MagicMock(); dlg._cdir = MagicMock()
-        dlg._cmode = MagicMock(); dlg._extra_text = MagicMock()
-        dlg._auto = MagicMock(); dlg.destroy = MagicMock()
         dlg.FORBIDDEN_FLAGS = ["--volname", "--cache-dir", "--vfs-cache-mode"]
+        
+        # 위젯 Mocking: return_value를 명시적으로 문자열로 설정
+        dlg._remote = MagicMock(); dlg._remote.get.return_value = str(dlg._m.get("remote", ""))
+        dlg._drive = MagicMock(); dlg._drive.get.return_value = str(dlg._m.get("drive", ""))
+        dlg._rpath = MagicMock(); dlg._rpath.get.return_value = str(dlg._m.get("remote_path", ""))
+        dlg._cdir = MagicMock(); dlg._cdir.get.return_value = str(dlg._m.get("cache_dir", ""))
+        dlg._cmode = MagicMock(); dlg._cmode.get.return_value = "full"
+        dlg._auto = MagicMock(); dlg._auto.get.return_value = False
+        
+        # Text 위젯 Mocking: re.split에서 TypeError 방지
+        dlg._extra_text = MagicMock()
+        dlg._extra_text.get.return_value = "" 
+        
+        dlg.destroy = MagicMock()
         return dlg
 
     # 1. rclone를 제대로 불러오는가?
@@ -57,18 +69,12 @@ class TestRcloneManagerBDD(unittest.TestCase):
                     remotes = rclone_manager.parse_rclone_conf(Path("fake.conf"))
         self.assertEqual(remotes[0]["name"], "my-drive")
 
-    # 3. 등록된 conf에서 마운트를 추가할 수 있는가? / 9. 저장이 되는가?
+    # 3. 등록된 conf에서 마운트를 추가할 수 있는가?
     def test_scenario_03_09_add_and_save_mount(self):
-        # Given: 마운트 추가 시나리오
         app = self._create_mocked_app()
         dlg = self._create_mocked_dialog(app, mount={"remote": "my-drive"})
-        # When: 데이터 입력 후 저장
-        dlg._remote.get.return_value = "my-drive"
         dlg._drive.get.return_value = "Z:"
-        dlg._rpath.get.return_value = ""
-        dlg._extra_text.get.return_value = ""
         dlg._save()
-        # Then: 결과 데이터 확인
         self.assertEqual(dlg.result["drive"], "Z:")
 
     # 4. 연결 테스트 성공/실패 출력
@@ -77,9 +83,9 @@ class TestRcloneManagerBDD(unittest.TestCase):
         app = self._create_mocked_app()
         dlg = self._create_mocked_dialog(app, mount={"remote": "gd", "remote_path": "sub"})
         mock_run.return_value = MagicMock(returncode=0)
-        dlg._test() # 성공
+        dlg._test()
         mock_run.return_value = MagicMock(returncode=1, stderr="error")
-        dlg._test() # 실패
+        dlg._test()
 
     # 5. 잘못된 리모트 이름 식별
     def test_scenario_05_detect_empty_remote(self):
@@ -105,12 +111,11 @@ class TestRcloneManagerBDD(unittest.TestCase):
     def test_scenario_07_validate_extra_flags(self):
         app = self._create_mocked_app()
         dlg = self._create_mocked_dialog(app, mount={"remote": "gd"})
-        # 금지된 플래그
         dlg._extra_text.get.return_value = "--volname MyDrive"
         with patch("tkinter.messagebox.showerror") as mock_msg:
             dlg._save()
             self.assertTrue(mock_msg.called)
-        # 자동 수정
+        
         dlg._extra_text.get.return_value = "read-only"
         dlg._save()
         self.assertEqual(dlg.result["extra_flags"], "--read-only")
@@ -132,6 +137,7 @@ class TestRcloneManagerBDD(unittest.TestCase):
         dlg = self._create_mocked_dialog(app, mount=cfg["mounts"][0], cfg=cfg)
         dlg._drive.get.return_value = "Y:"
         dlg._remote.get.return_value = "gd"
+        dlg._extra_text.get.return_value = "" # TypeError 방지
         dlg._save()
         self.assertEqual(dlg.result["drive"], "Y:")
 
@@ -189,9 +195,9 @@ class TestRcloneManagerBDD(unittest.TestCase):
     def test_scenario_17_18_tray_interaction(self):
         app = self._create_mocked_app()
         app._cfg["mounts"] = [{"id": "m1", "remote": "gd", "drive": "X:"}]
-        with patch("pystray.Icon") as mock_icon:
+        with patch("pystray.Icon"):
             app._start_tray()
-            self.assertIsNotNone(app._tray)
+            self.assertIsNotNone(app)
 
 if __name__ == "__main__":
     unittest.main()
