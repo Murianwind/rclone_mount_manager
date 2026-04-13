@@ -21,7 +21,6 @@ import urllib.parse
 from pathlib import Path
 import ctypes
 
-# ── 모듈 Mocking 대응 ──
 try:
     import winreg
 except ImportError:
@@ -37,7 +36,7 @@ except ImportError:
 APP_VERSION = "1.1.0"
 GITHUB_REPO = "Murianwind/rclone_mount_manager"
 
-# ── 1. 시스템 정보 수집 ──
+# ── 1. 시스템 환경 설정 ──
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(1)
     ctypes.windll.user32.SetProcessDPIAware()
@@ -45,7 +44,6 @@ except Exception:
     pass
 
 def get_sys_info():
-    """사용자의 해상도 및 배율 정보 반환 (Scenario 20)"""
     try:
         user32 = ctypes.windll.user32
         w, h = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
@@ -168,7 +166,7 @@ def activate_existing_window():
         return True
     return False
 
-# ── 4. 다이얼로그 클래스 ──
+# ── 4. 다이얼로그 ──
 class ConfImportDialog(tk.Toplevel):
     def __init__(self, parent, remotes):
         super().__init__(parent); self.title("리모트 선택"); self.grab_set(); self.configure(bg="#1e1e2e"); self.selected = []; self._remotes = remotes; self._vars = []
@@ -251,7 +249,7 @@ class MountDialog(tk.Toplevel):
         self.result = {"remote": rem, "drive": drv, "remote_path": pth, "cache_dir": self._cdir.get().strip(), "cache_mode": self._cmode.get(), "extra_flags": self._ext.get("1.0", tk.END).strip(), "auto_mount": self._auto.get()}
         self.destroy()
 
-# ── 5. 메인 앱 클래스 ──
+# ── 5. 메인 앱 ──
 class App(tk.Tk):
     def __init__(self):
         self._tray = None
@@ -276,20 +274,16 @@ class App(tk.Tk):
 
     def _build_ui(self):
         s = ttk.Style(self); s.theme_use("clam")
-        s.configure("TFrame", background="#1e1e2e")
-        s.configure("TLabel", background="#1e1e2e", foreground="#cdd6f4", font=("Segoe UI", 10))
+        s.configure("TFrame", background="#1e1e2e"); s.configure("TLabel", background="#1e1e2e", foreground="#cdd6f4", font=("Segoe UI", 10))
         s.configure("Header.TLabel", font=("Segoe UI", 16, "bold"), foreground="#cba6f7")
         s.configure("Treeview", background="#313244", foreground="#cdd6f4", fieldbackground="#313244", rowheight=30)
         s.configure("Treeview.Heading", background="#45475a", foreground="#cba6f7", font=("Segoe UI", 11, "bold"))
-        
         hdr = ttk.Frame(self); hdr.pack(fill="x", padx=20, pady=15)
         ttl_f = ttk.Frame(hdr); ttl_f.pack(side="left")
         ttk.Label(ttl_f, text="🚀 RcloneManager", style="Header.TLabel").pack(side="left")
         ttk.Label(ttl_f, text=f"v{APP_VERSION}", foreground="#fab387", font=("Segoe UI", 10, "bold")).pack(side="left", padx=8, pady=(5,0))
         tk.Button(ttl_f, text="!", bg="#f38ba8", fg="#1e1e2e", font=("Segoe UI", 9, "bold"), relief="flat", width=2, command=self._open_issue).pack(side="left", padx=5, pady=(5,0))
-        
         self._app_up_btn = tk.Button(hdr, text="✨ 새 버전 업데이트 가능", bg="#a6e3a1", fg="#1e1e2e", font=("Segoe UI", 9, "bold"), relief="flat", command=self._show_app_update_confirm)
-        
         rcf = tk.Frame(self, bg="#1e1e2e"); rcf.pack(fill="x", padx=20, pady=5)
         tk.Label(rcf, text="rclone 경로:", bg="#1e1e2e", fg="#cba6f7", font=("Segoe UI", 10, "bold")).pack(side="left")
         self._rc_var = tk.StringVar(value=self._cfg.get("rclone_path", ""))
@@ -306,18 +300,15 @@ class App(tk.Tk):
         ttk.Checkbutton(opt, text="시작 시 자동 실행", variable=self._st_var, command=lambda: set_startup(self._st_var.get())).pack(side="left", padx=(0, 20))
         self._am_var = tk.BooleanVar(value=self._cfg.get("auto_mount", False))
         ttk.Checkbutton(opt, text="시작 시 자동 마운트", variable=self._am_var, command=self._save_settings).pack(side="left")
-        
         btn_f = tk.Frame(self, bg="#1e1e2e"); btn_f.pack(fill="x", padx=20, pady=10)
         tk.Button(btn_f, text="+ 마운트 추가", bg="#cba6f7", fg="#1e1e2e", font=("Segoe UI", 10, "bold"), relief="flat", command=self._add_mount).pack(side="left", padx=(0,10), ipady=5, ipadx=10)
         tk.Button(btn_f, text="📥 conf에서 리모트 가져오기", bg="#89b4fa", fg="#1e1e2e", font=("Segoe UI", 10, "bold"), relief="flat", command=self._import_from_conf).pack(side="left", ipady=5, ipadx=10)
-        
         cols = ("id", "remote", "drive", "path", "status", "auto", "actions")
         self._tree = ttk.Treeview(self, columns=cols, show="headings", height=15); self._tree.pack(fill="both", expand=True, padx=20, pady=10)
         self._tree.heading("remote", text="리모트"); self._tree.heading("drive", text="드라이브"); self._tree.heading("path", text="경로"); self._tree.heading("status", text="상태"); self._tree.heading("auto", text="자동"); self._tree.heading("actions", text="작업")
         self._tree.column("id", width=0, stretch=False); self._tree.column("remote", width=150); self._tree.column("drive", width=80, anchor="center"); self._tree.column("path", width=250); self._tree.column("status", width=100, anchor="center"); self._tree.column("auto", width=80, anchor="center"); self._tree.column("actions", width=200, anchor="center")
         self._tree.bind("<Double-1>", self._on_double_click)
         self._tree.bind("<Button-1>", self._on_click)
-        
         st_bar = tk.Frame(self, bg="#313244", height=30); st_bar.pack(fill="x", side="bottom")
         tk.Label(st_bar, text=f" System: {get_sys_info()}", bg="#313244", fg="#9399b2", font=("Segoe UI", 9)).pack(side="left", padx=10)
 
