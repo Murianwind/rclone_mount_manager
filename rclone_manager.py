@@ -13,12 +13,10 @@ import threading
 import requests
 import zipfile
 import tempfile
-import shutil
 import re
 import configparser
 import uuid
 import webbrowser
-import urllib.parse
 from pathlib import Path
 import ctypes
 
@@ -409,7 +407,7 @@ class UpdateDialog(tk.Toplevel):
 
         btn_f = tk.Frame(self, bg="#1e1e2e")
         btn_f.grid(row=2, column=0, sticky="ew", padx=20, pady=(8, 16))
-        tk.Button(btn_f, text="업데이트", bg="#a6e3a1", fg="#1e1e2e",
+        tk.Button(btn_f, text="다운로드", bg="#a6e3a1", fg="#1e1e2e",
                   font=("Segoe UI", 10, "bold"), relief="flat",
                   command=self._ok, width=14).pack(side="right", padx=5, ipady=5)
         tk.Button(btn_f, text="취소", bg="#45475a", fg="#cdd6f4",
@@ -733,14 +731,16 @@ class App(tk.Tk):
                 cols,
                 ("구분", "자동", "드라이브", "리모트 (서브경로)", "상태"),
                 ("w", "center", "center", "w", "w"),
-                (False, False, False, True, False)):
+                (False, False, False, True, True)):
             self._tree.heading(col, text=head, anchor=anchor)
             if not stretch:
                 cw = saved_cw.get(col, self._col_default_widths[col])
                 self._tree.column(col, width=cw, minwidth=40,
                                   stretch=False, anchor=anchor)
             else:
-                self._tree.column(col, stretch=True, minwidth=80, anchor=anchor)
+                cw = saved_cw.get(col, self._col_default_widths.get(col, 80))
+                self._tree.column(col, width=cw, minwidth=80,
+                                  stretch=True, anchor=anchor)
         self._tree.pack(fill="both", expand=True, padx=20, pady=5)
         self._tree.tag_configure("remote_tag", foreground="#8fa0b5")
         # <<TreeviewColumnRelease>>: 헤더 드래그 완료 이벤트
@@ -922,8 +922,7 @@ class App(tk.Tk):
                     "Windows 보안 정책으로 인해 실행 중인 프로그램의\n"
                     "자동 교체가 불가능합니다.\n\n"
                     f"업데이트 파일 저장 위치:\n{df}\n\n"
-                    "프로그램을 종료한 후 기존 파일을 새 파일로 교체하고\n"
-                    "파일명을 원래 이름으로 변경해 주세요."))
+                    "프로그램을 종료한 후 기존 파일을 새 파일로 교체하고 재시작하세요."))
                 self.after(0, lambda: self._app_up_btn.config(
                     text="✨ 새 버전 업데이트 가능", state="normal"))
             else:
@@ -1020,7 +1019,7 @@ class App(tk.Tk):
                 is_mounted = mid in active_mounts
                 label = m.get("drive", "") or m.get("remote", "?")
                 rstr = f"{m['remote']}:{m.get('remote_path', '')}".strip(":")
-                display = f"{'🔵' if is_mounted else '⭕'}  {label}  ({rstr})"
+                display = f"{'■' if is_mounted else '▶'}  {label}  ({rstr})"
 
                 # 클릭 시 현재 active_mounts를 실시간으로 확인하여 토글
                 def _make_toggle(mount_id, mount_data):
@@ -1273,19 +1272,6 @@ class App(tk.Tk):
         self.deiconify()
         self.lift()
         self.focus_force()
-
-    def _restart_app(self):
-        """프로그램 종료 후 재실행"""
-        try:
-            exe = Path(sys.executable)
-            subprocess.Popen(
-                [str(exe)],
-                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
-                close_fds=True,
-            )
-        except Exception:
-            pass
-        self._quit_app()
 
     def _quit_app(self):
         for mid in list(active_mounts.keys()):
