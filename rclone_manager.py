@@ -191,97 +191,36 @@ def download_rclone(dest_dir: Path, version: str, progress_cb=None):
         return str(e)
 
 
-def _can_write_to_dir(directory: Path) -> bool:
-    """디렉토리에 파일 쓰기 권한이 있는지 확인"""
-    test_file = directory / f".write_test_{uuid.uuid4().hex}"
-    try:
-        test_file.write_text("test")
-        test_file.unlink()
-        return True
-    except Exception:
-        return False
-
-
 def download_app_release(asset_url: str, progress_cb=None):
     """
-    앱 자체 업데이트.
+    앱 자체 업데이트 파일 다운로드.
 
-    동작 흐름:
-    1. 쓰기 권한 확인
-    2. 권한 있으면 PowerShell로 자동 교체 ("restart" 반환)
-    3. 권한 없으면 zip을 APP_DIR에 다운로드 후 수동 교체 안내 ("manual" 반환)
-    4. zip 배포면 압축 해제 (True 반환)
+    Windows에서 실행 중인 exe는 OS 파일락으로 자동 교체가 불가능합니다.
+    → 업데이트 파일을 프로그램과 같은 폴더에 다운로드하고 수동 교체 안내.
 
     반환값:
-      "restart" - PowerShell 스크립트 실행됨, 호출자가 프로세스 종료
-      "manual"  - zip 다운로드 완료, 수동 교체 필요
-      True      - zip 압축 해제 완료 (재시작 필요)
-      str       - 오류 메시지
+      "manual" - 다운로드 완료, 수동 교체 안내
+      str      - 오류 메시지
     """
     try:
         suffix = "." + asset_url.rsplit(".", 1)[-1] if "." in asset_url else ".zip"
-        tmp_dir = Path(tempfile.mkdtemp())
-        tmp_file = tmp_dir / f"update{suffix}"
+
+        # 프로그램과 같은 폴더에 저장
+        dest_dir = Path(sys.executable).parent if getattr(sys, 'frozen', False) else APP_DIR
+        dest_file = dest_dir / f"RcloneManager_update{suffix}"
 
         # 다운로드
         r = requests.get(asset_url, stream=True, timeout=60)
         total = int(r.headers.get("content-length", 0))
         downloaded = 0
-        with open(tmp_file, "wb") as f:
+        with open(dest_file, "wb") as f:
             for chunk in r.iter_content(65536):
                 f.write(chunk)
                 downloaded += len(chunk)
                 if progress_cb and total:
                     progress_cb(int(downloaded * 100 / total))
 
-        # zip 배포: 압축 해제
-        if suffix.lower() == ".zip":
-            dest_dir = Path(sys.executable).parent if getattr(sys, 'frozen', False) else APP_DIR
-            with zipfile.ZipFile(tmp_file, "r") as z:
-                z.extractall(dest_dir)
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            return True
-
-        # exe 배포: 쓰기 권한 확인 후 자동/수동 분기
-        cur_exe = (Path(sys.executable) if getattr(sys, 'frozen', False)
-                   else APP_DIR / "rclone_mount_manager.exe")
-        exe_dir = cur_exe.parent
-
-        if not _can_write_to_dir(exe_dir):
-            # 권한 없음: zip을 프로그램 디렉토리에 다운로드해서 수동 교체 안내
-            dest_zip = exe_dir / f"RcloneManager_update{suffix}"
-            shutil.copy2(str(tmp_file), str(dest_zip))
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            return "manual"  # 수동 교체 필요
-
-        # 권한 있음: PowerShell로 자동 교체
-        old_exe = cur_exe.with_suffix(".old")
-        ps_path = tmp_dir / "updater.ps1"
-
-        ps_lines = [
-            "Start-Sleep -Seconds 5",
-            f'if (Test-Path "{old_exe}") {{ Remove-Item "{old_exe}" -Force }}',
-            "try {",
-            f'    Move-Item -Path "{cur_exe}" -Destination "{old_exe}" -Force',
-            f'    Copy-Item -Path "{tmp_file}" -Destination "{cur_exe}" -Force',
-            f'    Remove-Item -Path "{tmp_file}" -Force -ErrorAction SilentlyContinue',
-            f'    Remove-Item -Path "{tmp_dir}" -Recurse -Force -ErrorAction SilentlyContinue',
-            f'    Start-Process -FilePath "{cur_exe}"',
-            "} catch {",
-            f'    if (Test-Path "{old_exe}") {{ Move-Item -Path "{old_exe}" -Destination "{cur_exe}" -Force }}',
-            "}",
-        ]
-        ps_content = "\n".join(ps_lines)
-        # UTF-16 LE with BOM (PowerShell 기본 인코딩)
-        ps_path.write_bytes(('\ufeff' + ps_content).encode("utf-16-le"))
-
-        subprocess.Popen(
-            ["powershell.exe", "-ExecutionPolicy", "Bypass",
-             "-WindowStyle", "Hidden", "-File", str(ps_path)],
-            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
-            close_fds=True,
-        )
-        return "restart"
+        return "manual"
 
     except Exception as e:
         return str(e)
@@ -348,15 +287,20 @@ def build_cmd(exe: Path, mount: dict):
     return cmd
 
 
+# 의도적 언마운트 중인 ID 집합 (오류 메시지 억제용)
+_unmounting = set()
+
 def unmount(mid):
     p = active_mounts.get(mid)
     if p:
+        _unmounting.add(mid)   # 의도적 종료 표시
         p.terminate()
         try:
             p.wait(timeout=3)
         except:
             p.kill()
         active_mounts.pop(mid, None)
+        _unmounting.discard(mid)
 
 
 def activate_existing_window():
@@ -629,14 +573,9 @@ class App(tk.Tk):
         self._geometry_save_after = None
 
         # ── 창 크기 복원 또는 초기 계산 ──────────────────────────────────────
-        # 저장된 크기가 있으면 복원, 없으면 논리 화면의 55%x65%
-        saved_geo = self._cfg.get("window_geometry", "")
-        if saved_geo and self._is_valid_geometry(saved_geo):
-            self.geometry(saved_geo)
-        else:
-            mw, mh = calc_window_size(55, 65, min_w=780, min_h=540)
-            self.geometry(f"{mw}x{mh}")
-
+        # 저장된 크기: 복원
+        # 없으면: UI 구성 후 Tkinter 자동 측정으로 적절한 크기 결정
+        self._saved_geo = self._cfg.get("window_geometry", "")
         self.minsize(560, 420)
         self.resizable(True, True)
         # ─────────────────────────────────────────────────────────────────────
@@ -644,6 +583,13 @@ class App(tk.Tk):
         self._build_ui()
         self._refresh_list()
         self._start_tray()
+
+        # UI 구성 완료 후 창 크기 결정
+        # 저장된 크기 있으면 복원, 없으면 Tkinter가 필요 크기 측정 후 여유 추가
+        if self._saved_geo and self._is_valid_geometry(self._saved_geo):
+            self.geometry(self._saved_geo)
+        else:
+            self._auto_size_window()
 
         self._init_rc_label()
         self._check_versions_async()
@@ -666,6 +612,31 @@ class App(tk.Tk):
         except Exception:
             return False
 
+    def _auto_size_window(self):
+        """
+        저장된 크기가 없을 때 Tkinter 자동 측정으로 창 크기 결정.
+
+        원리:
+          1. update_idletasks()로 모든 위젯 렌더링 완료
+          2. winfo_reqwidth/reqheight로 실제 필요 최소 크기 측정
+          3. 여유 공간 추가 + 화면 90% 초과 방지
+          → DPI/폰트 크기에 관계없이 내용이 항상 화면에 맞게 표시됨
+        """
+        self.update_idletasks()
+        req_w = self.winfo_reqwidth()
+        req_h = self.winfo_reqheight()
+        lw, lh = get_logical_screen_size()
+        # 측정값에 여유 공간 추가 (트리뷰 높이 확보 등)
+        w = min(req_w + 100, int(lw * 0.90))
+        h = min(req_h + 80,  int(lh * 0.90))
+        # 최솟값 보장
+        w = max(w, 780)
+        h = max(h, 520)
+        # 화면 중앙 배치
+        x = max(0, (lw - w) // 2)
+        y = max(0, (lh - h) // 2)
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
     def _on_configure(self, event):
         """창 크기/위치 변경 시 디바운스 후 저장"""
         if event.widget is not self:
@@ -680,13 +651,17 @@ class App(tk.Tk):
         self._cfg["window_geometry"] = self.geometry()
         save_config(self._cfg)
 
-    def _on_column_resize(self, event):
-        """헤더 드래그로 컬럼 폭 조절 후 저장"""
+    def _on_column_resize(self, event=None):
+        """컬럼 폭 조절 후 저장 (헤더 드래그 or ButtonRelease)"""
         widths = {}
         for col in ("type", "auto", "drive", "status"):
-            widths[col] = self._tree.column(col, "width")
-        self._cfg["column_widths"] = widths
-        save_config(self._cfg)
+            try:
+                widths[col] = self._tree.column(col, "width")
+            except Exception:
+                pass
+        if widths:
+            self._cfg["column_widths"] = widths
+            save_config(self._cfg)
 
     # ────────────────────────────────────────────
     # UI 구성
@@ -750,22 +725,28 @@ class App(tk.Tk):
 
         # 트리뷰 (5컬럼)
         cols = ("type", "auto", "drive", "remote", "status")
-        self._col_default_widths = {"type": 70, "auto": 50, "drive": 75, "status": 85}
+        # 기본 폭: 상태는 170(기존 85의 2배), 저장된 값 있으면 복원
+        self._col_default_widths = {"type": 70, "auto": 50, "drive": 75, "status": 170}
         saved_cw = self._cfg.get("column_widths", {})
         self._tree = ttk.Treeview(self, columns=cols, show="headings", height=14)
-        for col, head, stretch in zip(
+        for col, head, anchor, stretch in zip(
                 cols,
                 ("구분", "자동", "드라이브", "리모트 (서브경로)", "상태"),
+                ("w", "center", "center", "w", "w"),
                 (False, False, False, True, False)):
-            self._tree.heading(col, text=head)
+            self._tree.heading(col, text=head, anchor=anchor)
             if not stretch:
                 cw = saved_cw.get(col, self._col_default_widths[col])
-                self._tree.column(col, width=cw, minwidth=40, stretch=False)
+                self._tree.column(col, width=cw, minwidth=40,
+                                  stretch=False, anchor=anchor)
             else:
-                self._tree.column(col, stretch=True, minwidth=80)
+                self._tree.column(col, stretch=True, minwidth=80, anchor=anchor)
         self._tree.pack(fill="both", expand=True, padx=20, pady=5)
         self._tree.tag_configure("remote_tag", foreground="#8fa0b5")
+        # <<TreeviewColumnRelease>>: 헤더 드래그 완료 이벤트
+        # <ButtonRelease-1>: 헤더 클릭/드래그 완료 후 폭 저장 (이중 바인딩으로 확실히 감지)
         self._tree.bind("<<TreeviewColumnRelease>>", self._on_column_resize)
+        self._tree.bind("<ButtonRelease-1>", lambda e: self.after(100, self._on_column_resize))
 
         # 하단 버튼 행
         btn_f = ttk.Frame(self)
@@ -930,34 +911,21 @@ class App(tk.Tk):
 
             res = download_app_release(asset_url, _prog)
 
-            if res == "restart":
-                # PowerShell 스크립트 실행됨 → 종료하면 자동 교체
-                self.after(0, lambda: messagebox.showinfo(
-                    "업데이트",
-                    "업데이트 파일을 내려받았습니다.\n"
-                    "프로그램이 종료된 후 자동으로 교체되고 재시작됩니다."))
-                self.after(500, self._quit_app)
+            exe_dir = (Path(sys.executable).parent if getattr(sys, 'frozen', False)
+                       else APP_DIR)
+            suffix = "." + asset_url.rsplit(".", 1)[-1] if "." in asset_url else ".zip"
+            dest_file = exe_dir / f"RcloneManager_update{suffix}"
 
-            elif res == "manual":
-                # 권한 부족 → zip을 프로그램 폴더에 저장, 수동 교체 안내
-                exe_dir = (Path(sys.executable).parent if getattr(sys, 'frozen', False)
-                           else APP_DIR)
-                self.after(0, lambda: messagebox.showwarning(
-                    "수동 업데이트 필요",
-                    f"권한 문제로 자동 업데이트가 불가능합니다.\n\n"
-                    f"업데이트 파일을 다음 위치에 저장했습니다:\n{exe_dir}\n\n"
-                    f"프로그램을 종료한 후 기존 실행 파일을 새 파일로 교체해 주세요."))
+            if res == "manual":
+                self.after(0, lambda df=str(dest_file): messagebox.showinfo(
+                    "업데이트 파일 다운로드 완료",
+                    "Windows 보안 정책으로 인해 실행 중인 프로그램의\n"
+                    "자동 교체가 불가능합니다.\n\n"
+                    f"업데이트 파일 저장 위치:\n{df}\n\n"
+                    "프로그램을 종료한 후 기존 파일을 새 파일로 교체하고\n"
+                    "파일명을 원래 이름으로 변경해 주세요."))
                 self.after(0, lambda: self._app_up_btn.config(
                     text="✨ 새 버전 업데이트 가능", state="normal"))
-
-            elif res is True:
-                # zip 압축 해제 완료 → 재시작
-                self.after(0, lambda: messagebox.showinfo(
-                    "업데이트 완료",
-                    "업데이트 파일 교체가 완료되었습니다.\n"
-                    "확인을 누르면 프로그램이 재시작됩니다."))
-                self.after(0, self._restart_app)
-
             else:
                 self.after(0, lambda err=res: messagebox.showerror("오류", err))
                 self.after(0, lambda: self._app_up_btn.config(
@@ -1013,9 +981,7 @@ class App(tk.Tk):
     # 이슈 리포트
     # ────────────────────────────────────────────
     def _open_issue(self):
-        body = urllib.parse.quote(
-            f"\n\n--- Debug Info ---\n- App Version: {APP_VERSION}\n- {get_sys_info()}")
-        webbrowser.open(f"https://github.com/{GITHUB_REPO}/issues/new?body={body}")
+        webbrowser.open(f"https://github.com/{GITHUB_REPO}/issues/new")
 
     # ────────────────────────────────────────────
     # 트레이
@@ -1054,7 +1020,7 @@ class App(tk.Tk):
                 is_mounted = mid in active_mounts
                 label = m.get("drive", "") or m.get("remote", "?")
                 rstr = f"{m['remote']}:{m.get('remote_path', '')}".strip(":")
-                display = f"{'🟢' if is_mounted else '⚫'}  {label}  ({rstr})"
+                display = f"{'🔵' if is_mounted else '⭕'}  {label}  ({rstr})"
 
                 # 클릭 시 현재 active_mounts를 실시간으로 확인하여 토글
                 def _make_toggle(mount_id, mount_data):
@@ -1091,7 +1057,7 @@ class App(tk.Tk):
         for r in self._cfg.get("remotes", []):
             self._tree.insert("", "end", iid=f"remote_{r['name']}",
                               values=("☁️ 원본", "—", "—",
-                                      f"[{r['type']}] {r['name']}", "설정 대기"),
+                                      f"[{r['type']}] {r['name']}", ""),
                               tags=("remote_tag",))
         for m in self._cfg.get("mounts", []):
             st = self._status.get(m["id"], "stopped")
@@ -1257,6 +1223,7 @@ class App(tk.Tk):
         """
         rclone mount 실행.
         rclone이 즉시 종료(오류)되면 stderr를 캡처해 사용자에게 표시.
+        unmount()로 의도적 종료된 경우(_unmounting)는 오류 표시 안 함.
         """
         try:
             p = subprocess.Popen(
@@ -1266,8 +1233,8 @@ class App(tk.Tk):
             )
             active_mounts[mid] = p
             p.wait()
-            # 비정상 종료 시 오류 표시
-            if p.returncode != 0:
+            # 의도적 언마운트(terminate)가 아닌 경우에만 오류 표시
+            if p.returncode != 0 and mid not in _unmounting:
                 stderr_out = ""
                 try:
                     stderr_out = p.stderr.read().decode("utf-8", errors="replace").strip()
@@ -1277,9 +1244,11 @@ class App(tk.Tk):
                     self.after(0, lambda msg=stderr_out: messagebox.showerror(
                         "마운트 오류", f"rclone 오류:\n{msg[:500]}"))
         except Exception as e:
-            self.after(0, lambda err=str(e): messagebox.showerror("마운트 오류", err))
+            if mid not in _unmounting:
+                self.after(0, lambda err=str(e): messagebox.showerror("마운트 오류", err))
         finally:
             active_mounts.pop(mid, None)
+            _unmounting.discard(mid)
             self._status[mid] = "stopped"
             self.after(0, self._refresh_list)
 
