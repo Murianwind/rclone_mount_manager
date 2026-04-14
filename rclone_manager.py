@@ -27,8 +27,7 @@ try:
 except ImportError:
     winreg = None
 
-# ── pystray + PIL import ──────────────────────────────────────────────────────
-# ImportError 외에 ValueError(GTK 없음 등) 도 잡아야 하므로 Exception으로 처리
+# pystray + PIL: 함께 import, ImportError 외 ValueError 등도 처리
 try:
     import pystray
     from PIL import Image, ImageDraw
@@ -36,7 +35,6 @@ try:
 except Exception:
     pystray = None
     _TRAY_AVAILABLE = False
-# ─────────────────────────────────────────────────────────────────────────────
 
 # ── 프로그램 설정 ──
 APP_VERSION = "1.1.0"
@@ -71,18 +69,7 @@ def get_screen_size():
 
 
 def get_logical_screen_size():
-    """
-    Tkinter 기준 논리 해상도 반환.
-    Tkinter 창 크기는 논리 픽셀 단위이므로 물리 해상도를 DPI 배율로 나눈 값.
-
-    예시:
-      1920x1080 @100%  → 논리 1920x1080
-      1920x1080 @125%  → 논리 1536x 864
-      2560x1440 @150%  → 논리 1706x 960
-      2736x1824 @175%  → 논리 1563x1042
-      3840x2160 @200%  → 논리 1920x1080
-      3840x2160 @150%  → 논리 2560x1440
-    """
+    """Tkinter 기준 논리 해상도 = 물리 해상도 / DPI 배율"""
     sw, sh = get_screen_size()
     scale = get_dpi_scale()
     return int(sw / scale), int(sh / scale)
@@ -103,13 +90,13 @@ def get_sys_info():
 
 def calc_window_size(w_pct, h_pct, min_w=400, min_h=300):
     """
-    현재 화면 논리 해상도의 w_pct%, h_pct% 크기 창을 계산한다.
-    1920×1080 기준값 없이, 실행 중인 화면에 맞게 직접 계산.
-
-    검증된 비율 (2736x1824 @175% 기준, 논리 1563x1042):
-      메인 창          → calc_window_size(70, 80)  → 약 1094x834 (2736x1824@175%)
-      마운트 추가/편집  → calc_window_size(34, 82)  → 약 531x854
-      업데이트 확인     → calc_window_size(34, 56)  → 약 531x583
+    현재 화면 논리 해상도의 w_pct%, h_pct% 크기 창을 계산.
+    두 기준점 (사용자 지정 환경별 선호 크기):
+      1920x1080 @100% → 목표 792x683  (논리화면의 41%x63%)
+      2736x1824 @175% → 목표 1300x833 (논리화면의 83%x80%)
+    단일 비율로 두 환경을 동시에 만족시킬 수 없으므로
+    논리 화면의 55%x65%를 기본으로 사용한다.
+    처음 실행 후 사용자가 창 크기 조정 시 저장/복원된다.
     """
     lw, lh = get_logical_screen_size()
     w = max(min_w, int(lw * w_pct / 100))
@@ -204,20 +191,32 @@ def download_rclone(dest_dir: Path, version: str, progress_cb=None):
         return str(e)
 
 
+def _can_write_to_dir(directory: Path) -> bool:
+    """디렉토리에 파일 쓰기 권한이 있는지 확인"""
+    test_file = directory / f".write_test_{uuid.uuid4().hex}"
+    try:
+        test_file.write_text("test")
+        test_file.unlink()
+        return True
+    except Exception:
+        return False
+
+
 def download_app_release(asset_url: str, progress_cb=None):
     """
     앱 자체 업데이트.
 
-    [권한 문제 해결] PowerShell 방식 사용:
-    - 한글 주석/경로 인코딩 문제 없음 (PowerShell은 UTF-16 LE 기본)
-    - 실행 중인 exe 종료 후 충분히 대기 (5초) 후 파일 교체
-    - 교체 실패 시 .old 파일로 복원
-    - 성공 시 새 exe 자동 실행
+    동작 흐름:
+    1. 쓰기 권한 확인
+    2. 권한 있으면 PowerShell로 자동 교체 ("restart" 반환)
+    3. 권한 없으면 zip을 APP_DIR에 다운로드 후 수동 교체 안내 ("manual" 반환)
+    4. zip 배포면 압축 해제 (True 반환)
 
     반환값:
-      "restart" - PowerShell 스크립트 실행됨, 호출자는 프로세스를 종료해야 함
-      True       - zip 압축 해제 완료 (재시작 필요 안내)
-      str        - 오류 메시지
+      "restart" - PowerShell 스크립트 실행됨, 호출자가 프로세스 종료
+      "manual"  - zip 다운로드 완료, 수동 교체 필요
+      True      - zip 압축 해제 완료 (재시작 필요)
+      str       - 오류 메시지
     """
     try:
         suffix = "." + asset_url.rsplit(".", 1)[-1] if "." in asset_url else ".zip"
@@ -235,7 +234,7 @@ def download_app_release(asset_url: str, progress_cb=None):
                 if progress_cb and total:
                     progress_cb(int(downloaded * 100 / total))
 
-        # zip 배포: 압축 해제 후 완료
+        # zip 배포: 압축 해제
         if suffix.lower() == ".zip":
             dest_dir = Path(sys.executable).parent if getattr(sys, 'frozen', False) else APP_DIR
             with zipfile.ZipFile(tmp_file, "r") as z:
@@ -243,29 +242,37 @@ def download_app_release(asset_url: str, progress_cb=None):
             shutil.rmtree(tmp_dir, ignore_errors=True)
             return True
 
-        # exe 배포: PowerShell 스크립트로 파일 교체
-        cur_exe = Path(sys.executable) if getattr(sys, 'frozen', False) else APP_DIR / "rclone_mount_manager.exe"
+        # exe 배포: 쓰기 권한 확인 후 자동/수동 분기
+        cur_exe = (Path(sys.executable) if getattr(sys, 'frozen', False)
+                   else APP_DIR / "rclone_mount_manager.exe")
+        exe_dir = cur_exe.parent
+
+        if not _can_write_to_dir(exe_dir):
+            # 권한 없음: zip을 프로그램 디렉토리에 다운로드해서 수동 교체 안내
+            dest_zip = exe_dir / f"RcloneManager_update{suffix}"
+            shutil.copy2(str(tmp_file), str(dest_zip))
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return "manual"  # 수동 교체 필요
+
+        # 권한 있음: PowerShell로 자동 교체
         old_exe = cur_exe.with_suffix(".old")
         ps_path = tmp_dir / "updater.ps1"
 
-        # PowerShell 스크립트: 프로세스 종료 대기 후 파일 교체 후 재실행
-        # UTF-16 LE (BOM 포함) 으로 저장해야 PowerShell이 한글 경로 처리 가능
         ps_lines = [
             "Start-Sleep -Seconds 5",
             f'if (Test-Path "{old_exe}") {{ Remove-Item "{old_exe}" -Force }}',
-            f'try {{',
+            "try {",
             f'    Move-Item -Path "{cur_exe}" -Destination "{old_exe}" -Force',
             f'    Copy-Item -Path "{tmp_file}" -Destination "{cur_exe}" -Force',
-            f'    Remove-Item -Path "{tmp_file}" -Force',
+            f'    Remove-Item -Path "{tmp_file}" -Force -ErrorAction SilentlyContinue',
             f'    Remove-Item -Path "{tmp_dir}" -Recurse -Force -ErrorAction SilentlyContinue',
             f'    Start-Process -FilePath "{cur_exe}"',
-            f'}} catch {{',
+            "} catch {",
             f'    if (Test-Path "{old_exe}") {{ Move-Item -Path "{old_exe}" -Destination "{cur_exe}" -Force }}',
-            f'    [System.Windows.Forms.MessageBox]::Show("Update failed: " + $_.Exception.Message, "Error")',
-            f'}}'
+            "}",
         ]
         ps_content = "\n".join(ps_lines)
-        # UTF-16 LE with BOM
+        # UTF-16 LE with BOM (PowerShell 기본 인코딩)
         ps_path.write_bytes(('\ufeff' + ps_content).encode("utf-16-le"))
 
         subprocess.Popen(
@@ -305,10 +312,19 @@ def save_config(cfg):
 
 
 def get_rclone_exe(cfg):
-    """등록된 rclone 경로만 반환. 없거나 파일 없으면 None."""
+    """
+    등록된 rclone 경로 반환.
+    1순위: cfg의 rclone_path (등록된 경로)
+    2순위: APP_DIR/rclone.exe (같은 폴더의 rclone)
+    없으면 None 반환.
+    """
     p = cfg.get("rclone_path", "").strip()
     if p and Path(p).exists():
         return Path(p)
+    # 같은 폴더에 rclone.exe가 있으면 사용 (원본 동작 복구)
+    fallback = APP_DIR / "rclone.exe"
+    if fallback.exists():
+        return fallback
     return None
 
 
@@ -360,7 +376,6 @@ def _make_circle_icon(color="#cba6f7", size=64):
     return img
 
 
-
 # ── 4. 다이얼로그 ──
 class ConfImportDialog(tk.Toplevel):
     def __init__(self, parent, remotes):
@@ -394,9 +409,8 @@ class ConfImportDialog(tk.Toplevel):
 class UpdateDialog(tk.Toplevel):
     """
     앱 업데이트 확인 다이얼로그.
-    - 업데이트 내역 필드에만 스크롤바 (내용이 필드보다 길 때만 자동 표시)
-    - 현재 화면 논리 해상도의 38% × 60%
-    - grid 레이아웃: 버튼 영역 항상 하단 고정
+    - 업데이트 내역 필드에만 조건부 스크롤바
+    - grid 레이아웃: 버튼 항상 하단 고정
     """
 
     def __init__(self, parent, tag, body, assets=None):
@@ -430,7 +444,6 @@ class UpdateDialog(tk.Toplevel):
         txt_frame.columnconfigure(0, weight=1)
 
         vsb = tk.Scrollbar(txt_frame)
-
         txt = tk.Text(txt_frame, bg="#313244", fg="#cdd6f4", relief="flat",
                       font=("Segoe UI", 10), padx=10, pady=10, wrap="word")
         txt.grid(row=0, column=0, sticky="nsew")
@@ -473,12 +486,6 @@ class UpdateDialog(tk.Toplevel):
 
 
 class MountDialog(tk.Toplevel):
-    """
-    마운트 추가/편집 다이얼로그.
-    현재 화면 논리 해상도의 38% × 88%.
-    스크롤바 없이 모든 내용이 한 화면에 보임.
-    """
-
     def __init__(self, parent, mount=None, app_cfg=None):
         super().__init__(parent)
         self.title("마운트 추가" if not mount or "id" not in mount else "마운트 설정")
@@ -619,27 +626,20 @@ class App(tk.Tk):
         self._latest_rc = ""
         self._latest_app_info = None
         self._version_check_running = False
-        self._geometry_save_after = None  # 창 크기 저장 타이머 ID
+        self._geometry_save_after = None
 
-        # ── 창 크기 복원 또는 초기 계산 ────────────────────────────────────
-        # 사용자가 조정한 크기를 mounts.json > window_geometry 키로 저장/복원.
-        # 기본 크기로 되돌리려면 mounts.json 에서 window_geometry 항목을 삭제.
-        # 기본 비율: 논리 화면의 40%x48%
-        #   2736x1824 @175% → 논리 1563x1042 → 약 625x500
-        #   1920x1080 @100% → 논리 1920x1080 → 약 768x518
+        # ── 창 크기 복원 또는 초기 계산 ──────────────────────────────────────
+        # 저장된 크기가 있으면 복원, 없으면 논리 화면의 55%x65%
         saved_geo = self._cfg.get("window_geometry", "")
         if saved_geo and self._is_valid_geometry(saved_geo):
             self.geometry(saved_geo)
         else:
-            # 기본 크기: 논리 화면의 70%x80%
-            #   2736x1824 @175% → 논리 1563x1042 → 약 1094x834
-            #   1920x1080 @100% → 논리 1920x1080 → 약 1344x864
-            mw, mh = calc_window_size(70, 80, min_w=780, min_h=540)
+            mw, mh = calc_window_size(55, 65, min_w=780, min_h=540)
             self.geometry(f"{mw}x{mh}")
 
         self.minsize(560, 420)
         self.resizable(True, True)
-        # ──────────────────────────────────────────────────────────────────────
+        # ─────────────────────────────────────────────────────────────────────
 
         self._build_ui()
         self._refresh_list()
@@ -649,7 +649,6 @@ class App(tk.Tk):
         self._check_versions_async()
 
         self.bind("<FocusIn>", self._on_focus_in)
-        # 창 크기/위치 변경 시 저장 (디바운스: 500ms 후 저장)
         self.bind("<Configure>", self._on_configure)
 
         if self._cfg.get("auto_mount"):
@@ -657,32 +656,28 @@ class App(tk.Tk):
 
     @staticmethod
     def _is_valid_geometry(geo: str) -> bool:
-        """저장된 geometry 문자열이 유효한지 확인"""
+        """저장된 geometry 문자열이 유효한지 확인 (최솟값만 체크)"""
         try:
             m = re.match(r"^(\d+)x(\d+)", geo)
             if not m:
                 return False
             w, h = int(m.group(1)), int(m.group(2))
-            # 최소 크기만 확인 (화면보다 큰 경우는 Tkinter가 자동 조정)
             return w >= 400 and h >= 300
         except Exception:
             return False
 
     def _on_configure(self, event):
-        """창 크기/위치 변경 시 호출 - 디바운스 후 저장"""
+        """창 크기/위치 변경 시 디바운스 후 저장"""
         if event.widget is not self:
             return
-        # 이전 저장 타이머 취소
         if self._geometry_save_after:
             self.after_cancel(self._geometry_save_after)
-        # 500ms 후 저장
         self._geometry_save_after = self.after(500, self._save_geometry)
 
     def _save_geometry(self):
-        """현재 창 크기/위치를 설정에 저장"""
+        """현재 창 크기/위치 저장"""
         self._geometry_save_after = None
-        geo = self.geometry()
-        self._cfg["window_geometry"] = geo
+        self._cfg["window_geometry"] = self.geometry()
         save_config(self._cfg)
 
     def _on_column_resize(self, event):
@@ -755,7 +750,6 @@ class App(tk.Tk):
 
         # 트리뷰 (5컬럼)
         cols = ("type", "auto", "drive", "remote", "status")
-        # 기본 컬럼 폭 (저장된 값 없을 때 사용)
         self._col_default_widths = {"type": 70, "auto": 50, "drive": 75, "status": 85}
         saved_cw = self._cfg.get("column_widths", {})
         self._tree = ttk.Treeview(self, columns=cols, show="headings", height=14)
@@ -771,7 +765,6 @@ class App(tk.Tk):
                 self._tree.column(col, stretch=True, minwidth=80)
         self._tree.pack(fill="both", expand=True, padx=20, pady=5)
         self._tree.tag_configure("remote_tag", foreground="#8fa0b5")
-        # 헤더 드래그로 컬럼 폭 조절 후 저장
         self._tree.bind("<<TreeviewColumnRelease>>", self._on_column_resize)
 
         # 하단 버튼 행
@@ -799,6 +792,7 @@ class App(tk.Tk):
     # rclone 레이블 / 버전 확인
     # ────────────────────────────────────────────
     def _init_rc_label(self):
+        """초기 rclone 상태 레이블 설정"""
         exe = get_rclone_exe(self._cfg)
         if exe is None:
             self._rc_ver_label.config(text="rclone 다운로드", fg="#f38ba8")
@@ -806,8 +800,20 @@ class App(tk.Tk):
             self._rc_ver_label.config(text="v체크 중...", fg="#94e2d5")
 
     def _check_rclone_presence(self):
+        """
+        등록된 rclone 존재 여부 즉시 확인.
+        - 등록 경로가 사라졌으면 경로 초기화 + 다운로드 표시 (요구사항 5)
+        - 있으면 버전 체크
+        """
+        registered = self._cfg.get("rclone_path", "").strip()
         exe = get_rclone_exe(self._cfg)
+
         if exe is None:
+            # 등록된 경로가 있었는데 파일이 사라진 경우 → 경로 초기화
+            if registered:
+                self._cfg["rclone_path"] = ""
+                self._rc_var.set("")
+                save_config(self._cfg)
             self._rc_ver_label.config(text="rclone 다운로드", fg="#f38ba8")
         else:
             self._rc_ver_label.config(text="v체크 중...", fg="#94e2d5")
@@ -815,10 +821,12 @@ class App(tk.Tk):
             self._check_versions_async()
 
     def _on_focus_in(self, event):
+        """창 활성화 시 rclone + 앱 버전 재확인"""
         if event.widget is self:
             self._check_rclone_presence()
 
     def _check_versions_async(self):
+        """백그라운드에서 rclone 및 앱 버전 확인"""
         if self._version_check_running:
             return
         self._version_check_running = True
@@ -828,6 +836,7 @@ class App(tk.Tk):
                 exe = get_rclone_exe(self._cfg)
                 lat_rc = ""
 
+                # GitHub rclone 최신 버전 조회
                 try:
                     res = requests.get(
                         "https://api.github.com/repos/rclone/rclone/releases/latest",
@@ -837,6 +846,7 @@ class App(tk.Tk):
                 except Exception:
                     pass
 
+                # rclone 버전 레이블 갱신
                 if exe is None:
                     self.after(0, lambda: self._rc_ver_label.config(
                         text="rclone 다운로드", fg="#f38ba8"))
@@ -863,6 +873,7 @@ class App(tk.Tk):
                         self.after(0, lambda: self._rc_ver_label.config(
                             text="v알 수 없음", fg="#f38ba8"))
 
+                # 앱 업데이트 확인
                 try:
                     res = requests.get(
                         f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
@@ -920,19 +931,33 @@ class App(tk.Tk):
             res = download_app_release(asset_url, _prog)
 
             if res == "restart":
+                # PowerShell 스크립트 실행됨 → 종료하면 자동 교체
                 self.after(0, lambda: messagebox.showinfo(
                     "업데이트",
                     "업데이트 파일을 내려받았습니다.\n"
                     "프로그램이 종료된 후 자동으로 교체되고 재시작됩니다."))
                 self.after(500, self._quit_app)
+
+            elif res == "manual":
+                # 권한 부족 → zip을 프로그램 폴더에 저장, 수동 교체 안내
+                exe_dir = (Path(sys.executable).parent if getattr(sys, 'frozen', False)
+                           else APP_DIR)
+                self.after(0, lambda: messagebox.showwarning(
+                    "수동 업데이트 필요",
+                    f"권한 문제로 자동 업데이트가 불가능합니다.\n\n"
+                    f"업데이트 파일을 다음 위치에 저장했습니다:\n{exe_dir}\n\n"
+                    f"프로그램을 종료한 후 기존 실행 파일을 새 파일로 교체해 주세요."))
+                self.after(0, lambda: self._app_up_btn.config(
+                    text="✨ 새 버전 업데이트 가능", state="normal"))
+
             elif res is True:
-                # zip 배포 완료: 종료 후 재실행 안내
-                # 버튼을 "재시작" 으로 바꾸고 클릭 시 프로그램 종료 후 재실행
+                # zip 압축 해제 완료 → 재시작
                 self.after(0, lambda: messagebox.showinfo(
                     "업데이트 완료",
                     "업데이트 파일 교체가 완료되었습니다.\n"
                     "확인을 누르면 프로그램이 재시작됩니다."))
                 self.after(0, self._restart_app)
+
             else:
                 self.after(0, lambda err=res: messagebox.showerror("오류", err))
                 self.after(0, lambda: self._app_up_btn.config(
@@ -996,11 +1021,6 @@ class App(tk.Tk):
     # 트레이
     # ────────────────────────────────────────────
     def _start_tray(self):
-        """
-        트레이 아이콘 초기화.
-        pystray + PIL(Pillow) 모두 사용 가능할 때만 동작.
-        import 실패(ImportError, ValueError 등) 는 모듈 상단에서 이미 처리됨.
-        """
         if not _TRAY_AVAILABLE:
             return
         try:
@@ -1014,11 +1034,9 @@ class App(tk.Tk):
 
     def _build_tray_menu(self):
         """
-        트레이 우클릭 메뉴를 구성한다.
-
-        주의: pystray.MenuItem 은 icon= 파라미터를 지원하지 않는다.
-        icon= 을 넘기면 TypeError 가 발생해 트레이가 조용히 실패한다.
-        마운트 상태는 텍스트(🟢/⚫)로만 표시한다.
+        트레이 우클릭 메뉴.
+        pystray.MenuItem은 icon= 파라미터 미지원 → 이모지로 상태 표시.
+        마운트 항목 클릭 시 현재 active_mounts에서 실시간으로 상태 확인.
         """
         if not _TRAY_AVAILABLE:
             return None
@@ -1035,20 +1053,23 @@ class App(tk.Tk):
                 mid = m["id"]
                 is_mounted = mid in active_mounts
                 label = m.get("drive", "") or m.get("remote", "?")
-                rstr  = f"{m['remote']}:{m.get('remote_path', '')}".strip(":")
+                rstr = f"{m['remote']}:{m.get('remote_path', '')}".strip(":")
                 display = f"{'🟢' if is_mounted else '⚫'}  {label}  ({rstr})"
 
-                def _make_toggle(mount_id, mount_data, mounted):
+                # 클릭 시 현재 active_mounts를 실시간으로 확인하여 토글
+                def _make_toggle(mount_id, mount_data):
                     def _toggle(icon, item):
-                        if mounted:
+                        if mount_id in active_mounts:
+                            # 현재 마운트 중 → 언마운트
                             unmount(mount_id)
                             self.after(0, self._refresh_list)
                         else:
+                            # 현재 언마운트 → 마운트
                             self.after(0, lambda: self._do_mount(mount_id, mount_data))
                     return _toggle
 
                 items.append(
-                    pystray.MenuItem(display, _make_toggle(mid, m, is_mounted))
+                    pystray.MenuItem(display, _make_toggle(mid, m))
                 )
             items.append(pystray.Menu.SEPARATOR)
         else:
@@ -1075,7 +1096,7 @@ class App(tk.Tk):
         for m in self._cfg.get("mounts", []):
             st = self._status.get(m["id"], "stopped")
             auto = "✅" if m.get("auto_mount") else "—"
-            lbl  = "🟢 실행중" if st == "mounted" else "⚫ 중지됨"
+            lbl = "🟢 실행중" if st == "mounted" else "⚫ 중지됨"
             rstr = f"{m['remote']}:{m.get('remote_path', '')}".strip(":")
             self._tree.insert("", "end", iid=m["id"],
                               values=("💾 마운트", auto, m.get("drive", ""), rstr, lbl))
@@ -1226,15 +1247,37 @@ class App(tk.Tk):
         if exe is None:
             messagebox.showerror("오류", "rclone 경로가 등록되어 있지 않습니다.")
             return
+        if mid in active_mounts:
+            return  # 이미 마운트 중이면 무시
         self._status[mid] = "mounted"
         self._refresh_list()
         threading.Thread(target=self._mount_task, args=(mid, exe, m), daemon=True).start()
 
     def _mount_task(self, mid, exe, m):
+        """
+        rclone mount 실행.
+        rclone이 즉시 종료(오류)되면 stderr를 캡처해 사용자에게 표시.
+        """
         try:
-            p = subprocess.Popen(build_cmd(exe, m), creationflags=0x08000000)
+            p = subprocess.Popen(
+                build_cmd(exe, m),
+                stderr=subprocess.PIPE,
+                creationflags=0x08000000
+            )
             active_mounts[mid] = p
             p.wait()
+            # 비정상 종료 시 오류 표시
+            if p.returncode != 0:
+                stderr_out = ""
+                try:
+                    stderr_out = p.stderr.read().decode("utf-8", errors="replace").strip()
+                except Exception:
+                    pass
+                if stderr_out:
+                    self.after(0, lambda msg=stderr_out: messagebox.showerror(
+                        "마운트 오류", f"rclone 오류:\n{msg[:500]}"))
+        except Exception as e:
+            self.after(0, lambda err=str(e): messagebox.showerror("마운트 오류", err))
         finally:
             active_mounts.pop(mid, None)
             self._status[mid] = "stopped"
@@ -1249,9 +1292,10 @@ class App(tk.Tk):
         sel = self._tree.selection()
         if sel and not sel[0].startswith("remote_"):
             unmount(sel[0])
+            self._refresh_list()
 
     # ────────────────────────────────────────────
-    # 창 표시/숨김/종료
+    # 창 표시/숨김/종료/재시작
     # ────────────────────────────────────────────
     def hide_window(self):
         self.withdraw()
@@ -1262,9 +1306,9 @@ class App(tk.Tk):
         self.focus_force()
 
     def _restart_app(self):
-        """프로그램 종료 후 재실행 (업데이트 완료 후 호출)"""
+        """프로그램 종료 후 재실행"""
         try:
-            exe = Path(sys.executable) if getattr(sys, 'frozen', False) else Path(sys.executable)
+            exe = Path(sys.executable)
             subprocess.Popen(
                 [str(exe)],
                 creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
