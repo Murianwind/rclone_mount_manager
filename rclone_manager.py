@@ -373,12 +373,6 @@ def _make_circle_icon(color="#cba6f7", size=64):
     return img
 
 
-def _make_dot_icon(color, size=16):
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    d.ellipse([1, 1, size - 2, size - 2], fill=color)
-    return img
-
 
 # ── 4. 다이얼로그 ──
 class ConfImportDialog(tk.Toplevel):
@@ -1013,17 +1007,19 @@ class App(tk.Tk):
             self._tray = None
 
     def _build_tray_menu(self):
+        """
+        트레이 우클릭 메뉴를 구성한다.
+
+        주의: pystray.MenuItem 은 icon= 파라미터를 지원하지 않는다.
+        icon= 을 넘기면 TypeError 가 발생해 트레이가 조용히 실패한다.
+        마운트 상태는 텍스트(🟢/⚫)로만 표시한다.
+        """
         if not _TRAY_AVAILABLE:
             return None
 
-        icon_open = _make_dot_icon("#89b4fa")
-        icon_quit = _make_dot_icon("#f38ba8")
-        icon_on   = _make_dot_icon("#a6e3a1")
-        icon_off  = _make_dot_icon("#585b70")
-
         items = [
             pystray.MenuItem("🪟 열기", lambda: self.after(0, self.show_window),
-                             default=True, icon=icon_open),
+                             default=True),
             pystray.Menu.SEPARATOR,
         ]
 
@@ -1035,7 +1031,6 @@ class App(tk.Tk):
                 label = m.get("drive", "") or m.get("remote", "?")
                 rstr  = f"{m['remote']}:{m.get('remote_path', '')}".strip(":")
                 display = f"{'🟢' if is_mounted else '⚫'}  {label}  ({rstr})"
-                ic = icon_on if is_mounted else icon_off
 
                 def _make_toggle(mount_id, mount_data, mounted):
                     def _toggle(icon, item):
@@ -1047,7 +1042,7 @@ class App(tk.Tk):
                     return _toggle
 
                 items.append(
-                    pystray.MenuItem(display, _make_toggle(mid, m, is_mounted), icon=ic)
+                    pystray.MenuItem(display, _make_toggle(mid, m, is_mounted))
                 )
             items.append(pystray.Menu.SEPARATOR)
         else:
@@ -1056,8 +1051,7 @@ class App(tk.Tk):
             items.append(pystray.Menu.SEPARATOR)
 
         items.append(
-            pystray.MenuItem("🚪 종료", lambda: self.after(0, self._quit_app),
-                             icon=icon_quit)
+            pystray.MenuItem("🚪 종료", lambda: self.after(0, self._quit_app))
         )
         return pystray.Menu(*items)
 
