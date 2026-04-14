@@ -10,6 +10,7 @@ import os
 import sys
 import subprocess
 import threading
+import time
 import requests
 import zipfile
 import tempfile
@@ -35,8 +36,10 @@ except Exception:
     _TRAY_AVAILABLE = False
 
 # ── 프로그램 설정 ──
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.0"
 GITHUB_REPO = "Murianwind/rclone_mount_manager"
+# GitHub API 버전 체크 주기 (초 단위, 86400 = 24시간)
+VERSION_CHECK_INTERVAL = 86400
 
 # ── 1. 시스템 환경 설정 ──
 try:
@@ -799,17 +802,31 @@ class App(tk.Tk):
         else:
             self._rc_ver_label.config(text="v체크 중...", fg="#94e2d5")
             self._version_check_running = False
-            self._check_versions_async()
+            self._check_versions_async(force=True)
 
     def _on_focus_in(self, event):
         """창 활성화 시 rclone + 앱 버전 재확인"""
         if event.widget is self:
             self._check_rclone_presence()
 
-    def _check_versions_async(self):
-        """백그라운드에서 rclone 및 앱 버전 확인"""
+    def _check_versions_async(self, force: bool = False):
+        """
+        백그라운드에서 rclone 및 앱 버전 확인.
+
+        GitHub API rate limit 대응 (비인증: 60회/시간/IP):
+          - mounts.json의 last_version_check 타임스탬프를 확인
+          - 마지막 체크로부터 VERSION_CHECK_INTERVAL(24시간) 미경과 시 GitHub API 호출 스킵
+          - force=True이면 주기와 무관하게 즉시 체크 (수동 클릭 등)
+          - API를 스킵해도 rclone 로컬 버전 표시는 항상 수행
+        """
         if self._version_check_running:
             return
+
+        # 24시간 주기 체크: 마지막 체크 시각 확인
+        now = time.time()
+        last_check = self._cfg.get("last_version_check", 0)
+        skip_api = (not force) and (now - last_check < VERSION_CHECK_INTERVAL)
+
         self._version_check_running = True
 
         def _task():
@@ -817,17 +834,43 @@ class App(tk.Tk):
                 exe = get_rclone_exe(self._cfg)
                 lat_rc = ""
 
-                # GitHub rclone 최신 버전 조회
-                try:
-                    res = requests.get(
-                        "https://api.github.com/repos/rclone/rclone/releases/latest",
-                        timeout=5)
-                    lat_rc = res.json().get("tag_name", "").lstrip("v")
-                    self._latest_rc = lat_rc
-                except Exception:
-                    pass
+                if not skip_api:
+                    # GitHub rclone 최신 버전 조회
+                    try:
+                        res = requests.get(
+                            "https://api.github.com/repos/rclone/rclone/releases/latest",
+                            timeout=5)
+                        lat_rc = res.json().get("tag_name", "").lstrip("v")
+                        self._latest_rc = lat_rc
+                    except Exception:
+                        pass
 
-                # rclone 버전 레이블 갱신
+                    # 앱 업데이트 확인
+                    try:
+                        res = requests.get(
+                            f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+                            timeout=5)
+                        data = res.json()
+                        latest_app = data.get("tag_name", "").lstrip("v")
+                        self._latest_app_info = data
+                        if latest_app > APP_VERSION:
+                            self.after(0, self._show_app_update_btn)
+                        else:
+                            self.after(0, self._hide_app_update_btn)
+                    except Exception:
+                        pass
+
+                    # 체크 완료 시각 저장
+                    self._cfg["last_version_check"] = now
+                    save_config(self._cfg)
+                else:
+                    # API 스킵: 기존에 저장된 앱 업데이트 정보로 버튼 상태 복원
+                    if self._latest_app_info:
+                        latest_app = self._latest_app_info.get("tag_name", "").lstrip("v")
+                        if latest_app > APP_VERSION:
+                            self.after(0, self._show_app_update_btn)
+
+                # rclone 로컬 버전 표시는 항상 수행 (로컬 실행이라 API 호출 없음)
                 if exe is None:
                     self.after(0, lambda: self._rc_ver_label.config(
                         text="rclone 다운로드", fg="#f38ba8"))
@@ -838,6 +881,8 @@ class App(tk.Tk):
                                            timeout=5, creationflags=0x08000000)
                         loc_match = re.search(r"rclone v([\d.]+)", r.stdout)
                         loc_rc = loc_match.group(1) if loc_match else ""
+                        # 업데이트 가능 여부 판단: lat_rc는 API 스킵 시 이전 값 재사용
+                        lat_rc = lat_rc or self._latest_rc
                         if loc_rc:
                             if lat_rc and loc_rc < lat_rc:
                                 txt = f"v{loc_rc} / v{lat_rc} 업데이트"
@@ -853,21 +898,6 @@ class App(tk.Tk):
                     except Exception:
                         self.after(0, lambda: self._rc_ver_label.config(
                             text="v알 수 없음", fg="#f38ba8"))
-
-                # 앱 업데이트 확인
-                try:
-                    res = requests.get(
-                        f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
-                        timeout=5)
-                    data = res.json()
-                    latest_app = data.get("tag_name", "").lstrip("v")
-                    self._latest_app_info = data
-                    if latest_app > APP_VERSION:
-                        self.after(0, self._show_app_update_btn)
-                    else:
-                        self.after(0, self._hide_app_update_btn)
-                except Exception:
-                    pass
             finally:
                 self._version_check_running = False
 
@@ -942,7 +972,7 @@ class App(tk.Tk):
                 messagebox.showinfo("rclone",
                                     "최신 버전 정보를 확인 중입니다. 잠시 후 다시 시도해 주세요.")
                 self._version_check_running = False
-                self._check_versions_async()
+                self._check_versions_async(force=True)
                 return
             if messagebox.askyesno("rclone", f"rclone v{self._latest_rc}를 설치할까요?"):
                 threading.Thread(target=self._do_rc_down, daemon=True).start()
