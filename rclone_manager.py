@@ -107,7 +107,7 @@ def calc_window_size(w_pct, h_pct, min_w=400, min_h=300):
     1920×1080 기준값 없이, 실행 중인 화면에 맞게 직접 계산.
 
     검증된 비율 (2736x1824 @175% 기준, 논리 1563x1042):
-      메인 창          → calc_window_size(40, 48)  → 약 625x500
+      메인 창          → calc_window_size(70, 80)  → 약 1094x834 (2736x1824@175%)
       마운트 추가/편집  → calc_window_size(34, 82)  → 약 531x854
       업데이트 확인     → calc_window_size(34, 56)  → 약 531x583
     """
@@ -208,17 +208,14 @@ def download_app_release(asset_url: str, progress_cb=None):
     """
     앱 자체 업데이트.
 
-    [권한 문제 해결]
-    실행 중인 .exe 는 Windows 에서 직접 rename / 덮어쓰기 불가(PermissionError).
-    해결책:
-      1. 새 파일을 %TEMP% 하위 임시 폴더에 다운로드
-      2. updater.bat 작성: 현재 프로세스 종료 후 대기 → 파일 교체 → 재시작
-      3. 배치 파일을 독립 프로세스로 실행 → 현재 프로세스는 "restart" 반환 후 종료
-
-    zip 배포인 경우: 압축 해제만 수행 (True 반환, 호출자가 재시작 안내).
+    [권한 문제 해결] PowerShell 방식 사용:
+    - 한글 주석/경로 인코딩 문제 없음 (PowerShell은 UTF-16 LE 기본)
+    - 실행 중인 exe 종료 후 충분히 대기 (5초) 후 파일 교체
+    - 교체 실패 시 .old 파일로 복원
+    - 성공 시 새 exe 자동 실행
 
     반환값:
-      "restart" - 배치 스크립트 실행됨, 호출자는 프로세스를 바로 종료해야 함
+      "restart" - PowerShell 스크립트 실행됨, 호출자는 프로세스를 종료해야 함
       True       - zip 압축 해제 완료 (재시작 필요 안내)
       str        - 오류 메시지
     """
@@ -227,7 +224,7 @@ def download_app_release(asset_url: str, progress_cb=None):
         tmp_dir = Path(tempfile.mkdtemp())
         tmp_file = tmp_dir / f"update{suffix}"
 
-        # ── 다운로드 ──────────────────────────────────────────────────────────
+        # 다운로드
         r = requests.get(asset_url, stream=True, timeout=60)
         total = int(r.headers.get("content-length", 0))
         downloaded = 0
@@ -238,7 +235,7 @@ def download_app_release(asset_url: str, progress_cb=None):
                 if progress_cb and total:
                     progress_cb(int(downloaded * 100 / total))
 
-        # ── zip 배포: 압축 해제 후 완료 ──────────────────────────────────────
+        # zip 배포: 압축 해제 후 완료
         if suffix.lower() == ".zip":
             dest_dir = Path(sys.executable).parent if getattr(sys, 'frozen', False) else APP_DIR
             with zipfile.ZipFile(tmp_file, "r") as z:
@@ -246,44 +243,34 @@ def download_app_release(asset_url: str, progress_cb=None):
             shutil.rmtree(tmp_dir, ignore_errors=True)
             return True
 
-        # ── exe 배포 ─────────────────────────────────────────────────────────
-        # frozen(PyInstaller) 여부와 무관하게 항상 배치 스크립트 방식 사용.
-        # 이유: frozen이든 아니든 .exe 파일이 실행 중이면 rename/overwrite 불가.
+        # exe 배포: PowerShell 스크립트로 파일 교체
         cur_exe = Path(sys.executable) if getattr(sys, 'frozen', False) else APP_DIR / "rclone_mount_manager.exe"
         old_exe = cur_exe.with_suffix(".old")
-        bat_path = tmp_dir / "updater.bat"
+        ps_path = tmp_dir / "updater.ps1"
 
-        # 배치 파일: ASCII로 작성해야 cmd.exe 가 깨지지 않음
-        bat_lines = [
-            "@echo off",
-            "chcp 65001 > nul",
-            ":: RcloneManager Updater",
-            ":: 현재 프로세스가 완전히 종료될 때까지 3초 대기",
-            "ping -n 4 127.0.0.1 > nul",
-            f'if exist "{old_exe}" del /f /q "{old_exe}"',
-            f'move /y "{cur_exe}" "{old_exe}"',
-            "if errorlevel 1 (",
-            "    echo Update failed: cannot rename current exe",
-            "    pause",
-            "    exit /b 1",
-            ")",
-            f'copy /y "{tmp_file}" "{cur_exe}"',
-            "if errorlevel 1 (",
-            f'    move /y "{old_exe}" "{cur_exe}"',
-            "    echo Update failed: cannot copy new exe",
-            "    pause",
-            "    exit /b 1",
-            ")",
-            f'del /f /q "{tmp_file}"',
-            f'rmdir /s /q "{tmp_dir}"',
-            f'start "" "{cur_exe}"',
-            "exit /b 0",
+        # PowerShell 스크립트: 프로세스 종료 대기 후 파일 교체 후 재실행
+        # UTF-16 LE (BOM 포함) 으로 저장해야 PowerShell이 한글 경로 처리 가능
+        ps_lines = [
+            "Start-Sleep -Seconds 5",
+            f'if (Test-Path "{old_exe}") {{ Remove-Item "{old_exe}" -Force }}',
+            f'try {{',
+            f'    Move-Item -Path "{cur_exe}" -Destination "{old_exe}" -Force',
+            f'    Copy-Item -Path "{tmp_file}" -Destination "{cur_exe}" -Force',
+            f'    Remove-Item -Path "{tmp_file}" -Force',
+            f'    Remove-Item -Path "{tmp_dir}" -Recurse -Force -ErrorAction SilentlyContinue',
+            f'    Start-Process -FilePath "{cur_exe}"',
+            f'}} catch {{',
+            f'    if (Test-Path "{old_exe}") {{ Move-Item -Path "{old_exe}" -Destination "{cur_exe}" -Force }}',
+            f'    [System.Windows.Forms.MessageBox]::Show("Update failed: " + $_.Exception.Message, "Error")',
+            f'}}'
         ]
-        bat_path.write_text("\r\n".join(bat_lines), encoding="utf-8")
+        ps_content = "\n".join(ps_lines)
+        # UTF-16 LE with BOM
+        ps_path.write_bytes(('\ufeff' + ps_content).encode("utf-16-le"))
 
-        # DETACHED_PROCESS: 현재 콘솔과 완전히 분리, CREATE_NO_WINDOW: 창 없이
         subprocess.Popen(
-            ["cmd.exe", "/c", str(bat_path)],
+            ["powershell.exe", "-ExecutionPolicy", "Bypass",
+             "-WindowStyle", "Hidden", "-File", str(ps_path)],
             creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
             close_fds=True,
         )
@@ -644,7 +631,10 @@ class App(tk.Tk):
         if saved_geo and self._is_valid_geometry(saved_geo):
             self.geometry(saved_geo)
         else:
-            mw, mh = calc_window_size(40, 48, min_w=620, min_h=480)
+            # 기본 크기: 논리 화면의 70%x80%
+            #   2736x1824 @175% → 논리 1563x1042 → 약 1094x834
+            #   1920x1080 @100% → 논리 1920x1080 → 약 1344x864
+            mw, mh = calc_window_size(70, 80, min_w=780, min_h=540)
             self.geometry(f"{mw}x{mh}")
 
         self.minsize(560, 420)
@@ -669,14 +659,12 @@ class App(tk.Tk):
     def _is_valid_geometry(geo: str) -> bool:
         """저장된 geometry 문자열이 유효한지 확인"""
         try:
-            # WxH 또는 WxH+X+Y 형식 검증
             m = re.match(r"^(\d+)x(\d+)", geo)
             if not m:
                 return False
             w, h = int(m.group(1)), int(m.group(2))
-            lw, lh = get_logical_screen_size()
-            # 현재 화면보다 크거나 너무 작으면 무효
-            return 400 <= w <= lw and 300 <= h <= lh
+            # 최소 크기만 확인 (화면보다 큰 경우는 Tkinter가 자동 조정)
+            return w >= 400 and h >= 300
         except Exception:
             return False
 
@@ -695,6 +683,14 @@ class App(tk.Tk):
         self._geometry_save_after = None
         geo = self.geometry()
         self._cfg["window_geometry"] = geo
+        save_config(self._cfg)
+
+    def _on_column_resize(self, event):
+        """헤더 드래그로 컬럼 폭 조절 후 저장"""
+        widths = {}
+        for col in ("type", "auto", "drive", "status"):
+            widths[col] = self._tree.column(col, "width")
+        self._cfg["column_widths"] = widths
         save_config(self._cfg)
 
     # ────────────────────────────────────────────
@@ -759,16 +755,24 @@ class App(tk.Tk):
 
         # 트리뷰 (5컬럼)
         cols = ("type", "auto", "drive", "remote", "status")
+        # 기본 컬럼 폭 (저장된 값 없을 때 사용)
+        self._col_default_widths = {"type": 70, "auto": 50, "drive": 75, "status": 85}
+        saved_cw = self._cfg.get("column_widths", {})
         self._tree = ttk.Treeview(self, columns=cols, show="headings", height=14)
-        for col, head, cw, stretch in zip(
+        for col, head, stretch in zip(
                 cols,
                 ("구분", "자동", "드라이브", "리모트 (서브경로)", "상태"),
-                (70, 50, 75, 0, 85),
                 (False, False, False, True, False)):
             self._tree.heading(col, text=head)
-            self._tree.column(col, width=cw, stretch=stretch)
+            if not stretch:
+                cw = saved_cw.get(col, self._col_default_widths[col])
+                self._tree.column(col, width=cw, minwidth=40, stretch=False)
+            else:
+                self._tree.column(col, stretch=True, minwidth=80)
         self._tree.pack(fill="both", expand=True, padx=20, pady=5)
         self._tree.tag_configure("remote_tag", foreground="#8fa0b5")
+        # 헤더 드래그로 컬럼 폭 조절 후 저장
+        self._tree.bind("<<TreeviewColumnRelease>>", self._on_column_resize)
 
         # 하단 버튼 행
         btn_f = ttk.Frame(self)
@@ -922,11 +926,13 @@ class App(tk.Tk):
                     "프로그램이 종료된 후 자동으로 교체되고 재시작됩니다."))
                 self.after(500, self._quit_app)
             elif res is True:
+                # zip 배포 완료: 종료 후 재실행 안내
+                # 버튼을 "재시작" 으로 바꾸고 클릭 시 프로그램 종료 후 재실행
                 self.after(0, lambda: messagebox.showinfo(
                     "업데이트 완료",
-                    "업데이트가 완료되었습니다.\n프로그램을 재시작해 주세요."))
-                self.after(0, lambda: self._app_up_btn.config(
-                    text="✅ 재시작 필요", state="normal"))
+                    "업데이트 파일 교체가 완료되었습니다.\n"
+                    "확인을 누르면 프로그램이 재시작됩니다."))
+                self.after(0, self._restart_app)
             else:
                 self.after(0, lambda err=res: messagebox.showerror("오류", err))
                 self.after(0, lambda: self._app_up_btn.config(
@@ -1254,6 +1260,19 @@ class App(tk.Tk):
         self.deiconify()
         self.lift()
         self.focus_force()
+
+    def _restart_app(self):
+        """프로그램 종료 후 재실행 (업데이트 완료 후 호출)"""
+        try:
+            exe = Path(sys.executable) if getattr(sys, 'frozen', False) else Path(sys.executable)
+            subprocess.Popen(
+                [str(exe)],
+                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
+                close_fds=True,
+            )
+        except Exception:
+            pass
+        self._quit_app()
 
     def _quit_app(self):
         for mid in list(active_mounts.keys()):
