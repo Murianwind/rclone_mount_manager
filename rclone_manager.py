@@ -36,7 +36,7 @@ except Exception:
     _TRAY_AVAILABLE = False
 
 # ── 프로그램 설정 ──
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.1.0"
 GITHUB_REPO = "Murianwind/rclone_mount_manager"
 # GitHub API 버전 체크 주기 (초 단위, 86400 = 24시간)
 VERSION_CHECK_INTERVAL = 86400
@@ -292,16 +292,24 @@ def build_cmd(exe: Path, mount: dict):
 _unmounting = set()
 
 def unmount(mid):
+    """
+    마운트 프로세스를 종료한다.
+    _unmounting에 mid를 추가해 의도적 종료임을 표시한다.
+    discard는 _mount_task의 finally에서만 수행하여
+    타이밍 경쟁 조건(race condition)을 방지한다.
+    """
     p = active_mounts.get(mid)
     if p:
-        _unmounting.add(mid)   # 의도적 종료 표시
+        _unmounting.add(mid)   # 의도적 종료 표시 (discard는 _mount_task finally에서)
         p.terminate()
         try:
             p.wait(timeout=3)
-        except:
+        except Exception:
             p.kill()
         active_mounts.pop(mid, None)
-        _unmounting.discard(mid)
+        # _unmounting.discard 는 여기서 하지 않음
+        # → _mount_task의 p.wait() 반환 후 finally에서만 discard
+        #   (unmount()가 먼저 discard하면 _mount_task가 오류로 인식하는 race condition 발생)
 
 
 def activate_existing_window():
@@ -1046,15 +1054,23 @@ class App(tk.Tk):
         if mounts:
             for m in mounts:
                 mid = m["id"]
-                is_mounted = mid in active_mounts
+                # _status=="mounted" OR active_mounts 둘 다 확인
+                # 이유: _do_mount에서 _status를 먼저 설정하고 _refresh_list를 호출하지만
+                #       active_mounts[mid]=p는 _mount_task 스레드에서 나중에 설정됨
+                #       → _status를 우선 확인해야 트레이 이모지가 즉시 반영됨
+                is_mounted = (self._status.get(mid) == "mounted") or (mid in active_mounts)
                 label = m.get("drive", "") or m.get("remote", "?")
                 rstr = f"{m['remote']}:{m.get('remote_path', '')}".strip(":")
                 display = f"{'■' if is_mounted else '▶'}  {label}  ({rstr})"
 
-                # 클릭 시 현재 active_mounts를 실시간으로 확인하여 토글
+                # 클릭 시 active_mounts와 _status 모두 확인하여 실시간 토글
                 def _make_toggle(mount_id, mount_data):
                     def _toggle(icon, item):
-                        if mount_id in active_mounts:
+                        currently_mounted = (
+                            (self._status.get(mount_id) == "mounted") or
+                            (mount_id in active_mounts)
+                        )
+                        if currently_mounted:
                             # 현재 마운트 중 → 언마운트
                             unmount(mount_id)
                             self.after(0, self._refresh_list)
