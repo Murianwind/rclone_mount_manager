@@ -246,11 +246,11 @@ class TestRcloneManagerBDD(unittest.TestCase):
         app = self._create_mocked_app()
         dlg = self._create_mocked_dialog(app)
         dlg._rem.get.return_value = ""
-        with patch("tkinter.messagebox.showwarning") as mock_warn:
+        with patch("tkinter.messagebox.showinfo") as mock_info:
             # When: 저장을 시도하면
             dlg._save()
-            # Then: 경고 창이 표시되어야 한다.
-            mock_warn.assert_called_with("오류", "리모트 이름 필수")
+            # Then: 알림 창이 표시되어야 한다.
+            mock_info.assert_called_with("알림", "리모트 이름을 입력해 주세요.")
 
     # ── Scenario 13: 드라이브 문자 중복 에러 ─────────────────────────────
     def test_scenario_13_dialog_duplicate_drive(self):
@@ -261,11 +261,11 @@ class TestRcloneManagerBDD(unittest.TestCase):
         dlg = self._create_mocked_dialog(app, cfg=cfg)
         dlg._rem.get.return_value = "test"
         dlg._drv.get.return_value = "Z:"
-        with patch("tkinter.messagebox.showerror") as mock_err:
+        with patch("tkinter.messagebox.showinfo") as mock_info:
             # When: 저장을 시도하면
             dlg._save()
-            # Then: 중복 에러가 표시되어야 한다.
-            mock_err.assert_called_with("오류", "드라이브 문자 중복")
+            # Then: 알림 창이 표시되어야 한다.
+            mock_info.assert_called_with("알림", "이미 사용 중인 드라이브 문자입니다.")
 
     # ── Scenario 14: 동일 리모트/경로 중복 에러 ──────────────────────────
     def test_scenario_14_dialog_duplicate_remote_path(self):
@@ -276,11 +276,11 @@ class TestRcloneManagerBDD(unittest.TestCase):
         dlg = self._create_mocked_dialog(app, cfg=cfg)
         dlg._rem.get.return_value = "test"
         dlg._pth.get.return_value = "path"
-        with patch("tkinter.messagebox.showerror") as mock_err:
+        with patch("tkinter.messagebox.showinfo") as mock_info:
             # When: 저장을 시도하면
             dlg._save()
-            # Then: 중복 에러가 표시되어야 한다.
-            mock_err.assert_called()
+            # Then: 알림 창이 표시되어야 한다.
+            mock_info.assert_called()
 
     # ── Scenario 15: rclone 다운로드 및 설치 ─────────────────────────────
     def test_scenario_15_rclone_install_path(self):
