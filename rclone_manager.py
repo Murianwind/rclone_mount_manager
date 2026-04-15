@@ -36,7 +36,7 @@ except Exception:
     _TRAY_AVAILABLE = False
 
 # ── 프로그램 설정 ──
-APP_VERSION = "1.1.4"
+APP_VERSION = "1.1.0"
 GITHUB_REPO = "Murianwind/rclone_mount_manager"
 # GitHub API 버전 체크 주기 (초 단위, 86400 = 24시간)
 VERSION_CHECK_INTERVAL = 86400
@@ -244,7 +244,7 @@ def load_config():
             return cfg
         except:
             pass
-    return {"remotes": [], "mounts": [], "rclone_path": "", "auto_mount": False}
+    return {"remotes": [], "mounts": [], "rclone_path": "", "auto_mount": False, "start_minimized": False}
 
 
 def save_config(cfg):
@@ -528,7 +528,7 @@ class MountDialog(tk.Toplevel):
         target = f"{self._rem.get().strip()}:{self._pth.get().strip().strip('/')}"
         exe = get_rclone_exe(self._app_cfg)
         if not exe:
-            return messagebox.showerror("오류", "rclone 경로가 등록되어 있지 않습니다.")
+            return messagebox.showinfo("알림", "rclone 경로가 등록되어 있지 않습니다.")
 
         def r():
             try:
@@ -538,23 +538,23 @@ class MountDialog(tk.Toplevel):
                 if p.returncode == 0:
                     messagebox.showinfo("성공", "연결 확인 완료!")
                 else:
-                    messagebox.showerror("실패", f"연결 불가:\n{p.stderr.strip()}")
+                    messagebox.showinfo("연결 실패", f"연결 불가:\n{p.stderr.strip()}")
             except Exception as e:
-                messagebox.showerror("오류", str(e))
+                messagebox.showinfo("알림", str(e))
 
         threading.Thread(target=r, daemon=True).start()
 
     def _save(self):
         rem, drv, pth = self._rem.get().strip(), self._drv.get(), self._pth.get().strip()
         if not rem:
-            return messagebox.showwarning("오류", "리모트 이름 필수")
+            return messagebox.showinfo("알림", "리모트 이름을 입력해 주세요.")
         for m in self._app_cfg.get("mounts", []):
             if m.get("id") == self._m.get("id"):
                 continue
             if drv and m.get("drive") == drv:
-                return messagebox.showerror("오류", "드라이브 문자 중복")
+                return messagebox.showinfo("알림", "이미 사용 중인 드라이브 문자입니다.")
             if m.get("remote") == rem and m.get("remote_path", "") == pth:
-                return messagebox.showerror("오류", "동일한 리모트/경로가 이미 등록되어 있습니다.")
+                return messagebox.showinfo("알림", "동일한 리모트/경로가 이미 등록되어 있습니다.")
         self.result = {
             "remote": rem, "drive": drv, "remote_path": pth,
             "cache_dir": self._cdir.get().strip(),
@@ -608,6 +608,10 @@ class App(tk.Tk):
 
         if self._cfg.get("auto_mount"):
             self.after(1500, self._automount_all)
+
+        # 시작 시 트레이로 최소화
+        if self._cfg.get("start_minimized"):
+            self.after(100, self.hide_window)
 
     @staticmethod
     def _is_valid_geometry(geo: str) -> bool:
@@ -730,7 +734,10 @@ class App(tk.Tk):
                         command=self._toggle_st).pack(side="left", padx=(0, 24))
         self._am_var = tk.BooleanVar(value=self._cfg.get("auto_mount", False))
         ttk.Checkbutton(opt, text="시작 시 자동 마운트", variable=self._am_var,
-                        command=self._toggle_am).pack(side="left")
+                        command=self._toggle_am).pack(side="left", padx=(0, 24))
+        self._min_var = tk.BooleanVar(value=self._cfg.get("start_minimized", False))
+        ttk.Checkbutton(opt, text="시작 시 트레이로 최소화", variable=self._min_var,
+                        command=self._toggle_min).pack(side="left")
 
         # 트리뷰 (5컬럼)
         cols = ("type", "auto", "drive", "remote", "status")
@@ -964,7 +971,7 @@ class App(tk.Tk):
                 self.after(0, lambda: self._app_up_btn.config(
                     text="✨ 새 버전 업데이트 가능", state="normal"))
             else:
-                self.after(0, lambda err=res: messagebox.showerror("오류", err))
+                self.after(0, lambda err=res: messagebox.showinfo("알림", err))
                 self.after(0, lambda: self._app_up_btn.config(
                     text="✨ 새 버전 업데이트 가능", state="normal"))
 
@@ -1010,7 +1017,7 @@ class App(tk.Tk):
             self._version_check_running = False
             self._check_versions_async()
         else:
-            messagebox.showerror("오류", str(res))
+            messagebox.showinfo("알림", str(res))
             self.after(0, lambda: self._rc_ver_label.config(
                 text="rclone 다운로드", fg="#f38ba8"))
 
@@ -1107,7 +1114,7 @@ class App(tk.Tk):
         for m in self._cfg.get("mounts", []):
             st = self._status.get(m["id"], "stopped")
             auto = "✅" if m.get("auto_mount") else "—"
-            lbl = "🟢 실행중" if st == "mounted" else "⚫ 중지됨"
+            lbl = "■ 실행중" if st == "mounted" else "▶ 중지됨"
             rstr = f"{m['remote']}:{m.get('remote_path', '')}".strip(":")
             self._tree.insert("", "end", iid=m["id"],
                               values=("💾 마운트", auto, m.get("drive", ""), rstr, lbl))
@@ -1126,6 +1133,10 @@ class App(tk.Tk):
 
     def _toggle_am(self):
         self._save_settings()
+
+    def _toggle_min(self):
+        self._cfg["start_minimized"] = self._min_var.get()
+        save_config(self._cfg)
 
     # [테스트 호환성] Scenario 17, 18, 19 대응 메서드
     def _save_settings(self):
@@ -1256,7 +1267,7 @@ class App(tk.Tk):
     def _do_mount(self, mid, m):
         exe = get_rclone_exe(self._cfg)
         if exe is None:
-            messagebox.showerror("오류", "rclone 경로가 등록되어 있지 않습니다.")
+            messagebox.showinfo("알림", "rclone 경로가 등록되어 있지 않습니다.")
             return
         if mid in active_mounts:
             return  # 이미 마운트 중이면 무시
@@ -1286,11 +1297,11 @@ class App(tk.Tk):
                 except Exception:
                     pass
                 if stderr_out:
-                    self.after(0, lambda msg=stderr_out: messagebox.showerror(
+                    self.after(0, lambda msg=stderr_out: messagebox.showinfo(
                         "마운트 오류", f"rclone 오류:\n{msg[:500]}"))
         except Exception as e:
             if mid not in _unmounting:
-                self.after(0, lambda err=str(e): messagebox.showerror("마운트 오류", err))
+                self.after(0, lambda err=str(e): messagebox.showinfo("마운트 오류", err))
         finally:
             active_mounts.pop(mid, None)
             _unmounting.discard(mid)
