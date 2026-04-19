@@ -174,7 +174,7 @@ def download_rclone(dest_dir: Path, version: str, progress_cb=None):
       "manual" - 파일락으로 교체 불가, rclone_new.exe로 저장함
       str      - 오류 메시지
     """
-    url = (f"https://github.com/rclone/rclone/releases/download/"
+    url = (f"https://github.com/wiserain/rclone/releases/download"
            f"v{version}/rclone-v{version}-windows-amd64.zip")
     try:
         r = requests.get(url, stream=True, timeout=30)
