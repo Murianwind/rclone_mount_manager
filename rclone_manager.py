@@ -36,7 +36,7 @@ except Exception:
     _TRAY_AVAILABLE = False
 
 # ── 프로그램 설정 ──
-APP_VERSION = "1.1.5"
+APP_VERSION = "1.1.0"
 GITHUB_REPO = "Murianwind/rclone_mount_manager"
 # GitHub API 버전 체크 주기 (초 단위, 86400 = 24시간)
 VERSION_CHECK_INTERVAL = 86400
@@ -166,7 +166,14 @@ def find_default_rclone_conf():
 
 
 def download_rclone(dest_dir: Path, version: str, progress_cb=None):
-    """rclone 다운로드 및 설치 (Scenario 15)"""
+    """
+    rclone 다운로드 및 설치.
+
+    반환값:
+      True     - 설치 완료
+      "manual" - 파일락으로 교체 불가, rclone_new.exe로 저장함
+      str      - 오류 메시지
+    """
     url = (f"https://github.com/rclone/rclone/releases/download/"
            f"v{version}/rclone-v{version}-windows-amd64.zip")
     try:
@@ -180,14 +187,31 @@ def download_rclone(dest_dir: Path, version: str, progress_cb=None):
                 downloaded += len(chunk)
                 if progress_cb and total:
                     progress_cb(int(downloaded * 100 / total))
+
+        # zip에서 rclone.exe 추출
+        rclone_data = None
         with zipfile.ZipFile(tmp, "r") as z:
             for name in z.namelist():
                 if name.endswith("rclone.exe"):
-                    data = z.read(name)
-                    (dest_dir / "rclone.exe").write_bytes(data)
+                    rclone_data = z.read(name)
                     break
         os.unlink(tmp)
-        return True
+
+        if rclone_data is None:
+            return "zip 파일에서 rclone.exe를 찾을 수 없습니다."
+
+        # rclone.exe 교체 시도
+        target = dest_dir / "rclone.exe"
+        try:
+            target.write_bytes(rclone_data)
+            return True
+        except PermissionError:
+            # 다른 프로그램이 rclone.exe를 사용 중
+            # → 프로그램 실행 폴더(APP_DIR)에 rclone_new.exe로 저장
+            new_target = APP_DIR / "rclone_new.exe"
+            new_target.write_bytes(rclone_data)
+            return "manual"
+
     except Exception as e:
         return str(e)
 
@@ -228,6 +252,18 @@ def download_app_release(asset_url: str, progress_cb=None):
 
 
 # ── 3. 설정 관리 ──
+def _ver_tuple(v: str):
+    """
+    버전 문자열을 정수 튜플로 변환하여 올바른 버전 비교를 수행한다.
+    문자열 비교는 '1.68.2' < '1.68.10' 이 False가 되는 버그가 있음.
+    예: '1.68.10' → (1, 68, 10),  '1.9.0' → (1, 9, 0)
+    """
+    try:
+        return tuple(int(x) for x in v.strip().split("."))
+    except Exception:
+        return (0,)
+
+
 if getattr(sys, 'frozen', False):
     APP_DIR = Path(sys.executable).parent
 else:
@@ -829,18 +865,19 @@ class App(tk.Tk):
         백그라운드에서 rclone 및 앱 버전 확인.
 
         GitHub API rate limit 대응 (비인증: 60회/시간/IP):
-          - mounts.json의 last_version_check 타임스탬프를 확인
-          - 마지막 체크로부터 VERSION_CHECK_INTERVAL(24시간) 미경과 시 GitHub API 호출 스킵
-          - force=True이면 주기와 무관하게 즉시 체크 (수동 클릭 등)
-          - API를 스킵해도 rclone 로컬 버전 표시는 항상 수행
+          - rclone 버전: 매번 체크 (실행 시, 창 활성화 시)
+            이유: rclone은 자주 업데이트되고 사용자가 직접 인지해야 함
+          - 앱 버전:     24시간 주기로만 체크 (last_version_check 타임스탬프)
+            이유: 앱 업데이트는 빈도가 낮고 rate limit 절약
+          - force=True이면 앱 버전도 주기 무관하게 즉시 체크
         """
         if self._version_check_running:
             return
 
-        # 24시간 주기 체크: 마지막 체크 시각 확인
+        # 앱 버전만 24시간 주기 체크
         now = time.time()
         last_check = self._cfg.get("last_version_check", 0)
-        skip_api = (not force) and (now - last_check < VERSION_CHECK_INTERVAL)
+        skip_app_api = (not force) and (now - last_check < VERSION_CHECK_INTERVAL)
 
         self._version_check_running = True
 
@@ -849,18 +886,18 @@ class App(tk.Tk):
                 exe = get_rclone_exe(self._cfg)
                 lat_rc = ""
 
-                if not skip_api:
-                    # GitHub rclone 최신 버전 조회
-                    try:
-                        res = requests.get(
-                            "https://api.github.com/repos/rclone/rclone/releases/latest",
-                            timeout=5)
-                        lat_rc = res.json().get("tag_name", "").lstrip("v")
-                        self._latest_rc = lat_rc
-                    except Exception:
-                        pass
+                # rclone 최신 버전은 항상 조회 (rate limit 영향 적음: 1회/실행)
+                try:
+                    res = requests.get(
+                        "https://api.github.com/repos/rclone/rclone/releases/latest",
+                        timeout=5)
+                    lat_rc = res.json().get("tag_name", "").lstrip("v")
+                    self._latest_rc = lat_rc
+                except Exception:
+                    lat_rc = self._latest_rc  # 실패 시 이전 값 재사용
 
-                    # 앱 업데이트 확인
+                # 앱 업데이트는 24시간 주기로만 확인
+                if not skip_app_api:
                     try:
                         res = requests.get(
                             f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
@@ -868,24 +905,24 @@ class App(tk.Tk):
                         data = res.json()
                         latest_app = data.get("tag_name", "").lstrip("v")
                         self._latest_app_info = data
-                        if latest_app > APP_VERSION:
+                        if _ver_tuple(latest_app) > _ver_tuple(APP_VERSION):
                             self.after(0, self._show_app_update_btn)
                         else:
                             self.after(0, self._hide_app_update_btn)
                     except Exception:
                         pass
 
-                    # 체크 완료 시각 저장
+                    # 앱 체크 완료 시각 저장
                     self._cfg["last_version_check"] = now
                     save_config(self._cfg)
                 else:
-                    # API 스킵: 기존에 저장된 앱 업데이트 정보로 버튼 상태 복원
+                    # 앱 API 스킵: 기존에 저장된 정보로 버튼 상태 복원
                     if self._latest_app_info:
                         latest_app = self._latest_app_info.get("tag_name", "").lstrip("v")
-                        if latest_app > APP_VERSION:
+                        if _ver_tuple(latest_app) > _ver_tuple(APP_VERSION):
                             self.after(0, self._show_app_update_btn)
 
-                # rclone 로컬 버전 표시는 항상 수행 (로컬 실행이라 API 호출 없음)
+                # rclone 로컬 버전 표시 (로컬 실행, API 호출 없음)
                 if exe is None:
                     self.after(0, lambda: self._rc_ver_label.config(
                         text="rclone 다운로드", fg="#f38ba8"))
@@ -896,10 +933,8 @@ class App(tk.Tk):
                                            timeout=5, creationflags=0x08000000)
                         loc_match = re.search(r"rclone v([\d.]+)", r.stdout)
                         loc_rc = loc_match.group(1) if loc_match else ""
-                        # 업데이트 가능 여부 판단: lat_rc는 API 스킵 시 이전 값 재사용
-                        lat_rc = lat_rc or self._latest_rc
                         if loc_rc:
-                            if lat_rc and loc_rc < lat_rc:
+                            if lat_rc and _ver_tuple(loc_rc) < _ver_tuple(lat_rc):
                                 txt = f"v{loc_rc} / v{lat_rc} 업데이트"
                                 self.after(0, lambda t=txt: self._rc_ver_label.config(
                                     text=t, fg="#fab387"))
@@ -992,13 +1027,39 @@ class App(tk.Tk):
             if messagebox.askyesno("rclone", f"rclone v{self._latest_rc}를 설치할까요?"):
                 threading.Thread(target=self._do_rc_down, daemon=True).start()
         elif "업데이트" in text:
-            if self._latest_rc and messagebox.askyesno(
-                    "rclone", f"rclone v{self._latest_rc}로 업데이트할까요?"):
-                threading.Thread(target=self._do_rc_down, daemon=True).start()
+            if not self._latest_rc:
+                return
+            # 마운트 중인 드라이브가 있으면 경고 후 확인
+            mounted = [m for m in self._cfg.get("mounts", [])
+                       if m["id"] in active_mounts]
+            if mounted:
+                names = ", ".join(
+                    m.get("drive", "") or m.get("remote", "?")
+                    for m in mounted)
+                if not messagebox.askyesno(
+                        "rclone 업데이트",
+                        f"현재 마운트 중인 드라이브가 있습니다: {names}\n\n"
+                        "업데이트하려면 마운트를 해제해야 합니다.\n"
+                        "모두 해제하고 업데이트할까요?\n"
+                        "(업데이트 완료 후 자동으로 재마운트됩니다)"):
+                    return
+            threading.Thread(target=self._do_rc_down, daemon=True).start()
 
     def _do_rc_down(self):
         registered = self._cfg.get("rclone_path", "").strip()
         dest_dir = Path(registered).parent if registered else APP_DIR
+
+        # 마운트 중인 항목 기록 (업데이트 후 재마운트용)
+        remount_list = [m for m in self._cfg.get("mounts", [])
+                        if m["id"] in active_mounts]
+
+        # 마운트 중인 항목 모두 해제
+        if remount_list:
+            self.after(0, lambda: self._rc_ver_label.config(
+                text="마운트 해제 중...", fg="#89b4fa"))
+            for m in remount_list:
+                unmount(m["id"])
+            self.after(0, self._refresh_list)
 
         self.after(0, lambda: self._rc_ver_label.config(
             text="다운로드 중... 0%", fg="#89b4fa"))
@@ -1008,18 +1069,45 @@ class App(tk.Tk):
                 text=f"다운로드 중... {pv}%", fg="#89b4fa"))
 
         res = download_rclone(dest_dir, self._latest_rc, _prog)
+
         if res is True:
+            # 교체 완료
             new_path = str(dest_dir / "rclone.exe")
             self._rc_var.set(new_path)
             self._cfg["rclone_path"] = new_path
             save_config(self._cfg)
             messagebox.showinfo("완료", "rclone 설치/업데이트 완료!")
             self._version_check_running = False
-            self._check_versions_async()
+            self._check_versions_async(force=True)
+            if remount_list:
+                self.after(500, lambda: [self._do_mount(m["id"], m)
+                                         for m in remount_list])
+
+        elif res == "manual":
+            # 다른 프로그램이 rclone을 사용 중 → 파일락으로 교체 불가
+            new_file = APP_DIR / "rclone_new.exe"
+            self.after(0, lambda nf=str(new_file): messagebox.showinfo(
+                "수동 교체 필요",
+                "다른 프로그램에서 rclone을 사용 중이어서\n"
+                "자동 업데이트가 불가능합니다.\n\n"
+                f"새 파일 저장 위치:\n{nf}\n\n"
+                "해당 프로그램을 종료한 후\n"
+                "rclone_new.exe 파일의 이름을 rclone.exe로 변경하고\n"
+                "기존 rclone.exe를 교체해 주세요."))
+            self.after(0, lambda: self._rc_ver_label.config(
+                text="수동 교체 필요", fg="#fab387"))
+            if remount_list:
+                self.after(500, lambda: [self._do_mount(m["id"], m)
+                                         for m in remount_list])
+
         else:
+            # 다운로드 오류
             messagebox.showinfo("알림", str(res))
             self.after(0, lambda: self._rc_ver_label.config(
                 text="rclone 다운로드", fg="#f38ba8"))
+            if remount_list:
+                self.after(500, lambda: [self._do_mount(m["id"], m)
+                                         for m in remount_list])
 
     # ────────────────────────────────────────────
     # 이슈 리포트
