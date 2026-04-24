@@ -36,7 +36,7 @@ except Exception:
     _TRAY_AVAILABLE = False
 
 # ── 프로그램 설정 ──
-APP_VERSION = "1.1.7"
+APP_VERSION = "1.1.0"
 GITHUB_REPO = "Murianwind/rclone_mount_manager"
 # GitHub API 버전 체크 주기 (초 단위, 86400 = 24시간)
 VERSION_CHECK_INTERVAL = 86400
@@ -142,6 +142,50 @@ def set_startup(enable: bool):
         return str(e)
 
 
+def get_startup_path() -> str:
+    """레지스트리에 등록된 시작프로그램 경로 반환. 없으면 빈 문자열."""
+    if not winreg:
+        return ""
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\CurrentVersion\Run",
+                             0, winreg.KEY_READ)
+        value, _ = winreg.QueryValueEx(key, "RcloneManager")
+        winreg.CloseKey(key)
+        return value
+    except Exception:
+        return ""
+
+
+def get_current_exe_path() -> str:
+    """현재 실행 중인 exe 경로를 레지스트리 등록 형식으로 반환."""
+    if getattr(sys, 'frozen', False):
+        return f'"{sys.executable}"'
+    else:
+        return f'pythonw "{Path(__file__).resolve()}"'
+
+
+def check_and_fix_startup() -> bool:
+    """
+    시작프로그램이 등록되어 있고 경로가 현재 실행 위치와 다르면 자동 재등록.
+
+    반환값:
+      True  - 경로 불일치로 재등록 수행
+      False - 재등록 불필요 (미등록이거나 경로 일치)
+    """
+    registered = get_startup_path()
+    if not registered:
+        return False  # 시작프로그램 미등록 → 아무것도 안 함
+
+    current = get_current_exe_path()
+    if registered == current:
+        return False  # 경로 일치 → 재등록 불필요
+
+    # 경로 불일치 → 현재 경로로 재등록
+    set_startup(True)
+    return True
+
+
 def parse_rclone_conf(conf_path: Path):
     remotes = []
     try:
@@ -174,7 +218,7 @@ def download_rclone(dest_dir: Path, version: str, progress_cb=None):
       "manual" - 파일락으로 교체 불가, rclone_new.exe로 저장함
       str      - 오류 메시지
     """
-    url = (f"https://github.com/wiserain/rclone/releases/download"
+    url = (f"https://github.com/rclone/rclone/releases/download/"
            f"v{version}/rclone-v{version}-windows-amd64.zip")
     try:
         r = requests.get(url, stream=True, timeout=30)
@@ -638,6 +682,10 @@ class App(tk.Tk):
 
         self._init_rc_label()
         self._check_versions_async()
+
+        # 실행 위치가 변경된 경우 시작프로그램 경로 자동 재등록
+        if check_and_fix_startup():
+            self._st_var.set(True)  # 체크박스 상태 동기화
 
         self.bind("<FocusIn>", self._on_focus_in)
         self.bind("<Configure>", self._on_configure)
