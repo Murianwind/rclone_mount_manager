@@ -36,7 +36,7 @@ except Exception:
     _TRAY_AVAILABLE = False
 
 # ── 프로그램 설정 ──
-APP_VERSION = "1.1.8"
+APP_VERSION = "1.1.0"
 GITHUB_REPO = "Murianwind/rclone_mount_manager"
 # GitHub API 버전 체크 주기 (초 단위, 86400 = 24시간)
 VERSION_CHECK_INTERVAL = 86400
@@ -1045,20 +1045,33 @@ class App(tk.Tk):
             dest_file = exe_dir / f"RcloneManager_update{suffix}"
 
             if res == "manual":
-                self.after(0, lambda df=str(dest_file): messagebox.showinfo(
-                    "업데이트 파일 다운로드 완료",
-                    "Windows 보안 정책으로 인해 실행 중인 프로그램의\n"
-                    "자동 교체가 불가능합니다.\n\n"
-                    f"업데이트 파일 저장 위치:\n{df}\n\n"
-                    "프로그램을 종료한 후 기존 파일을 새 파일로 교체하고 재시작하세요."))
-                self.after(0, lambda: self._app_up_btn.config(
-                    text="✨ 새 버전 업데이트 가능", state="normal"))
+                # 다운로드 완료 → 버튼을 "교체 파일 위치 열기"로 변경
+                # 클릭 시 탐색기로 해당 폴더 열기
+                self.after(0, lambda df=exe_dir: self._set_update_downloaded_btn(df))
             else:
                 self.after(0, lambda err=res: messagebox.showinfo("알림", err))
                 self.after(0, lambda: self._app_up_btn.config(
                     text="✨ 새 버전 업데이트 가능", state="normal"))
 
         threading.Thread(target=_do, daemon=True).start()
+
+    def _set_update_downloaded_btn(self, folder: Path):
+        """
+        다운로드 완료 후 버튼을 '📂 교체 파일 위치 열기'로 변경.
+        클릭 시 탐색기로 해당 폴더 열기.
+        """
+        self._update_folder = folder
+        self._app_up_btn.config(
+            text="📂 교체 파일 위치 열기",
+            bg="#fab387",
+            command=self._open_update_folder,
+            state="normal")
+
+    def _open_update_folder(self):
+        """탐색기로 업데이트 파일이 저장된 폴더 열기."""
+        folder = getattr(self, "_update_folder", APP_DIR)
+        subprocess.Popen(["explorer", str(folder)],
+                         creationflags=subprocess.CREATE_NO_WINDOW)
 
     # ────────────────────────────────────────────
     # rclone 다운로드/업데이트
