@@ -334,8 +334,7 @@ def write_log(level: str, message: str):
     try:
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        line = f"{timestamp} {level:<5} {message}
-"
+        line = f"{timestamp} {level:<5} {message}\n"
 
         # 기존 로그 읽기
         if LOG_FILE.exists():
