@@ -371,6 +371,52 @@ def save_config(cfg):
     CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def normalize_flags(extra: str) -> str:
+    """
+    extra_flags를 정규화하여 저장.
+
+    입력 형식 (모두 허용):
+      --flag=value;--flag2 value2
+      --flag value\n--flag2=value2
+      --flag1 --flag2 --flag3 value
+
+    출력 형식: --flag=value;--flag2=value2;--flag3
+      - 플래그 구분자: 세미콜론(;)
+      - 값 연결: = (공백 없이)
+      - 값 없는 플래그: 그대로 유지
+
+    이유:
+      - 세미콜론은 값에 공백이 포함된 플래그를 안전하게 구분
+      - = 연결은 rclone이 가장 확실하게 인식
+      - JSON 저장 시 \n 이스케이프 없이 한 줄로 저장됨
+    """
+    import re as _re
+    if not extra.strip():
+        return ""
+
+    flags = []
+    for chunk in _re.split(r'[;\n]+', extra):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        # 청크 내 공백으로 구분된 다중 플래그 처리
+        # '--no-modtime --no-checksum' → ['--no-modtime', '--no-checksum']
+        for part in _re.split(r'(?=--)', chunk):
+            part = part.strip()
+            if not part or not part.startswith('--'):
+                continue
+            if '=' in part:
+                flags.append(part)
+            else:
+                m = _re.match(r'^(--[\w-]+)\s+(\S+)$', part)
+                if m:
+                    flags.append(f"{m.group(1)}={m.group(2)}")
+                else:
+                    flags.append(part)
+
+    return ";".join(flags)
+
+
 def get_rclone_exe(cfg):
     """
     등록된 rclone 경로 반환.
@@ -406,9 +452,12 @@ def build_cmd(exe: Path, mount: dict):
         cmd += ["--vfs-cache-mode", mount["cache_mode"]]
     extra = mount.get("extra_flags", "").strip()
     if extra:
-        for f in re.split(r"[\s;]+|\n", extra):
-            if f.strip():
-                cmd.append(f.strip())
+        # 저장 시 normalize_flags로 정규화되므로 세미콜론으로만 분리
+        # '--flag=value' 형태로 저장되어 있으므로 공백 분리 불필요
+        for f in extra.split(";"):
+            f = f.strip()
+            if f:
+                cmd.append(f)
     return cmd
 
 
@@ -684,7 +733,7 @@ class MountDialog(tk.Toplevel):
             "remote": rem, "drive": drv, "remote_path": pth,
             "cache_dir": self._cdir.get().strip(),
             "cache_mode": self._cmode.get(),
-            "extra_flags": self._ext.get("1.0", tk.END).strip(),
+            "extra_flags": normalize_flags(self._ext.get("1.0", tk.END).strip()),
             "auto_mount": self._auto.get(),
         }
         self.destroy()
@@ -735,7 +784,10 @@ class App(tk.Tk):
             write_log("INFO", f"[시작프로그램] 실행 경로 변경 감지 → 자동 재등록: {get_current_exe_path()}")
             self._st_var.set(True)  # 체크박스 상태 동기화
 
-        self.bind("<FocusIn>", self._on_focus_in)
+        # FocusIn 바인딩을 3초 후에 등록
+        # 앱 시작 직후 창 표시 과정에서 FocusIn이 여러 번 발생해
+        # 버전 체크가 중복 호출되는 것을 방지
+        self.after(3000, lambda: self.bind("<FocusIn>", self._on_focus_in))
         self.bind("<Configure>", self._on_configure)
 
         if self._cfg.get("auto_mount"):
@@ -948,8 +1000,9 @@ class App(tk.Tk):
             self._rc_ver_label.config(text="rclone 다운로드", fg="#f38ba8")
         else:
             self._rc_ver_label.config(text="v체크 중...", fg="#94e2d5")
-            self._version_check_running = False
-            self._check_versions_async(force=True)
+            # 이미 체크 중이면 강제 초기화하지 않고 스킵
+            # (강제 초기화하면 진행 중인 체크가 중단되고 중복 호출됨)
+            self._check_versions_async()
 
     def _on_focus_in(self, event):
         """창 활성화 시 rclone + 앱 버전 재확인"""
