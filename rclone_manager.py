@@ -219,7 +219,7 @@ def download_rclone(dest_dir: Path, version: str, progress_cb=None):
       "manual" - 파일락으로 교체 불가, rclone_new.exe로 저장함
       str      - 오류 메시지
     """
-    url = (f"https://github.com/rclone/rclone/releases/download/"
+    url = (f"https://github.com/wiserain/rclone/releases/download/"
            f"v{version}/rclone-v{version}-windows-amd64.zip")
     try:
         r = requests.get(url, stream=True, timeout=30)
@@ -986,7 +986,7 @@ class App(tk.Tk):
                 # rclone 최신 버전은 항상 조회 (rate limit 영향 적음: 1회/실행)
                 try:
                     res = requests.get(
-                        "https://api.github.com/repos/rclone/rclone/releases/latest",
+                        "https://api.github.com/repos/wiserain/rclone/releases/latest",
                         timeout=5)
                     lat_rc = res.json().get("tag_name", "").lstrip("v")
                     self._latest_rc = lat_rc
