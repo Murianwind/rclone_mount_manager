@@ -36,7 +36,7 @@ except Exception:
     _TRAY_AVAILABLE = False
 
 # ── 프로그램 설정 ──
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.1.0"
 GITHUB_REPO = "Murianwind/rclone_mount_manager"
 # GitHub API 버전 체크 주기 (초 단위, 86400 = 24시간)
 VERSION_CHECK_INTERVAL = 86400
@@ -1150,9 +1150,15 @@ class App(tk.Tk):
             dest_file = exe_dir / f"RcloneManager_update{suffix}"
 
             if res == "manual":
-                # 다운로드 완료 → 버튼을 "교체 파일 위치 열기"로 변경
+                # 다운로드 완료 → 안내 메시지 + 버튼을 "교체 파일 위치 열기"로 변경
                 write_log("INFO", f"[앱 업데이트] 다운로드 완료: {dest_file}")
-                self.after(0, lambda df=exe_dir: self._set_update_downloaded_btn(df))
+                self.after(0, lambda df=str(dest_file), folder=exe_dir: (
+                    messagebox.showinfo(
+                        "업데이트 파일 다운로드 완료",
+                        f"다운로드 위치:\n{df}\n\n"
+                        "프로그램을 종료한 후 기존 파일을 새 파일로 교체하고 재시작하세요."),
+                    self._set_update_downloaded_btn(folder)
+                ))
             else:
                 write_log("ERROR", f"[앱 업데이트] 다운로드 실패: {res}")
                 self.after(0, lambda err=res: messagebox.showinfo("알림", err))
