@@ -155,16 +155,18 @@ class TestRcloneManagerBDD(unittest.TestCase):
     # ── Scenario 04: rclone 명령어 빌드 (추가 플래그 포함) ───────────────
     def test_scenario_04_build_cmd_with_extra_flags(self):
         # Given: 추가 플래그가 주어졌을 때
+        # extra_flags는 저장 시 normalize_flags를 거쳐 정규화된 형태로 저장됨
+        # '--bwlimit 10M' → '--bwlimit=10M' (=로 연결)
         exe = Path("rclone.exe")
         mount = {
             "remote": "drive", "drive": "X:",
-            "extra_flags": "--read-only; --bwlimit 10M"
+            "extra_flags": rclone_manager.normalize_flags("--read-only; --bwlimit 10M")
         }
         # When: 명령어를 빌드하면
         cmd = rclone_manager.build_cmd(exe, mount)
-        # Then: 플래그들이 개별 인자로 포함되어야 한다.
+        # Then: 정규화된 형태의 플래그가 포함되어야 한다.
         self.assertIn("--read-only", cmd)
-        self.assertIn("--bwlimit", cmd)
+        self.assertIn("--bwlimit=10M", cmd)
 
     # ── Scenario 05: 설정 파일 로드 (파일 없음) ──────────────────────────
     def test_scenario_05_load_config_none(self):
