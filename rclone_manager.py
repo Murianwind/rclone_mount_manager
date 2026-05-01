@@ -36,7 +36,7 @@ except Exception:
     _TRAY_AVAILABLE = False
 
 # ── 프로그램 설정 ──
-APP_VERSION = "1.1.9"
+APP_VERSION = "1.1.0"
 GITHUB_REPO = "Murianwind/rclone_mount_manager"
 # GitHub API 버전 체크 주기 (초 단위, 86400 = 24시간)
 VERSION_CHECK_INTERVAL = 86400
@@ -139,6 +139,7 @@ def set_startup(enable: bool):
         winreg.CloseKey(key)
         return True
     except Exception as e:
+        write_log("ERROR", f"[시작프로그램] 등록/해제 실패: {e}")
         return str(e)
 
 
@@ -254,9 +255,11 @@ def download_rclone(dest_dir: Path, version: str, progress_cb=None):
             # → 프로그램 실행 폴더(APP_DIR)에 rclone_new.exe로 저장
             new_target = APP_DIR / "rclone_new.exe"
             new_target.write_bytes(rclone_data)
+            write_log("WARN", f"[rclone 업데이트] 파일락으로 교체 불가 → {new_target} 저장")
             return "manual"
 
     except Exception as e:
+        write_log("ERROR", f"[rclone 다운로드] 실패: {e}")
         return str(e)
 
 
@@ -292,6 +295,7 @@ def download_app_release(asset_url: str, progress_cb=None):
         return "manual"
 
     except Exception as e:
+        write_log("ERROR", f"[앱 업데이트 다운로드] 실패: {e}")
         return str(e)
 
 
@@ -315,6 +319,43 @@ else:
 CONFIG_FILE = APP_DIR / "mounts.json"
 
 
+LOG_FILE = APP_DIR / "RcloneManager.log"
+LOG_MAX_LINES = 1000
+
+
+def write_log(level: str, message: str):
+    """
+    로그 파일에 한 줄 기록.
+    LOG_MAX_LINES 초과 시 오래된 줄부터 삭제 (rotate).
+
+    level: "INFO" | "ERROR" | "WARN"
+    포맷:  2026-04-14 13:01:07 INFO  [마운트] G: ← gdrive:movies
+    """
+    try:
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"{timestamp} {level:<5} {message}
+"
+
+        # 기존 로그 읽기
+        if LOG_FILE.exists():
+            try:
+                lines = LOG_FILE.read_text(encoding="utf-8").splitlines(keepends=True)
+            except Exception:
+                lines = []
+        else:
+            lines = []
+
+        # 1000줄 초과 시 오래된 것 삭제
+        lines.append(line)
+        if len(lines) > LOG_MAX_LINES:
+            lines = lines[len(lines) - LOG_MAX_LINES:]
+
+        LOG_FILE.write_text("".join(lines), encoding="utf-8")
+    except Exception:
+        pass  # 로그 실패는 무시
+
+
 def load_config():
     if CONFIG_FILE.exists():
         try:
@@ -322,8 +363,8 @@ def load_config():
             if "mounts" not in cfg:
                 cfg["mounts"] = []
             return cfg
-        except:
-            pass
+        except Exception as e:
+            write_log("ERROR", f"[설정] mounts.json 파싱 실패: {e}")
     return {"remotes": [], "mounts": [], "rclone_path": "", "auto_mount": False, "start_minimized": False}
 
 
@@ -354,8 +395,12 @@ active_mounts = {}
 def build_cmd(exe: Path, mount: dict):
     rpath = mount.get("remote_path", "").strip().replace("\\", "/").strip("/")
     drive_target = mount.get("drive", "").strip() or " "
-    cmd = [str(exe), "mount", f"{mount['remote']}:{rpath}", drive_target,
-           "--volname", mount.get("label") or mount["remote"]]
+    # --volname 을 붙이지 않음
+    # 이유: WinFsp가 --volname 지정 시 드라이브를 DRIVE_REMOTE(네트워크)로
+    #       인식하는 경우가 있어 네트워크 드라이브에서 exe 실행이 차단됨.
+    #       --volname 없이 마운트하면 DRIVE_FIXED(로컬 디스크)로 인식되어
+    #       exe 실행이 정상 동작함.
+    cmd = [str(exe), "mount", f"{mount['remote']}:{rpath}", drive_target]
     if mount.get("cache_dir"):
         cmd += ["--cache-dir", mount["cache_dir"]]
     if mount.get("cache_mode"):
@@ -620,6 +665,7 @@ class MountDialog(tk.Toplevel):
                 else:
                     messagebox.showinfo("연결 실패", f"연결 불가:\n{p.stderr.strip()}")
             except Exception as e:
+                write_log("ERROR", f"[연결 테스트] 실패: {e}")
                 messagebox.showinfo("알림", str(e))
 
         threading.Thread(target=r, daemon=True).start()
@@ -661,6 +707,8 @@ class App(tk.Tk):
         self._version_check_running = False
         self._geometry_save_after = None
 
+        write_log("INFO", f"[시작] RcloneManager v{APP_VERSION}")
+
         # ── 창 크기 복원 또는 초기 계산 ──────────────────────────────────────
         # 저장된 크기: 복원
         # 없으면: UI 구성 후 Tkinter 자동 측정으로 적절한 크기 결정
@@ -685,6 +733,7 @@ class App(tk.Tk):
 
         # 실행 위치가 변경된 경우 시작프로그램 경로 자동 재등록
         if check_and_fix_startup():
+            write_log("INFO", f"[시작프로그램] 실행 경로 변경 감지 → 자동 재등록: {get_current_exe_path()}")
             self._st_var.set(True)  # 체크박스 상태 동기화
 
         self.bind("<FocusIn>", self._on_focus_in)
@@ -942,6 +991,7 @@ class App(tk.Tk):
                     lat_rc = res.json().get("tag_name", "").lstrip("v")
                     self._latest_rc = lat_rc
                 except Exception:
+                    write_log("WARN", "[버전] rclone GitHub API 호출 실패")
                     lat_rc = self._latest_rc  # 실패 시 이전 값 재사용
 
                 # 앱 업데이트는 24시간 주기로만 확인
@@ -957,8 +1007,8 @@ class App(tk.Tk):
                             self.after(0, self._show_app_update_btn)
                         else:
                             self.after(0, self._hide_app_update_btn)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        write_log("WARN", f"[버전] 앱 GitHub API 호출 실패: {e}")
 
                     # 앱 체크 완료 시각 저장
                     self._cfg["last_version_check"] = now
@@ -984,16 +1034,19 @@ class App(tk.Tk):
                         if loc_rc:
                             if lat_rc and _ver_tuple(loc_rc) < _ver_tuple(lat_rc):
                                 txt = f"v{loc_rc} / v{lat_rc} 업데이트"
+                                write_log("INFO", f"[버전] rclone {txt}")
                                 self.after(0, lambda t=txt: self._rc_ver_label.config(
                                     text=t, fg="#fab387"))
                             else:
                                 txt = f"v{loc_rc} (최신)"
+                                write_log("INFO", f"[버전] rclone {txt}")
                                 self.after(0, lambda t=txt: self._rc_ver_label.config(
                                     text=t, fg="#94e2d5"))
                         else:
                             self.after(0, lambda: self._rc_ver_label.config(
                                 text="v알 수 없음", fg="#f38ba8"))
-                    except Exception:
+                    except Exception as e:
+                        write_log("ERROR", f"[버전] rclone version 실행 실패: {e}")
                         self.after(0, lambda: self._rc_ver_label.config(
                             text="v알 수 없음", fg="#f38ba8"))
             finally:
@@ -1046,9 +1099,10 @@ class App(tk.Tk):
 
             if res == "manual":
                 # 다운로드 완료 → 버튼을 "교체 파일 위치 열기"로 변경
-                # 클릭 시 탐색기로 해당 폴더 열기
+                write_log("INFO", f"[앱 업데이트] 다운로드 완료: {dest_file}")
                 self.after(0, lambda df=exe_dir: self._set_update_downloaded_btn(df))
             else:
+                write_log("ERROR", f"[앱 업데이트] 다운로드 실패: {res}")
                 self.after(0, lambda err=res: messagebox.showinfo("알림", err))
                 self.after(0, lambda: self._app_up_btn.config(
                     text="✨ 새 버전 업데이트 가능", state="normal"))
@@ -1137,6 +1191,7 @@ class App(tk.Tk):
             self._rc_var.set(new_path)
             self._cfg["rclone_path"] = new_path
             save_config(self._cfg)
+            write_log("INFO", f"[rclone 설치] v{self._latest_rc} 완료: {new_path}")
             messagebox.showinfo("완료", "rclone 설치/업데이트 완료!")
             self._version_check_running = False
             self._check_versions_async(force=True)
@@ -1162,6 +1217,7 @@ class App(tk.Tk):
                                          for m in remount_list])
 
         else:
+            write_log("ERROR", f"[rclone 다운로드] 실패: {res}")
             # 다운로드 오류
             messagebox.showinfo("알림", str(res))
             self.after(0, lambda: self._rc_ver_label.config(
@@ -1188,7 +1244,8 @@ class App(tk.Tk):
                 "RcloneManager", main_icon, "RcloneManager",
                 menu=self._build_tray_menu())
             threading.Thread(target=self._tray.run, daemon=True).start()
-        except Exception:
+        except Exception as e:
+            write_log("ERROR", f"[트레이] 아이콘 생성 실패: {e}")
             self._tray = None
 
     def _build_tray_menu(self):
@@ -1271,8 +1328,8 @@ class App(tk.Tk):
             try:
                 self._tray.menu = self._build_tray_menu()
                 self._tray.update_menu()
-            except Exception:
-                pass
+            except Exception as e:
+                write_log("WARN", f"[트레이] 메뉴 갱신 실패: {e}")
 
     # ────────────────────────────────────────────
     # 설정 토글
@@ -1417,9 +1474,14 @@ class App(tk.Tk):
         exe = get_rclone_exe(self._cfg)
         if exe is None:
             messagebox.showinfo("알림", "rclone 경로가 등록되어 있지 않습니다.")
+            write_log("WARN", f"[마운트 실패] {m.get('drive','?')} ← {m.get('remote','?')}: rclone 미등록")
             return
         if mid in active_mounts:
             return  # 이미 마운트 중이면 무시
+        label = m.get("drive", "") or m.get("remote", "?")
+        rstr = f"{m['remote']}:{m.get('remote_path', '')}".strip(":")
+        cache = m.get("cache_mode", "")
+        write_log("INFO", f"[마운트] {label} ← {rstr}" + (f" ({cache})" if cache else ""))
         self._status[mid] = "mounted"
         self._refresh_list()
         threading.Thread(target=self._mount_task, args=(mid, exe, m), daemon=True).start()
@@ -1427,45 +1489,128 @@ class App(tk.Tk):
     def _mount_task(self, mid, exe, m):
         """
         rclone mount 실행.
-        rclone이 즉시 종료(오류)되면 stderr를 캡처해 사용자에게 표시.
-        unmount()로 의도적 종료된 경우(_unmounting)는 오류 표시 안 함.
+
+        rclone 마운트 실패 패턴:
+          1. 즉시 종료 (returncode != 0): 드라이브 충돌 등
+          2. 실행은 되지만 마운트 실패 후 계속 실행:
+             rclone이 서비스를 시작하고 오류를 stderr에 출력하면서도
+             프로세스를 종료하지 않는 경우 (예: symlinks 오류)
+             → p.wait()가 블록되어 계속 '실행중'으로 표시되는 문제
+
+        해결:
+          - Popen 후 2초 대기
+          - poll()로 이미 종료됐으면 → 오류 처리
+          - 살아있으면 → stderr를 별도 스레드로 비동기 수집
+          - stderr에 오류 키워드 감지 시 즉시 오류 표시 + 상태 중지됨
+
+        의도적 언마운트: _unmounting에 있으면 오류 표시 안 함
         """
+        m_label = m.get("drive", "") or m.get("remote", "?")
+        rstr = f"{m['remote']}:{m.get('remote_path', '')}".strip(":")
+        log_path = str(LOG_FILE)
+
+        def _show_error(msg: str):
+            """오류 표시: 상태 즉시 중지됨 + 오류창 (의도적 언마운트 제외)"""
+            if mid in _unmounting:
+                return
+            write_log("ERROR", f"[마운트 오류] {m_label}: {msg[:200]}")
+            self._status[mid] = "stopped"
+            self.after(0, self._refresh_list)
+            self.after(0, lambda msg_=msg, lp=log_path: messagebox.showinfo(
+                "마운트 오류",
+                f"rclone 오류:\n{msg_[:500]}\n\n"
+                f"자세한 내용은 로그 파일을 확인하세요:\n{lp}"))
+
         try:
+            cmd = build_cmd(exe, m)
+            write_log("INFO", f"[마운트 명령] {' '.join(cmd)}")
             p = subprocess.Popen(
-                build_cmd(exe, m),
+                cmd,
                 stderr=subprocess.PIPE,
-                creationflags=0x08000000
+                # DETACHED_PROCESS(0x08): 콘솔 창 없이 현재 사용자 세션에서 실행
+                # CREATE_NO_WINDOW(0x08000000) 대신 사용하는 이유:
+                # CREATE_NO_WINDOW는 비인터랙티브 컨텍스트로 실행되어
+                # WinFsp 마운트 드라이브에서 exe 실행이 차단되는 문제 발생
+                creationflags=subprocess.DETACHED_PROCESS
             )
             active_mounts[mid] = p
-            p.wait()
-            # 의도적 언마운트(terminate)가 아닌 경우에만 오류 표시
-            if p.returncode != 0 and mid not in _unmounting:
+            write_log("INFO", f"[마운트 시작] {m_label} ← {rstr} (PID {p.pid})")
+
+            # ── 2초 대기 후 상태 확인 ─────────────────────────────────────
+            # rclone mount는 마운트 성공 시 2초 이내에 안정적으로 실행됨
+            # 2초 내에 종료되면 마운트 실패로 판단
+            import time as _time
+            _time.sleep(2)
+
+            poll = p.poll()
+            if poll is not None:
+                # 2초 내에 종료됨 → 오류
                 stderr_out = ""
                 try:
                     stderr_out = p.stderr.read().decode("utf-8", errors="replace").strip()
                 except Exception:
                     pass
-                if stderr_out:
-                    self.after(0, lambda msg=stderr_out: messagebox.showinfo(
-                        "마운트 오류", f"rclone 오류:\n{msg[:500]}"))
+                err_msg = stderr_out if stderr_out else f"종료 코드: {poll}"
+                _show_error(err_msg)
+                return
+
+            # ── 2초 후에도 살아있음 → 마운트 성공 ──────────────────────────
+            write_log("INFO", f"[마운트 완료] {m_label} ← {rstr}")
+
+            # stderr 비동기 수집: 실행 중 오류 메시지 감지용
+            stderr_lines = []
+            def _read_stderr():
+                try:
+                    for raw in p.stderr:
+                        line = raw.decode("utf-8", errors="replace").rstrip()
+                        if line:
+                            stderr_lines.append(line)
+                            write_log("WARN", f"[rclone stderr] {m_label}: {line[:200]}")
+                except Exception:
+                    pass
+
+            threading.Thread(target=_read_stderr, daemon=True).start()
+
+            # 프로세스 종료까지 대기 (정상 언마운트 또는 비정상 종료)
+            p.wait()
+
+            if p.returncode != 0 and mid not in _unmounting:
+                err_msg = "\n".join(stderr_lines[-10:]) if stderr_lines else f"종료 코드: {p.returncode}"
+                _show_error(err_msg)
+
         except Exception as e:
+            write_log("ERROR", f"[마운트 예외] {m_label}: {e}")
             if mid not in _unmounting:
-                self.after(0, lambda err=str(e): messagebox.showinfo("마운트 오류", err))
+                self._status[mid] = "stopped"
+                self.after(0, self._refresh_list)
+                self.after(0, lambda err=str(e), lp=log_path: messagebox.showinfo(
+                    "마운트 오류",
+                    f"오류:\n{err}\n\n"
+                    f"자세한 내용은 로그 파일을 확인하세요:\n{lp}"))
         finally:
             active_mounts.pop(mid, None)
             _unmounting.discard(mid)
             self._status[mid] = "stopped"
+            write_log("INFO", f"[마운트 종료] {m_label} ← {rstr}")
             self.after(0, self._refresh_list)
 
     def _automount_all(self):
-        for m in self._cfg.get("mounts", []):
-            if m.get("auto_mount"):
-                self._do_mount(m["id"], m)
+        targets = [m for m in self._cfg.get("mounts", []) if m.get("auto_mount")]
+        if targets:
+            write_log("INFO", f"[자동 마운트] {len(targets)}개 항목 마운트 시작")
+        for m in targets:
+            self._do_mount(m["id"], m)
 
     def _unmount_sel(self):
         sel = self._tree.selection()
         if sel and not sel[0].startswith("remote_"):
-            unmount(sel[0])
+            mid = sel[0]
+            m = next((m for m in self._cfg.get("mounts", []) if m["id"] == mid), None)
+            if m:
+                label = m.get("drive", "") or m.get("remote", "?")
+                rstr = f"{m['remote']}:{m.get('remote_path', '')}".strip(":")
+                write_log("INFO", f"[언마운트] {label} ← {rstr}")
+            unmount(mid)
             self._refresh_list()
 
     # ────────────────────────────────────────────
@@ -1480,6 +1625,7 @@ class App(tk.Tk):
         self.focus_force()
 
     def _quit_app(self):
+        write_log("INFO", "[종료] RcloneManager 종료")
         for mid in list(active_mounts.keys()):
             unmount(mid)
         if self._tray:
