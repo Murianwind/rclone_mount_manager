@@ -36,7 +36,7 @@ except Exception:
     _TRAY_AVAILABLE = False
 
 # ── 프로그램 설정 ──
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 GITHUB_REPO = "Murianwind/rclone_mount_manager"
 # GitHub API 버전 체크 주기 (초 단위, 86400 = 24시간)
 VERSION_CHECK_INTERVAL = 86400
@@ -303,11 +303,15 @@ def download_app_release(asset_url: str, progress_cb=None):
 def _ver_tuple(v: str):
     """
     버전 문자열을 정수 튜플로 변환하여 올바른 버전 비교를 수행한다.
-    문자열 비교는 '1.68.2' < '1.68.10' 이 False가 되는 버그가 있음.
-    예: '1.68.10' → (1, 68, 10),  '1.9.0' → (1, 9, 0)
+
+    - 문자열 비교 버그 방지: '1.68.2' < '1.68.10' = False 문제 해결
+    - wiserain fork 버전 형식 지원: '1.74.0-297' → '1.74.0' (빌드 번호 제거 후 비교)
+    예: '1.74.0-297' → (1, 74, 0),  '1.68.10' → (1, 68, 10)
     """
     try:
-        return tuple(int(x) for x in v.strip().split("."))
+        # '-297' 같은 빌드 번호 제거: '1.74.0-297' → '1.74.0'
+        v = v.strip().split("-")[0]
+        return tuple(int(x) for x in v.split("."))
     except Exception:
         return (0,)
 
