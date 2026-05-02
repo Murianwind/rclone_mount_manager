@@ -437,26 +437,55 @@ def get_rclone_exe(cfg):
 active_mounts = {}
 
 
+def _get_volname(mount: dict) -> str:
+    """
+    드라이브 볼륨 이름 결정.
+
+    우선순위:
+    1. extra_flags에 --volname=VALUE 가 있으면 그 값 사용
+    2. 없으면 remote_path의 마지막 경로 요소 사용
+       PLEX:KODI        → KODI
+       gds:GDRIVE/VIDEO → VIDEO
+    3. remote_path 없으면 리모트명
+       nas:             → nas
+    """
+    extra = mount.get("extra_flags", "")
+    if extra:
+        for token in extra.split(";"):
+            m = re.match(r'^--volname=(.+)$', token.strip())
+            if m:
+                return m.group(1).strip()
+
+    rpath = mount.get("remote_path", "").strip().replace("\\", "/").strip("/")
+    if rpath:
+        return rpath.split("/")[-1]
+
+    return mount.get("remote", "").split(":")[0]
+
+
 def build_cmd(exe: Path, mount: dict):
     rpath = mount.get("remote_path", "").strip().replace("\\", "/").strip("/")
     drive_target = mount.get("drive", "").strip() or " "
-    # --volname 을 붙이지 않음
-    # 이유: WinFsp가 --volname 지정 시 드라이브를 DRIVE_REMOTE(네트워크)로
-    #       인식하는 경우가 있어 네트워크 드라이브에서 exe 실행이 차단됨.
-    #       --volname 없이 마운트하면 DRIVE_FIXED(로컬 디스크)로 인식되어
-    #       exe 실행이 정상 동작함.
-    cmd = [str(exe), "mount", f"{mount['remote']}:{rpath}", drive_target]
+
+    # --volname: extra_flags에 --volname=VALUE 가 있으면 그 값을, 없으면 자동 생성
+    # 주의: --volname을 명시하면 WinFsp가 DRIVE_REMOTE로 인식해 exe 실행이 차단될 수 있음
+    #       그러나 볼륨 이름이 없으면 리모트 경로의 특수문자(:, \)가 그대로 표시됨
+    #       → _get_volname으로 깔끔한 이름 생성 후 --volname으로 전달
+    volname = _get_volname(mount)
+    cmd = [str(exe), "mount", f"{mount['remote']}:{rpath}", drive_target,
+           "--volname", volname]
+
     if mount.get("cache_dir"):
         cmd += ["--cache-dir", mount["cache_dir"]]
     if mount.get("cache_mode"):
         cmd += ["--vfs-cache-mode", mount["cache_mode"]]
+
     extra = mount.get("extra_flags", "").strip()
     if extra:
-        # 저장 시 normalize_flags로 정규화되므로 세미콜론으로만 분리
-        # '--flag=value' 형태로 저장되어 있으므로 공백 분리 불필요
         for f in extra.split(";"):
             f = f.strip()
-            if f:
+            # --volname은 이미 위에서 처리했으므로 extra_flags에서 제외
+            if f and not f.startswith("--volname"):
                 cmd.append(f)
     return cmd
 
