@@ -36,7 +36,7 @@ except Exception:
     _TRAY_AVAILABLE = False
 
 # ── 프로그램 설정 ──
-APP_VERSION = "1.2.3"
+APP_VERSION = "1.2.2"
 GITHUB_REPO = "Murianwind/rclone_mount_manager"
 # GitHub API 버전 체크 주기 (초 단위, 86400 = 24시간)
 VERSION_CHECK_INTERVAL = 86400
@@ -1118,7 +1118,8 @@ class App(tk.Tk):
                         r = subprocess.run([str(exe), "version"],
                                            capture_output=True, text=True,
                                            timeout=5, creationflags=0x08000000)
-                        loc_match = re.search(r"rclone v([\d.]+)", r.stdout)
+                        # 빌드 번호(-300 등)를 포함하여 버전을 추출하도록 정규표현식 수정
+                        loc_match = re.search(r"rclone v([\d.-]+)", r.stdout)
                         loc_rc = loc_match.group(1) if loc_match else ""
                         if loc_rc:
                             if lat_rc and _ver_tuple(loc_rc) < _ver_tuple(lat_rc):
