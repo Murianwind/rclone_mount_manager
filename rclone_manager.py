@@ -302,16 +302,18 @@ def download_app_release(asset_url: str, progress_cb=None):
 # ── 3. 설정 관리 ──
 def _ver_tuple(v: str):
     """
-    버전 문자열을 정수 튜플로 변환하여 올바른 버전 비교를 수행한다.
-
-    - 문자열 비교 버그 방지: '1.68.2' < '1.68.10' = False 문제 해결
-    - wiserain fork 버전 형식 지원: '1.74.0-297' → '1.74.0' (빌드 번호 제거 후 비교)
-    예: '1.74.0-297' → (1, 74, 0),  '1.68.10' → (1, 68, 10)
+    버전 문자열을 정수 튜플로 변환한다.
+    빌드 번호(예: -300)까지 포함하여 정확한 비교를 수행하도록 개선했다.
+    예: '1.74.2-300' -> (1, 74, 2, 300)
     """
     try:
-        # '-297' 같은 빌드 번호 제거: '1.74.0-297' → '1.74.0'
-        v = v.strip().split("-")[0]
-        return tuple(int(x) for x in v.split("."))
+        parts = v.strip().split("-")
+        # 주 버전 번호 처리 (예: 1.74.2)
+        t = [int(x) for x in parts[0].split(".")]
+        # 빌드 번호가 존재하면 튜플 끝에 추가
+        if len(parts) > 1:
+            t.append(int(parts[1]))
+        return tuple(t)
     except Exception:
         return (0,)
 
@@ -1032,14 +1034,16 @@ class App(tk.Tk):
                 save_config(self._cfg)
             self._rc_ver_label.config(text="rclone 다운로드", fg="#f38ba8")
         else:
-            self._rc_ver_label.config(text="v체크 중...", fg="#94e2d5")
-            # 이미 체크 중이면 강제 초기화하지 않고 스킵
-            # (강제 초기화하면 진행 중인 체크가 중단되고 중복 호출됨)
-            self._check_versions_async()
+            # 이미 체크 작업이 진행 중이 아닐 때만 라벨을 변경하고 작업을 시작한다.
+            if not self._version_check_running:
+                self._rc_ver_label.config(text="v체크 중...", fg="#94e2d5")
+                self._check_versions_async()
 
     def _on_focus_in(self, event):
         """창 활성화 시 rclone + 앱 버전 재확인"""
-        if event.widget is self:
+        # 위젯이 메인 창이거나, 창 내부 위젯에서 발생한 FocusIn 이벤트를 허용하여
+        # 트레이에서 복구 시 더 확실하게 체크를 시작하도록 개선
+        if event.widget == self or str(event.widget).startswith("."):
             self._check_rclone_presence()
 
     def _check_versions_async(self, force: bool = False):
