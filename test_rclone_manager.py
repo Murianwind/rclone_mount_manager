@@ -75,6 +75,7 @@ class TestRcloneManagerBDD(unittest.TestCase):
         app._tree = MagicMock()
         app._tree.get_children.return_value = []     # _refresh_list 호출 대비
         app._rc_ver_label = MagicMock()
+        app._app_ver_label = MagicMock()
         app._app_up_btn = MagicMock()
         app._rc_var = MagicMock()
         app._am_var = MagicMock()
@@ -2052,6 +2053,18 @@ class TestRcloneManagerBDD(unittest.TestCase):
         with patch("rclone_manager.write_log"):
             app._quit_app()
             app.destroy.assert_called_once()
+
+    # ── Scenario 183: 앱 버전 레이블 클릭 - 즉시 확인(force=True) ────────
+    def test_scenario_183_handle_app_ver_click_forces_check(self):
+        app = self._create_mocked_app()
+        app._version_check_running = True  # 이미 실행 중이어도
+        with patch.object(app, "_check_versions_async") as mock_check:
+            app._handle_app_ver_click(MagicMock())
+            # 강제 초기화 후 force=True 로 재호출되어야 한다
+            self.assertFalse(app._version_check_running)
+            mock_check.assert_called_once_with(force=True)
+            app._app_ver_label.config.assert_any_call(
+                text="버전 확인 중...", fg="#89b4fa")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
