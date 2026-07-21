@@ -36,6 +36,12 @@ except Exception:
     pystray = None
     _TRAY_AVAILABLE = False
 
+# Windows 전용 subprocess 상수의 크로스플랫폼 안전 폴백
+# (실제 값은 Windows 표준 값과 동일하므로 Windows 동작에는 영향 없음.
+#  Linux/Mac 등 비Windows 환경(테스트, 커버리지 측정 등)에서 AttributeError 방지 목적)
+_DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
 # ── 프로그램 설정 ──
 APP_VERSION = "1.2.5"
 GITHUB_REPO = "Murianwind/rclone_mount_manager"
@@ -360,7 +366,20 @@ def write_log(level: str, message: str):
         pass  # 로그 실패는 무시
 
 
+BACKUP_FILE = APP_DIR / "mounts.json.bak"
+
+
 def load_config():
+    """
+    설정 파일 로드.
+
+    복구 순서:
+      1. mounts.json 정상 파싱 → 그대로 반환
+      2. 파싱 실패 → mounts.json.bak(마지막 정상 저장본)으로 자동 복구 시도
+      3. 백업도 없거나 손상됐으면 → 손상된 원본을
+         mounts.json.corrupted-<타임스탬프> 로 보존(삭제하지 않음, 수동 복구 가능)
+         후 기본값 반환
+    """
     if CONFIG_FILE.exists():
         try:
             cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
@@ -369,11 +388,59 @@ def load_config():
             return cfg
         except Exception as e:
             write_log("ERROR", f"[설정] mounts.json 파싱 실패: {e}")
+
+            # 1차 복구 시도: 마지막 정상 저장본(.bak)
+            if BACKUP_FILE.exists():
+                try:
+                    cfg = json.loads(BACKUP_FILE.read_text(encoding="utf-8"))
+                    if "mounts" not in cfg:
+                        cfg["mounts"] = []
+                    write_log("INFO", "[설정] mounts.json.bak 으로 자동 복구 완료")
+                    # 복구된 내용을 다시 mounts.json으로 저장해 정상 상태로 되돌림
+                    try:
+                        save_config(cfg)
+                    except Exception:
+                        pass
+                    return cfg
+                except Exception as e2:
+                    write_log("ERROR", f"[설정] mounts.json.bak 도 손상됨: {e2}")
+
+            # 2차: 손상된 원본을 보존 (덮어쓰지 않고 타임스탬프 붙여 남김)
+            try:
+                from datetime import datetime
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                corrupted_path = APP_DIR / f"mounts.json.corrupted-{stamp}"
+                CONFIG_FILE.replace(corrupted_path)
+                write_log("WARN", f"[설정] 손상된 파일 보존: {corrupted_path}")
+            except Exception as e3:
+                write_log("ERROR", f"[설정] 손상 파일 보존 실패: {e3}")
+
     return {"remotes": [], "mounts": [], "rclone_path": "", "auto_mount": False, "start_minimized": False}
 
 
 def save_config(cfg):
-    CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    """
+    설정 파일 저장.
+
+    - 기존 파일이 정상 JSON이면 저장 전에 mounts.json.bak 으로 백업
+      (다음번 손상 시 이 백업으로 자동 복구됨)
+    - 임시 파일에 먼저 쓰고 원자적으로 교체(os.replace)하여
+      쓰는 도중 프로그램이 종료/충돌해도 mounts.json 자체는 손상되지 않음
+    """
+    # 기존 파일이 유효하면 백업 (손상된 파일을 백업으로 덮어쓰지 않기 위해 검증)
+    if CONFIG_FILE.exists():
+        try:
+            existing = CONFIG_FILE.read_text(encoding="utf-8")
+            json.loads(existing)  # 유효성 검증
+            BACKUP_FILE.write_text(existing, encoding="utf-8")
+        except Exception:
+            pass  # 기존 파일이 이미 손상됐다면 백업하지 않음(정상본 보존)
+
+    # 임시 파일에 쓴 후 원자적 교체
+    tmp_file = APP_DIR / "mounts.json.tmp"
+    data = json.dumps(cfg, ensure_ascii=False, indent=2)
+    tmp_file.write_text(data, encoding="utf-8")
+    tmp_file.replace(CONFIG_FILE)
 
 
 def normalize_flags(extra: str) -> str:
@@ -756,7 +823,7 @@ class MountDialog(tk.Toplevel):
             try:
                 p = subprocess.run([str(exe), "lsf", target, "--max-depth", "1"],
                                    capture_output=True, text=True, timeout=10,
-                                   creationflags=0x08000000)
+                                   creationflags=_CREATE_NO_WINDOW)
                 if p.returncode == 0:
                     messagebox.showinfo("성공", "연결 확인 완료!")
                 else:
@@ -936,8 +1003,10 @@ class App(tk.Tk):
         ttl_f = ttk.Frame(hdr)
         ttl_f.pack(side="left")
         ttk.Label(ttl_f, text="🚀 RcloneManager", style="Header.TLabel").pack(side="left")
-        ttk.Label(ttl_f, text=f"v{APP_VERSION}", foreground="#fab387",
-                  font=("Segoe UI", 10, "bold")).pack(side="left", padx=8, pady=(5, 0))
+        self._app_ver_label = tk.Label(ttl_f, text=f"v{APP_VERSION}", bg="#1e1e2e",
+                  fg="#fab387", font=("Segoe UI", 10, "bold"), cursor="hand2")
+        self._app_ver_label.pack(side="left", padx=8, pady=(5, 0))
+        self._app_ver_label.bind("<Button-1>", self._handle_app_ver_click)
         tk.Button(ttl_f, text="!", bg="#f38ba8", fg="#1e1e2e",
                   font=("Segoe UI", 9, "bold"), relief="flat", width=2,
                   command=self._open_issue).pack(side="left", padx=5, pady=(5, 0))
@@ -1134,8 +1203,12 @@ class App(tk.Tk):
                     try:
                         r = subprocess.run([str(exe), "version"],
                                            capture_output=True, text=True,
-                                           timeout=5, creationflags=0x08000000)
-                        loc_match = re.search(r"rclone v([\d.]+)", r.stdout)
+                                           timeout=5, creationflags=_CREATE_NO_WINDOW)
+                        # wiserain fork는 버전에 빌드번호가 붙음: "rclone v1.74.4-302"
+                        # 하이픈까지 포함해 캡처해야 표시가 GitHub 태그(lat_rc)와 동일한
+                        # 전체 버전 문자열로 나온다. 실제 비교는 _ver_tuple이 빌드번호를
+                        # 제거하고 수행하므로 여기서 전체를 캡처해도 비교 정확도는 그대로다.
+                        loc_match = re.search(r"rclone v([\d.\-]+)", r.stdout)
                         loc_rc = loc_match.group(1) if loc_match else ""
                         if loc_rc:
                             if lat_rc and _ver_tuple(loc_rc) < _ver_tuple(lat_rc):
@@ -1237,11 +1310,30 @@ class App(tk.Tk):
         """탐색기로 업데이트 파일이 저장된 폴더 열기."""
         folder = getattr(self, "_update_folder", APP_DIR)
         subprocess.Popen(["explorer", str(folder)],
-                         creationflags=subprocess.CREATE_NO_WINDOW)
+                         creationflags=_CREATE_NO_WINDOW)
 
     # ────────────────────────────────────────────
     # rclone 다운로드/업데이트
     # ────────────────────────────────────────────
+    def _handle_app_ver_click(self, event):
+        """
+        프로그램 버전 레이블 클릭 시 24시간 주기와 무관하게 즉시 확인.
+
+        rclone 레이블 클릭과 동일한 방식: 진행 중인 체크가 있어도 강제로
+        초기화한 뒤 force=True로 다시 시작한다. 기존의 24시간 주기 자동
+        확인 로직은 그대로 유지되며, 이 클릭은 그 주기를 건너뛰는
+        수동 트리거일 뿐이다.
+        """
+        self._app_ver_label.config(text="버전 확인 중...", fg="#89b4fa")
+        self._version_check_running = False
+        self._check_versions_async(force=True)
+        # 버전 확인은 백그라운드에서 진행되며, 완료 시 _check_versions_async
+        # 내부에서 self.after(0, ...)로 rclone 레이블은 갱신되지만
+        # 앱 버전 레이블 자체는 텍스트가 고정 표시(vX.X.X)이므로
+        # 잠시 후 원래 텍스트로 되돌린다.
+        self.after(1500, lambda: self._app_ver_label.config(
+            text=f"v{APP_VERSION}", fg="#fab387"))
+
     def _handle_rc_click(self, event):
         text = self._rc_ver_label.cget("text")
         if "다운로드" in text:
@@ -1643,7 +1735,7 @@ class App(tk.Tk):
                 # CREATE_NO_WINDOW(0x08000000) 대신 사용하는 이유:
                 # CREATE_NO_WINDOW는 비인터랙티브 컨텍스트로 실행되어
                 # WinFsp 마운트 드라이브에서 exe 실행이 차단되는 문제 발생
-                creationflags=subprocess.DETACHED_PROCESS
+                creationflags=_DETACHED_PROCESS
             )
             active_mounts[mid] = p
             write_log("INFO", f"[마운트 시작] {m_label} ← {rstr} (PID {p.pid})")
