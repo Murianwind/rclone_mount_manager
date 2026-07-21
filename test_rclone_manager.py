@@ -222,11 +222,48 @@ class TestRcloneManagerBDD(unittest.TestCase):
     def test_scenario_07_save_config(self):
         # Given: 저장할 설정 데이터가 있을 때
         cfg = {"mounts": []}
-        with patch("pathlib.Path.write_text") as mock_write:
+        # 원자적 쓰기 방식: 기존 파일 없음 → 백업 스킵 → 임시파일 write_text → replace
+        with patch("pathlib.Path.exists", return_value=False), \
+             patch("pathlib.Path.write_text") as mock_write, \
+             patch("pathlib.Path.replace") as mock_replace:
             # When: 설정을 저장하면
             rclone_manager.save_config(cfg)
-            # Then: 파일 쓰기 함수가 호출되어야 한다.
+            # Then: 임시 파일에 쓰고 원자적으로 교체해야 한다.
             mock_write.assert_called_once()
+            mock_replace.assert_called_once()
+
+    # ── Scenario 07b: 설정 저장 - 기존 파일이 유효하면 백업 생성 ─────────
+    def test_scenario_07b_save_config_creates_backup(self):
+        cfg = {"mounts": [{"id": "new"}]}
+        with patch("pathlib.Path.exists", return_value=True), \
+             patch("pathlib.Path.read_text", return_value='{"mounts": [{"id": "old"}]}'), \
+             patch("pathlib.Path.write_text") as mock_write, \
+             patch("pathlib.Path.replace") as mock_replace:
+            rclone_manager.save_config(cfg)
+            # 백업 파일 쓰기 1회 + 임시파일 쓰기 1회 = 총 2회
+            self.assertEqual(mock_write.call_count, 2)
+            mock_replace.assert_called_once()
+
+    # ── Scenario 07c: 설정 로드 - 손상 시 백업으로 자동 복구 ─────────────
+    def test_scenario_07c_load_config_recovers_from_backup(self):
+        good_backup = '{"mounts": [{"id": "backup-ok"}]}'
+        with patch("pathlib.Path.exists", return_value=True), \
+             patch("pathlib.Path.read_text", side_effect=["{bad", good_backup]), \
+             patch("rclone_manager.save_config"), \
+             patch("rclone_manager.write_log"):
+            cfg = rclone_manager.load_config()
+            self.assertEqual(cfg["mounts"][0]["id"], "backup-ok")
+
+    # ── Scenario 07d: 설정 로드 - 백업도 손상되면 원본 보존 후 기본값 ────
+    def test_scenario_07d_load_config_preserves_corrupted_file(self):
+        with patch("pathlib.Path.exists", return_value=True), \
+             patch("pathlib.Path.read_text", side_effect=["{bad", "{also bad"]), \
+             patch("pathlib.Path.replace") as mock_replace, \
+             patch("rclone_manager.write_log"):
+            cfg = rclone_manager.load_config()
+            self.assertEqual(cfg["mounts"], [])
+            # 손상된 원본을 보존하기 위해 replace(rename)가 호출되어야 한다
+            mock_replace.assert_called_once()
 
     # ── Scenario 08: 시작 프로그램 상태 확인 ─────────────────────────────
     def test_scenario_08_startup_check(self):
