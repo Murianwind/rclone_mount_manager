@@ -11,6 +11,7 @@ import sys
 import subprocess
 import threading
 import time
+import socket
 import requests
 import zipfile
 import tempfile
@@ -36,7 +37,7 @@ except Exception:
     _TRAY_AVAILABLE = False
 
 # ── 프로그램 설정 ──
-APP_VERSION = "1.2.4"
+APP_VERSION = "1.1.0"
 GITHUB_REPO = "Murianwind/rclone_mount_manager"
 # GitHub API 버전 체크 주기 (초 단위, 86400 = 24시간)
 VERSION_CHECK_INTERVAL = 86400
@@ -302,18 +303,16 @@ def download_app_release(asset_url: str, progress_cb=None):
 # ── 3. 설정 관리 ──
 def _ver_tuple(v: str):
     """
-    버전 문자열을 정수 튜플로 변환한다.
-    빌드 번호(예: -300)까지 포함하여 정확한 비교를 수행하도록 개선했다.
-    예: '1.74.2-300' -> (1, 74, 2, 300)
+    버전 문자열을 정수 튜플로 변환하여 올바른 버전 비교를 수행한다.
+
+    - 문자열 비교 버그 방지: '1.68.2' < '1.68.10' = False 문제 해결
+    - wiserain fork 버전 형식 지원: '1.74.0-297' → '1.74.0' (빌드 번호 제거 후 비교)
+    예: '1.74.0-297' → (1, 74, 0),  '1.68.10' → (1, 68, 10)
     """
     try:
-        parts = v.strip().split("-")
-        # 주 버전 번호 처리 (예: 1.74.2)
-        t = [int(x) for x in parts[0].split(".")]
-        # 빌드 번호가 존재하면 튜플 끝에 추가
-        if len(parts) > 1:
-            t.append(int(parts[1]))
-        return tuple(t)
+        # '-297' 같은 빌드 번호 제거: '1.74.0-297' → '1.74.0'
+        v = v.strip().split("-")[0]
+        return tuple(int(x) for x in v.split("."))
     except Exception:
         return (0,)
 
@@ -421,6 +420,21 @@ def normalize_flags(extra: str) -> str:
                     flags.append(part)
 
     return ";".join(flags)
+
+
+def is_internet_available(host: str = "8.8.8.8", port: int = 53, timeout: float = 3.0) -> bool:
+    """
+    인터넷 연결 상태 확인.
+    Google DNS(8.8.8.8:53)에 TCP 연결을 시도하여 판단.
+    외부 라이브러리 불필요, 응답 빠름.
+    """
+    try:
+        socket.setdefaulttimeout(timeout)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect((host, port))
+        return True
+    except Exception:
+        return False
 
 
 def get_rclone_exe(cfg):
@@ -789,6 +803,8 @@ class App(tk.Tk):
         self._latest_app_info = None
         self._version_check_running = False
         self._geometry_save_after = None
+        self._net_was_connected = None   # 이전 인터넷 상태 (None = 아직 미확인)
+        self._net_monitor_running = False
 
         write_log("INFO", f"[시작] RcloneManager v{APP_VERSION}")
 
@@ -825,8 +841,11 @@ class App(tk.Tk):
         self.after(3000, lambda: self.bind("<FocusIn>", self._on_focus_in))
         self.bind("<Configure>", self._on_configure)
 
-        if self._cfg.get("auto_mount"):
-            self.after(1500, self._automount_all)
+        # 네트워크 모니터 시작
+        # - auto_mount 활성화 여부와 무관하게 항상 실행
+        # - 인터넷 연결 감지 → auto_mount 항목 자동 마운트/언마운트
+        # - 시작 시 인터넷 없으면 팝업 없이 대기, 연결되면 자동 마운트
+        self.after(1000, self._start_net_monitor)
 
         # 시작 시 트레이로 최소화
         if self._cfg.get("start_minimized"):
@@ -1034,16 +1053,14 @@ class App(tk.Tk):
                 save_config(self._cfg)
             self._rc_ver_label.config(text="rclone 다운로드", fg="#f38ba8")
         else:
-            # 이미 체크 작업이 진행 중이 아닐 때만 라벨을 변경하고 작업을 시작한다.
-            if not self._version_check_running:
-                self._rc_ver_label.config(text="v체크 중...", fg="#94e2d5")
-                self._check_versions_async()
+            self._rc_ver_label.config(text="v체크 중...", fg="#94e2d5")
+            # 이미 체크 중이면 강제 초기화하지 않고 스킵
+            # (강제 초기화하면 진행 중인 체크가 중단되고 중복 호출됨)
+            self._check_versions_async()
 
     def _on_focus_in(self, event):
         """창 활성화 시 rclone + 앱 버전 재확인"""
-        # 위젯이 메인 창이거나, 창 내부 위젯에서 발생한 FocusIn 이벤트를 허용하여
-        # 트레이에서 복구 시 더 확실하게 체크를 시작하도록 개선
-        if event.widget == self or str(event.widget).startswith("."):
+        if event.widget is self:
             self._check_rclone_presence()
 
     def _check_versions_async(self, force: bool = False):
@@ -1118,8 +1135,7 @@ class App(tk.Tk):
                         r = subprocess.run([str(exe), "version"],
                                            capture_output=True, text=True,
                                            timeout=5, creationflags=0x08000000)
-                        # 빌드 번호(-300 등)를 포함하여 버전을 추출하도록 정규표현식 수정
-                        loc_match = re.search(r"rclone v([\d.-]+)", r.stdout)
+                        loc_match = re.search(r"rclone v([\d.]+)", r.stdout)
                         loc_rc = loc_match.group(1) if loc_match else ""
                         if loc_rc:
                             if lat_rc and _ver_tuple(loc_rc) < _ver_tuple(lat_rc):
@@ -1697,6 +1713,85 @@ class App(tk.Tk):
         for m in targets:
             self._do_mount(m["id"], m)
 
+    def _start_net_monitor(self):
+        """
+        인터넷 연결 상태를 주기적으로 감시하여 auto_mount 항목을 자동 마운트/언마운트.
+
+        동작:
+          - 10초마다 인터넷 연결 상태 확인
+          - 끊김 → 연결: auto_mount 항목 마운트
+          - 연결 → 끊김: auto_mount 항목 언마운트
+          - 시작 시 인터넷 없으면 팝업 없이 대기
+        """
+        if self._net_monitor_running:
+            return
+        self._net_monitor_running = True
+        write_log("INFO", "[네트워크] 인터넷 연결 감시 시작")
+
+        def _monitor():
+            while self._net_monitor_running:
+                connected = is_internet_available()
+
+                if connected != self._net_was_connected:
+                    prev = self._net_was_connected
+                    self._net_was_connected = connected
+
+                    if connected:
+                        # 끊김 → 연결: auto_mount 항목 마운트
+                        write_log("INFO", "[네트워크] 인터넷 연결됨 → auto_mount 마운트 시작")
+                        self.after(0, self._automount_all)
+                    else:
+                        # 연결 → 끊김: 현재 마운트 중인 모든 드라이브 언마운트
+                        # (auto_mount 여부와 무관하게 전부 해제)
+                        write_log("WARN", "[네트워크] 인터넷 끊김 → 마운트 중인 드라이브 해제")
+                        self.after(0, self._unmount_all_on_disconnect)
+
+                import time as _t
+                _t.sleep(10)
+
+        threading.Thread(target=_monitor, daemon=True).start()
+
+    def _unmount_all_on_disconnect(self):
+        """
+        인터넷 끊김 감지 시 현재 마운트 중인 드라이브를 언마운트.
+
+        - 자동 마운트(auto_mount) 항목: 알림 없이 조용히 언마운트
+          (네트워크 상태에 따라 자동으로 켜고 끄는 것이 정상 동작이므로)
+        - 수동 마운트 항목: 언마운트 후 알림 창으로 안내
+          (사용자가 직접 마운트했으므로 끊겼다는 사실을 알려야 함)
+        """
+        mounted = [m for m in self._cfg.get("mounts", []) if m["id"] in active_mounts]
+        if not mounted:
+            return
+
+        auto_targets = [m for m in mounted if m.get("auto_mount")]
+        manual_targets = [m for m in mounted if not m.get("auto_mount")]
+
+        # 자동 마운트: 조용히 해제
+        for m in auto_targets:
+            label = m.get("drive", "") or m.get("remote", "?")
+            rstr = f"{m['remote']}:{m.get('remote_path', '')}".strip(":")
+            write_log("INFO", f"[자동 언마운트] {label} ← {rstr} (인터넷 끊김)")
+            unmount(m["id"])
+
+        # 수동 마운트: 해제 후 알림
+        manual_labels = []
+        for m in manual_targets:
+            label = m.get("drive", "") or m.get("remote", "?")
+            rstr = f"{m['remote']}:{m.get('remote_path', '')}".strip(":")
+            write_log("WARN", f"[언마운트] {label} ← {rstr} (인터넷 끊김)")
+            unmount(m["id"])
+            manual_labels.append(f"{label} ({rstr})")
+
+        if mounted:
+            self._refresh_list()
+
+        if manual_labels:
+            names = "\n".join(manual_labels)
+            messagebox.showinfo(
+                "네트워크 연결 끊김",
+                f"인터넷 연결이 끊겨 다음 드라이브의 마운트를 해제했습니다:\n\n{names}")
+
     def _unmount_sel(self):
         sel = self._tree.selection()
         if sel and not sel[0].startswith("remote_"):
@@ -1722,6 +1817,7 @@ class App(tk.Tk):
 
     def _quit_app(self):
         write_log("INFO", "[종료] RcloneManager 종료")
+        self._net_monitor_running = False  # 네트워크 모니터 종료
         for mid in list(active_mounts.keys()):
             unmount(mid)
         if self._tray:
