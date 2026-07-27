@@ -886,6 +886,7 @@ class App(tk.Tk):
         self._build_ui()
         self._refresh_list()
         self._start_tray()
+        self._apply_measured_minsize()
 
         # UI 구성 완료 후 창 크기 결정
         # 저장된 크기 있으면 복원, 없으면 Tkinter가 필요 크기 측정 후 여유 추가
@@ -930,6 +931,34 @@ class App(tk.Tk):
         except Exception:
             return False
 
+    def _apply_measured_minsize(self):
+        """
+        하단 버튼 행/상태바가 창 축소 시 사라지지 않도록 실측 기반 최소 창
+        크기를 계산해 적용한다.
+
+        원리:
+          1. 트리뷰의 height(행 수)를 일시적으로 1로 줄여 update_idletasks()
+             → 이 상태의 winfo_reqheight()는 "트리뷰를 제외한 나머지 위젯들
+               (헤더/rclone 경로/옵션/버튼 행/상태바) + 트리뷰 최소 1행"의
+               실제 필요 높이가 된다.
+          2. 트리뷰가 최소 몇 행은 보이도록 여유 높이를 더한다.
+          3. 원래 height(14)로 복원한다.
+          4. 이렇게 측정한 값을 minsize로 지정하면, 폰트 크기나 DPI가
+             달라져도 항상 버튼 행/상태바가 가려지지 않는 최소 크기가 된다.
+        """
+        try:
+            original_height = self._tree.cget("height")
+            self._tree.configure(height=1)
+            self.update_idletasks()
+            min_h = self.winfo_reqheight() + 90  # 트리뷰 최소 3행 정도 여유
+            min_w = max(self.winfo_reqwidth(), 560)
+            self._tree.configure(height=original_height)
+            self.update_idletasks()
+            self.minsize(min_w, min_h)
+        except Exception:
+            # 측정 실패 시 기존 고정값으로 폴백
+            self.minsize(560, 420)
+
     def _auto_size_window(self):
         """
         저장된 크기가 없을 때 Tkinter 자동 측정으로 창 크기 결정.
@@ -970,9 +999,17 @@ class App(tk.Tk):
         save_config(self._cfg)
 
     def _on_column_resize(self, event=None):
-        """컬럼 폭 조절 후 저장 (헤더 드래그 or ButtonRelease)"""
+        """
+        컬럼 폭 조절 후 저장 (헤더 드래그 or ButtonRelease).
+
+        "remote"(리모트/서브경로)도 반드시 포함해야 한다.
+        remote와 status 둘 다 stretch=True라서 경계를 드래그하면 두 컬럼의
+        폭이 함께 바뀌는데, 기존 코드는 remote를 저장 대상에서 빠뜨려서
+        재실행 시 remote 폭이 복원되지 않고 기본값으로 되돌아가
+        "조정한 폭이 유지되지 않는" 현상이 발생했다.
+        """
         widths = {}
-        for col in ("type", "auto", "drive", "status"):
+        for col in ("type", "auto", "drive", "remote", "status"):
             try:
                 widths[col] = self._tree.column(col, "width")
             except Exception:
@@ -1046,7 +1083,37 @@ class App(tk.Tk):
         ttk.Checkbutton(opt, text="시작 시 트레이로 최소화", variable=self._min_var,
                         command=self._toggle_min).pack(side="left")
 
-        # 트리뷰 (5컬럼)
+        # 상태바 - 버튼 행보다 먼저 pack해야 맨 아래 자리를 차지한다
+        # (side="bottom"끼리는 먼저 pack된 쪽이 더 아래쪽에 위치한다)
+        st_bar = tk.Frame(self, bg="#313244", height=28)
+        st_bar.pack(fill="x", side="bottom")
+        tk.Label(st_bar, text=f" System: {get_sys_info()}", bg="#313244",
+                 fg="#9399b2", font=("Segoe UI", 9)).pack(side="left", padx=10)
+
+        # 하단 버튼 행
+        # ⚠️ 트리뷰보다 먼저 pack() 해야 한다.
+        # Tk의 pack 배치 우선순위는 side 값과 무관하게 pack()이 호출된 순서로
+        # 결정되며, 창이 작아져 전체 요청 크기를 담을 공간이 부족해지면
+        # 나중에 pack()된 위젯부터 공간을 못 받아 사라진다.
+        # 트리뷰는 expand=True로 남는 공간을 모두 가져가므로, 트리뷰를
+        # 먼저 pack하면 창을 줄일 때 버튼 행/상태바가 통째로 밀려 사라진다.
+        # → 상태바와 버튼 행을 먼저 pack해 항상 자기 몫을 확보하게 하고,
+        #   트리뷰를 가장 마지막에 pack해서 공간이 부족할 때 트리뷰만 줄어들게 한다.
+        btn_f = ttk.Frame(self)
+        btn_f.pack(fill="x", padx=20, pady=12, side="bottom")
+        ttk.Button(btn_f, text="➕ 추가", command=self._add).pack(side="left", padx=2)
+        ttk.Button(btn_f, text="✏️ 편집", command=self._edit).pack(side="left", padx=2)
+        ttk.Button(btn_f, text="🗑️ 삭제", command=self._del).pack(side="left", padx=2)
+        ttk.Button(btn_f, text="🔼", width=4, command=self._move_up).pack(side="left", padx=2)
+        ttk.Button(btn_f, text="🔽", width=4, command=self._move_down).pack(side="left", padx=2)
+        ttk.Button(btn_f, text="📥 conf 가져오기",
+                   command=self._import_conf).pack(side="left", padx=2)
+        ttk.Button(btn_f, text="▶ 마운트",
+                   command=self._mount_sel).pack(side="left", padx=14)
+        ttk.Button(btn_f, text="■ 언마운트",
+                   command=self._unmount_sel).pack(side="left")
+
+        # 트리뷰 (5컬럼) - 가장 마지막에 pack. 공간이 부족하면 이 위젯만 줄어든다.
         cols = ("type", "auto", "drive", "remote", "status")
         # 기본 폭: 상태는 170(기존 85의 2배), 저장된 값 있으면 복원
         self._col_default_widths = {"type": 70, "auto": 50, "drive": 75, "status": 170}
@@ -1072,27 +1139,6 @@ class App(tk.Tk):
         # <ButtonRelease-1>: 헤더 클릭/드래그 완료 후 폭 저장 (이중 바인딩으로 확실히 감지)
         self._tree.bind("<<TreeviewColumnRelease>>", self._on_column_resize)
         self._tree.bind("<ButtonRelease-1>", lambda e: self.after(100, self._on_column_resize))
-
-        # 하단 버튼 행
-        btn_f = ttk.Frame(self)
-        btn_f.pack(fill="x", padx=20, pady=12)
-        ttk.Button(btn_f, text="➕ 추가", command=self._add).pack(side="left", padx=2)
-        ttk.Button(btn_f, text="✏️ 편집", command=self._edit).pack(side="left", padx=2)
-        ttk.Button(btn_f, text="🗑️ 삭제", command=self._del).pack(side="left", padx=2)
-        ttk.Button(btn_f, text="🔼", width=4, command=self._move_up).pack(side="left", padx=2)
-        ttk.Button(btn_f, text="🔽", width=4, command=self._move_down).pack(side="left", padx=2)
-        ttk.Button(btn_f, text="📥 conf 가져오기",
-                   command=self._import_conf).pack(side="left", padx=2)
-        ttk.Button(btn_f, text="▶ 마운트",
-                   command=self._mount_sel).pack(side="left", padx=14)
-        ttk.Button(btn_f, text="■ 언마운트",
-                   command=self._unmount_sel).pack(side="left")
-
-        # 상태바
-        st_bar = tk.Frame(self, bg="#313244", height=28)
-        st_bar.pack(fill="x", side="bottom")
-        tk.Label(st_bar, text=f" System: {get_sys_info()}", bg="#313244",
-                 fg="#9399b2", font=("Segoe UI", 9)).pack(side="left", padx=10)
 
     # ────────────────────────────────────────────
     # rclone 레이블 / 버전 확인
