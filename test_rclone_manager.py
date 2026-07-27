@@ -1063,6 +1063,16 @@ class TestRcloneManagerBDD(unittest.TestCase):
             widths = app._cfg["column_widths"]
             self.assertNotIn("drive", widths)
 
+    # ── Scenario 96b: 컬럼 폭 저장 - remote(리모트/서브경로)도 포함 ──────
+    def test_scenario_96b_on_column_resize_includes_remote(self):
+        app = self._create_mocked_app()
+        app._tree.column.return_value = 250
+        with patch("rclone_manager.save_config"):
+            app._on_column_resize()
+            widths = app._cfg["column_widths"]
+            self.assertIn("remote", widths)
+            self.assertEqual(widths["remote"], 250)
+
     # ── Scenario 97: rclone 레이블 초기화 - 존재함 ───────────────────────
     def test_scenario_97_init_rc_label_found(self):
         app = self._create_mocked_app({"rclone_path": "C:\\fake\\rclone.exe"})
