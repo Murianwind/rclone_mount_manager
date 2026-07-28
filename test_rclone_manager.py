@@ -103,6 +103,7 @@ class TestRcloneManagerBDD(unittest.TestCase):
         app.destroy = MagicMock()
         # _check_versions_async 호출 방지용 플래그
         app._version_check_running = False
+        app._pending_force_check = False
         app._latest_rc = ""
         app._latest_app_info = None
         app._net_was_connected = None
@@ -1116,6 +1117,40 @@ class TestRcloneManagerBDD(unittest.TestCase):
         with patch("threading.Thread") as mock_thread:
             app._check_versions_async()
             mock_thread.assert_not_called()
+            # force=False로 호출했으므로 예약(pending)도 설정되지 않아야 한다
+            self.assertFalse(app._pending_force_check)
+
+    # ── Scenario 101b: 버전 체크 - 실행 중에 force 요청 시 예약만 하고
+    #                  새 스레드는 만들지 않는다(경쟁 상태 방지) ─────────
+    def test_scenario_101b_check_versions_async_running_force_sets_pending(self):
+        app = self._create_mocked_app()
+        app._version_check_running = True
+        with patch("threading.Thread") as mock_thread:
+            app._check_versions_async(force=True)
+            # 이미 실행 중이면 새 스레드를 만들지 않고 예약만 한다
+            mock_thread.assert_not_called()
+            self.assertTrue(app._pending_force_check)
+
+    # ── Scenario 101c: 버전 체크 완료 후 예약된 force 요청을 자동 실행 ───
+    def test_scenario_101c_check_versions_async_runs_pending_after_finish(self):
+        app = self._create_mocked_app({"rclone_path": "C:\\fake\\rclone.exe"})
+        app._pending_force_check = True
+        with patch("threading.Thread", self._sync_thread()), \
+             patch("pathlib.Path.exists", return_value=True), \
+             patch("subprocess.run") as mock_run, \
+             patch("requests.get") as mock_get, \
+             patch("rclone_manager.save_config"), \
+             patch.object(app, "_check_versions_async",
+                          wraps=app._check_versions_async) as wrapped:
+            mock_run.return_value = MagicMock(stdout="rclone v1.70.0")
+            resp = MagicMock()
+            resp.json.return_value = {"tag_name": "v1.70.0"}
+            mock_get.return_value = resp
+            wrapped(force=False)
+            # 체크가 끝난 뒤 예약돼 있던 force 체크가 자동으로 한 번 더 실행되어
+            # 총 2회(원래 호출 + 예약 실행) 호출되어야 한다
+            self.assertGreaterEqual(wrapped.call_count, 2)
+            self.assertFalse(app._pending_force_check)
 
     # ── Scenario 102: 버전 체크 - force=True, 앱 업데이트 있음 ───────────
     def test_scenario_102_check_versions_async_force_update_available(self):
@@ -2067,11 +2102,13 @@ class TestRcloneManagerBDD(unittest.TestCase):
     # ── Scenario 183: 앱 버전 레이블 클릭 - 즉시 확인(force=True) ────────
     def test_scenario_183_handle_app_ver_click_forces_check(self):
         app = self._create_mocked_app()
-        app._version_check_running = True  # 이미 실행 중이어도
+        # 진행 중인 체크가 있어도 이제는 강제로 리셋하지 않는다
+        # (강제 리셋은 두 스레드가 동시에 도는 경쟁 상태의 원인이었음)
+        app._version_check_running = True
         with patch.object(app, "_check_versions_async") as mock_check:
             app._handle_app_ver_click(MagicMock())
-            # 강제 초기화 후 force=True 로 재호출되어야 한다
-            self.assertFalse(app._version_check_running)
+            # _version_check_running을 건드리지 않고 그대로 force=True 요청만 위임
+            self.assertTrue(app._version_check_running)
             mock_check.assert_called_once_with(force=True)
             app._app_ver_label.config.assert_any_call(
                 text="버전 확인 중...", fg="#89b4fa")
