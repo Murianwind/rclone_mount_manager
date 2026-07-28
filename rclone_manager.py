@@ -869,6 +869,7 @@ class App(tk.Tk):
         self._latest_rc = ""
         self._latest_app_info = None
         self._version_check_running = False
+        self._pending_force_check = False
         self._geometry_save_after = None
         self._net_was_connected = None   # 이전 인터넷 상태 (None = 아직 미확인)
         self._net_monitor_running = False
@@ -1188,8 +1189,20 @@ class App(tk.Tk):
           - 앱 버전:     24시간 주기로만 체크 (last_version_check 타임스탬프)
             이유: 앱 업데이트는 빈도가 낮고 rate limit 절약
           - force=True이면 앱 버전도 주기 무관하게 즉시 체크
+
+        동시 실행 방지:
+          이미 체크가 진행 중일 때 force=True로 다시 호출되면, 예전에는
+          _version_check_running 을 강제로 False로 리셋하고 새 스레드를
+          또 시작해서 두 스레드가 동시에 실행되는 경쟁 상태가 있었다.
+          (늦게 끝난 스레드가 먼저 끝난 스레드의 결과를 덮어써
+           클릭으로 발견한 업데이트가 화면에 반영되지 않는 원인이었다.)
+          이제는 새 스레드를 만들지 않고 "예약(pending)"만 해두고,
+          진행 중이던 체크가 끝나면 그 직후에 자동으로 force 체크를
+          한 번 더 실행한다.
         """
         if self._version_check_running:
+            if force:
+                self._pending_force_check = True
             return
 
         # 앱 버전만 24시간 주기 체크
@@ -1225,8 +1238,11 @@ class App(tk.Tk):
                         latest_app = data.get("tag_name", "").lstrip("v")
                         self._latest_app_info = data
                         if _ver_tuple(latest_app) > _ver_tuple(APP_VERSION):
+                            write_log("INFO",
+                                      f"[버전] 앱 v{APP_VERSION} → v{latest_app} 업데이트 가능")
                             self.after(0, self._show_app_update_btn)
                         else:
+                            write_log("INFO", f"[버전] 앱 v{APP_VERSION} (최신)")
                             self.after(0, self._hide_app_update_btn)
                     except Exception as e:
                         write_log("WARN", f"[버전] 앱 GitHub API 호출 실패: {e}")
@@ -1276,6 +1292,10 @@ class App(tk.Tk):
                             text="v알 수 없음", fg="#f38ba8"))
             finally:
                 self._version_check_running = False
+                # 진행 중에 force 체크 요청이 예약돼 있었다면 지금 실행한다
+                if self._pending_force_check:
+                    self._pending_force_check = False
+                    self.after(0, lambda: self._check_versions_async(force=True))
 
         threading.Thread(target=_task, daemon=True).start()
 
@@ -1365,13 +1385,16 @@ class App(tk.Tk):
         """
         프로그램 버전 레이블 클릭 시 24시간 주기와 무관하게 즉시 확인.
 
-        rclone 레이블 클릭과 동일한 방식: 진행 중인 체크가 있어도 강제로
-        초기화한 뒤 force=True로 다시 시작한다. 기존의 24시간 주기 자동
-        확인 로직은 그대로 유지되며, 이 클릭은 그 주기를 건너뛰는
-        수동 트리거일 뿐이다.
+        이미 다른 체크가 진행 중이어도 _version_check_running 을 강제로
+        리셋하지 않는다. 강제로 리셋하면 기존 스레드와 새 스레드가 동시에
+        실행되는 경쟁 상태가 생겨, 늦게 끝난 스레드가 결과를 덮어써서
+        클릭으로 발견한 업데이트가 화면에 반영되지 않는 문제가 있었다.
+        대신 _check_versions_async가 내부적으로 "예약(pending)"해두고
+        진행 중이던 체크가 끝난 직후 자동으로 force 체크를 실행한다.
+        기존의 24시간 주기 자동 확인 로직은 그대로 유지되며, 이 클릭은
+        그 주기를 건너뛰는 수동 트리거일 뿐이다.
         """
         self._app_ver_label.config(text="버전 확인 중...", fg="#89b4fa")
-        self._version_check_running = False
         self._check_versions_async(force=True)
         # 버전 확인은 백그라운드에서 진행되며, 완료 시 _check_versions_async
         # 내부에서 self.after(0, ...)로 rclone 레이블은 갱신되지만
@@ -1386,7 +1409,6 @@ class App(tk.Tk):
             if not self._latest_rc:
                 messagebox.showinfo("rclone",
                                     "최신 버전 정보를 확인 중입니다. 잠시 후 다시 시도해 주세요.")
-                self._version_check_running = False
                 self._check_versions_async(force=True)
                 return
             if messagebox.askyesno("rclone", f"rclone v{self._latest_rc}를 설치할까요?"):
@@ -1443,7 +1465,6 @@ class App(tk.Tk):
             save_config(self._cfg)
             write_log("INFO", f"[rclone 설치] v{self._latest_rc} 완료: {new_path}")
             messagebox.showinfo("완료", "rclone 설치/업데이트 완료!")
-            self._version_check_running = False
             self._check_versions_async(force=True)
             if remount_list:
                 self.after(500, lambda: [self._do_mount(m["id"], m)
