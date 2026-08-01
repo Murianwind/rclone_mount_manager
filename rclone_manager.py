@@ -330,6 +330,42 @@ else:
 CONFIG_FILE = APP_DIR / "mounts.json"
 
 
+def _ensure_stable_ca_bundle():
+    """
+    PyInstaller onefile 실행 시 requests(certifi)가 참조하는 SSL 인증서
+    번들은 exe 실행마다 새로 만들어지는 임시 압축 해제 폴더
+    (%TEMP%\\_MEI숫자) 안에 있다.
+
+    문제: 이 임시 폴더가 프로그램이 오래 켜져 있는 동안 Windows 임시파일
+    정리, 백신 검사/격리, 디스크 정리 도구 등에 의해 삭제될 수 있다.
+    그러면 이후의 모든 HTTPS 요청(GitHub API 호출 등)이 인증서 파일을
+    찾지 못해 계속 실패한다. 이때 버전 체크는 실패 시 이전에 캐시해둔
+    값을 그대로 재사용하므로 겉보기엔 정상 동작하는 것처럼 보이지만
+    실제로는 새 버전을 영영 확인하지 못하게 된다.
+    (프로그램을 재시작하면 새 임시 폴더가 다시 만들어지므로 그제서야
+    우연히 해결되는 것처럼 보이는 현상이 바로 이것이다.)
+
+    해결: 인증서 파일을 프로그램 폴더(APP_DIR, 임시 폴더가 아닌 안정적인
+    위치)에 한 번만 복사해두고, requests가 항상 그 경로를 쓰도록
+    환경 변수로 고정한다. 이러면 임시 폴더가 나중에 사라져도 영향받지
+    않는다.
+    """
+    try:
+        import certifi
+        import shutil
+        stable_cert = APP_DIR / "cacert.pem"
+        src_cert = Path(certifi.where())
+        if not stable_cert.exists() or stable_cert.stat().st_size == 0:
+            shutil.copy(src_cert, stable_cert)
+        os.environ["REQUESTS_CA_BUNDLE"] = str(stable_cert)
+        os.environ["SSL_CERT_FILE"] = str(stable_cert)
+    except Exception:
+        pass  # 실패해도 무시: 시스템/certifi 기본 동작으로 폴백
+
+
+_ensure_stable_ca_bundle()
+
+
 LOG_FILE = APP_DIR / "RcloneManager.log"
 LOG_MAX_LINES = 1000
 
@@ -1224,8 +1260,8 @@ class App(tk.Tk):
                         timeout=5)
                     lat_rc = res.json().get("tag_name", "").lstrip("v")
                     self._latest_rc = lat_rc
-                except Exception:
-                    write_log("WARN", "[버전] rclone GitHub API 호출 실패")
+                except Exception as e:
+                    write_log("WARN", f"[버전] rclone GitHub API 호출 실패: {e}")
                     lat_rc = self._latest_rc  # 실패 시 이전 값 재사용
 
                 # 앱 업데이트는 24시간 주기로만 확인
