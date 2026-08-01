@@ -43,7 +43,7 @@ _DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
 # ── 프로그램 설정 ──
-APP_VERSION = "1.2.8"
+APP_VERSION = "1.2.9"
 GITHUB_REPO = "Murianwind/rclone_mount_manager"
 # GitHub API 버전 체크 주기 (초 단위, 86400 = 24시간)
 VERSION_CHECK_INTERVAL = 86400
