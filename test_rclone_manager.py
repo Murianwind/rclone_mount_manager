@@ -16,6 +16,7 @@ RcloneManager BDD 테스트
 """
 
 import sys
+import os
 import unittest
 import unittest.mock as mock
 from pathlib import Path
@@ -1202,7 +1203,8 @@ class TestRcloneManagerBDD(unittest.TestCase):
             app_resp.json.return_value = {"tag_name": "v0.0.1", "body": "", "assets": []}
             mock_get.side_effect = [Exception("network fail"), app_resp]
             app._check_versions_async(force=True)
-            mock_log.assert_any_call("WARN", "[버전] rclone GitHub API 호출 실패")
+            mock_log.assert_any_call(
+                "WARN", "[버전] rclone GitHub API 호출 실패: network fail")
 
     # ── Scenario 105: 버전 체크 - 앱 API 실패해도 계속 진행 ──────────────
     def test_scenario_105_check_versions_async_app_api_failure(self):
@@ -2112,6 +2114,42 @@ class TestRcloneManagerBDD(unittest.TestCase):
             mock_check.assert_called_once_with(force=True)
             app._app_ver_label.config.assert_any_call(
                 text="버전 확인 중...", fg="#89b4fa")
+
+    # ── Scenario 184: 인증서 안정화 - 정상 복사 및 환경변수 설정 ─────────
+    def test_scenario_184_ensure_stable_ca_bundle_success(self):
+        # Given: certifi가 정상 설치돼 있고 안정 경로에 인증서가 없을 때
+        fake_certifi = MagicMock()
+        fake_certifi.where.return_value = "/fake/_MEI123/certifi/cacert.pem"
+        with patch.dict("sys.modules", {"certifi": fake_certifi}), \
+             patch("pathlib.Path.exists", return_value=False), \
+             patch("shutil.copy") as mock_copy, \
+             patch.dict("os.environ", {}, clear=False):
+            # When: 인증서 안정화를 수행하면
+            rclone_manager._ensure_stable_ca_bundle()
+            # Then: APP_DIR/cacert.pem 으로 복사하고 환경변수를 고정해야 한다
+            mock_copy.assert_called_once()
+            self.assertTrue(os.environ.get("REQUESTS_CA_BUNDLE", "").endswith("cacert.pem"))
+            self.assertTrue(os.environ.get("SSL_CERT_FILE", "").endswith("cacert.pem"))
+
+    # ── Scenario 185: 인증서 안정화 - 이미 존재하면 재복사하지 않음 ──────
+    def test_scenario_185_ensure_stable_ca_bundle_already_exists(self):
+        fake_certifi = MagicMock()
+        fake_certifi.where.return_value = "/fake/_MEI123/certifi/cacert.pem"
+        with patch.dict("sys.modules", {"certifi": fake_certifi}), \
+             patch("pathlib.Path.exists", return_value=True), \
+             patch("pathlib.Path.stat") as mock_stat, \
+             patch("shutil.copy") as mock_copy:
+            mock_stat.return_value.st_size = 1000  # 이미 유효한 파일 존재
+            rclone_manager._ensure_stable_ca_bundle()
+            mock_copy.assert_not_called()
+
+    # ── Scenario 186: 인증서 안정화 - certifi 없거나 예외 시 조용히 무시 ──
+    def test_scenario_186_ensure_stable_ca_bundle_exception_ignored(self):
+        with patch.dict("sys.modules", {"certifi": None}):
+            try:
+                rclone_manager._ensure_stable_ca_bundle()
+            except Exception:
+                self.fail("certifi가 없어도 예외 없이 조용히 넘어가야 한다")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
