@@ -784,9 +784,20 @@ class TestRcloneManagerBDD(unittest.TestCase):
 
     # ── Scenario 61: 빌드번호 포함 버전 비교 ─────────────────────────────
     def test_scenario_61_ver_tuple_build_suffix(self):
-        self.assertEqual(rclone_manager._ver_tuple("1.74.0-297"), (1, 74, 0))
+        # 빌드번호를 버리지 않고 마지막 비교 요소로 포함해야 한다
+        self.assertEqual(rclone_manager._ver_tuple("1.74.0-297"), (1, 74, 0, 297))
         self.assertTrue(
             rclone_manager._ver_tuple("1.73.5") < rclone_manager._ver_tuple("1.74.0-297"))
+
+    # ── Scenario 61b: 버전 숫자는 같고 빌드번호만 다른 경우 감지 ─────────
+    # (실사용 사례: rclone 버전은 그대로(1.75.0)인데 wiserain이 빌드번호만
+    #  올려 재배포(-306 → -315)하는 경우, 예전 코드는 빌드번호를 버려서
+    #  두 버전을 동일하게 취급해 업데이트를 절대 감지하지 못했다.)
+    def test_scenario_61b_ver_tuple_same_version_different_build(self):
+        loc = rclone_manager._ver_tuple("1.75.0-306")
+        lat = rclone_manager._ver_tuple("1.75.0-315")
+        self.assertNotEqual(loc, lat)
+        self.assertTrue(loc < lat)
 
     # ── Scenario 62: 로그 rotate (최대 줄 수 초과) ───────────────────────
     def test_scenario_62_write_log_rotation(self):
