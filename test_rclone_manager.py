@@ -1,2166 +1,2043 @@
 """
-RcloneManager BDD 테스트
-수정 내역:
-  - 모든 테스트 최상단에 Windows/GUI 의존성 mock 설정 추가 (conftest 역할)
-  - Scenario 17: save_config mock 추가 (파일 I/O 격리)
-  - Scenario 18: [데드락 수정]
-      원인: app._cfg['rclone_path'] = '' → get_rclone_exe() → None
-            → _do_mount()에서 messagebox.showerror() 호출
-            → Tk 루트 없이 GUI 이벤트루프 대기 → 데드락
-      수정: rclone_path를 유효한 경로로 설정 + Path.exists mock
-            + _cfg['mounts']에 마운트에 필요한 필드 전체 포함
-            + messagebox.showerror patch로 안전망 추가
-  - Scenario 28: _version_check_running 속성 추가 (AttributeError 방지)
-  - tearDown 추가: active_mounts 전역 상태 초기화
-  - _create_mocked_app: save_config 기본 mock 적용
+RcloneManager - rclone 마운트 관리 트레이 앱
+GitHub: https://github.com/Murianwind/rclone_mount_manager
 """
 
-import sys
-import os
-import unittest
-import unittest.mock as mock
-from pathlib import Path
-from unittest.mock import MagicMock, patch
-
-# ── Windows/GUI 의존성 최상단 mock (import 전) ──────────────────────────
-# winreg: Windows 레지스트리 모듈, Linux/Mac에 없음
-sys.modules.setdefault("winreg", mock.MagicMock())
-
-# pystray: 트레이 아이콘 (Linux에서 GTK 의존성 문제)
-sys.modules.setdefault("pystray", None)
-
-# ctypes: Windows API 호출 mock
-if "ctypes" not in sys.modules or not isinstance(sys.modules.get("ctypes"), mock.MagicMock):
-    _ctypes_mock = mock.MagicMock()
-    _ctypes_mock.windll.shcore.SetProcessDpiAwareness.return_value = 0
-    _ctypes_mock.windll.user32.SetProcessDPIAware.return_value = 0
-    _ctypes_mock.windll.user32.GetDC.return_value = 0
-    _ctypes_mock.windll.user32.ReleaseDC.return_value = 0
-    _ctypes_mock.windll.user32.GetSystemMetrics.return_value = 1920
-    _ctypes_mock.windll.gdi32.GetDeviceCaps.return_value = 96
-    _ctypes_mock.windll.user32.FindWindowW.return_value = 0
-    _ctypes_mock.windll.user32.ShowWindow.return_value = 1
-    _ctypes_mock.windll.user32.SetForegroundWindow.return_value = 1
-    sys.modules["ctypes"] = _ctypes_mock
-# ──────────────────────────────────────────────────────────────────────────
-
 import tkinter as tk
-import rclone_manager
+from tkinter import ttk, messagebox, filedialog
+import json
+import os
+import sys
+import subprocess
+import threading
+import time
+import socket
+import requests
+import zipfile
+import tempfile
+import re
+import configparser
+import uuid
+import webbrowser
+from pathlib import Path
+import ctypes
+
+try:
+    import winreg
+except ImportError:
+    winreg = None
+
+# pystray + PIL: 함께 import, ImportError 외 ValueError 등도 처리
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    _TRAY_AVAILABLE = True
+except Exception:
+    pystray = None
+    _TRAY_AVAILABLE = False
+
+# Windows 전용 subprocess 상수의 크로스플랫폼 안전 폴백
+# (실제 값은 Windows 표준 값과 동일하므로 Windows 동작에는 영향 없음.
+#  Linux/Mac 등 비Windows 환경(테스트, 커버리지 측정 등)에서 AttributeError 방지 목적)
+_DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+# ── 프로그램 설정 ──
+APP_VERSION = "1.2.9"
+GITHUB_REPO = "Murianwind/rclone_mount_manager"
+# GitHub API 버전 체크 주기 (초 단위, 86400 = 24시간)
+VERSION_CHECK_INTERVAL = 86400
+
+# ── 1. 시스템 환경 설정 ──
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    ctypes.windll.user32.SetProcessDPIAware()
+except Exception:
+    pass
 
 
-class TestRcloneManagerBDD(unittest.TestCase):
+def get_dpi_scale():
+    """현재 시스템 DPI 배율 반환 (1.0 = 100%)"""
+    try:
+        hdc = ctypes.windll.user32.GetDC(0)
+        dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)
+        ctypes.windll.user32.ReleaseDC(0, hdc)
+        return dpi / 96.0
+    except Exception:
+        return 1.0
 
-    def setUp(self):
-        """테스트 데이터 초기 설정 (Given)"""
-        self.sample_cfg = {
-            "remotes": [], "mounts": [], "rclone_path": "", "auto_mount": False
-        }
 
-    def tearDown(self):
-        """전역 상태 초기화 (테스트 간 격리)"""
-        rclone_manager.active_mounts.clear()
+def get_screen_size():
+    """실제 물리 해상도 반환"""
+    try:
+        user32 = ctypes.windll.user32
+        return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+    except Exception:
+        return 1920, 1080
 
-    def _create_mocked_app(self, cfg=None):
-        """
-        Mock 앱 인스턴스 생성 유틸리티 (RecursionError 방지)
-        - save_config를 기본 patch하여 실제 파일 I/O 차단
-        """
-        app = rclone_manager.App.__new__(rclone_manager.App)
-        app.tk = MagicMock()
-        # cfg는 복사본 사용 - 테스트 간 공유 방지
-        app._cfg = dict(cfg) if cfg else dict(self.sample_cfg)
-        if "mounts" not in app._cfg:
-            app._cfg["mounts"] = []
-        app._status = {}
-        app._tray = MagicMock()
-        app._tree = MagicMock()
-        app._tree.get_children.return_value = []     # _refresh_list 호출 대비
-        app._rc_ver_label = MagicMock()
-        app._app_ver_label = MagicMock()
-        app._app_up_btn = MagicMock()
-        app._rc_var = MagicMock()
-        app._am_var = MagicMock()
-        app._am_var.get = MagicMock()
-        app._st_var = MagicMock()
-        app._st_var.get = MagicMock()
-        app._min_var = MagicMock()
-        app._min_var.get = MagicMock(return_value=False)
-        def _run_after(delay, callback=None, *cb_args, **cb_kwargs):
-            # 실제 Tkinter의 after()는 지연 실행이지만, 테스트에서는
-            # 예약된 콜백(주로 UI 갱신/알림)이 실행됐는지 검증해야 하므로
-            # 동기적으로 즉시 실행한다.
-            if callable(callback):
-                return callback(*cb_args, **cb_kwargs)
-            return None
 
-        app.after = MagicMock(side_effect=_run_after)
-        app.withdraw = MagicMock()
-        app.deiconify = MagicMock()
-        app.lift = MagicMock()
-        app.focus_force = MagicMock()
-        app.bind = MagicMock()
-        app.wait_window = MagicMock()
-        app.geometry = MagicMock(return_value="800x600+0+0")
-        app.destroy = MagicMock()
-        # _check_versions_async 호출 방지용 플래그
-        app._version_check_running = False
-        app._pending_force_check = False
-        app._latest_rc = ""
-        app._latest_app_info = None
-        app._net_was_connected = None
-        app._net_monitor_running = False
-        app._geometry_save_after = None
-        return app
+def get_logical_screen_size():
+    """Tkinter 기준 논리 해상도 = 물리 해상도 / DPI 배율"""
+    sw, sh = get_screen_size()
+    scale = get_dpi_scale()
+    return int(sw / scale), int(sh / scale)
+
+
+def get_sys_info():
+    """시스템 해상도 및 배율 정보 (Scenario 20)"""
+    try:
+        user32 = ctypes.windll.user32
+        w, h = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+        hdc = user32.GetDC(0)
+        dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)
+        user32.ReleaseDC(0, hdc)
+        return f"Resolution: {w}x{h}, Scaling: {int((dpi / 96) * 100)}%"
+    except Exception:
+        return "N/A"
+
+
+def calc_window_size(w_pct, h_pct, min_w=400, min_h=300):
+    """
+    현재 화면 논리 해상도의 w_pct%, h_pct% 크기 창을 계산.
+    두 기준점 (사용자 지정 환경별 선호 크기):
+      1920x1080 @100% → 목표 792x683  (논리화면의 41%x63%)
+      2736x1824 @175% → 목표 1300x833 (논리화면의 83%x80%)
+    단일 비율로 두 환경을 동시에 만족시킬 수 없으므로
+    논리 화면의 55%x65%를 기본으로 사용한다.
+    처음 실행 후 사용자가 창 크기 조정 시 저장/복원된다.
+    """
+    lw, lh = get_logical_screen_size()
+    w = max(min_w, int(lw * w_pct / 100))
+    h = max(min_h, int(lh * h_pct / 100))
+    return w, h
+
+
+# ── 2. 시작 프로그램 및 유틸리티 ──
+def is_startup_enabled():
+    if not winreg:
+        return False
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\CurrentVersion\Run",
+                             0, winreg.KEY_READ)
+        winreg.QueryValueEx(key, "RcloneManager")
+        winreg.CloseKey(key)
+        return True
+    except:
+        return False
+
+
+def set_startup(enable: bool):
+    if not winreg:
+        return False
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\CurrentVersion\Run",
+                             0, winreg.KEY_SET_VALUE)
+        if enable:
+            path = (f'"{sys.executable}"' if getattr(sys, 'frozen', False)
+                    else f'pythonw "{Path(__file__).resolve()}"')
+            winreg.SetValueEx(key, "RcloneManager", 0, winreg.REG_SZ, path)
+        else:
+            try:
+                winreg.DeleteValue(key, "RcloneManager")
+            except:
+                pass
+        winreg.CloseKey(key)
+        return True
+    except Exception as e:
+        write_log("ERROR", f"[시작프로그램] 등록/해제 실패: {e}")
+        return str(e)
+
+
+def get_startup_path() -> str:
+    """레지스트리에 등록된 시작프로그램 경로 반환. 없으면 빈 문자열."""
+    if not winreg:
+        return ""
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\CurrentVersion\Run",
+                             0, winreg.KEY_READ)
+        value, _ = winreg.QueryValueEx(key, "RcloneManager")
+        winreg.CloseKey(key)
+        return value
+    except Exception:
+        return ""
+
+
+def get_current_exe_path() -> str:
+    """현재 실행 중인 exe 경로를 레지스트리 등록 형식으로 반환."""
+    if getattr(sys, 'frozen', False):
+        return f'"{sys.executable}"'
+    else:
+        return f'pythonw "{Path(__file__).resolve()}"'
+
+
+def check_and_fix_startup() -> bool:
+    """
+    시작프로그램이 등록되어 있고 경로가 현재 실행 위치와 다르면 자동 재등록.
+
+    반환값:
+      True  - 경로 불일치로 재등록 수행
+      False - 재등록 불필요 (미등록이거나 경로 일치)
+    """
+    registered = get_startup_path()
+    if not registered:
+        return False  # 시작프로그램 미등록 → 아무것도 안 함
+
+    current = get_current_exe_path()
+    if registered == current:
+        return False  # 경로 일치 → 재등록 불필요
+
+    # 경로 불일치 → 현재 경로로 재등록
+    set_startup(True)
+    return True
+
+
+def parse_rclone_conf(conf_path: Path):
+    remotes = []
+    try:
+        cfg = configparser.ConfigParser()
+        cfg.read(str(conf_path), encoding="utf-8")
+        for section in cfg.sections():
+            remotes.append({"name": section, "type": cfg.get(section, "type", fallback="")})
+    except Exception:
+        pass
+    return remotes
+
+
+def find_default_rclone_conf():
+    for p in [
+        Path(os.environ.get("APPDATA", "")) / "rclone" / "rclone.conf",
+        Path.home() / ".config" / "rclone" / "rclone.conf",
+        APP_DIR / "rclone.conf",
+    ]:
+        if p.exists():
+            return p
+    return None
+
+
+def download_rclone(dest_dir: Path, version: str, progress_cb=None):
+    """
+    rclone 다운로드 및 설치.
+
+    반환값:
+      True     - 설치 완료
+      "manual" - 파일락으로 교체 불가, rclone_new.exe로 저장함
+      str      - 오류 메시지
+    """
+    url = (f"https://github.com/wiserain/rclone/releases/download/"
+           f"v{version}/rclone-v{version}-windows-amd64.zip")
+    try:
+        r = requests.get(url, stream=True, timeout=30)
+        total = int(r.headers.get("content-length", 0))
+        downloaded = 0
+        tmp = tempfile.mktemp(suffix=".zip")
+        with open(tmp, "wb") as f:
+            for chunk in r.iter_content(65536):
+                f.write(chunk)
+                downloaded += len(chunk)
+                if progress_cb and total:
+                    progress_cb(int(downloaded * 100 / total))
+
+        # zip에서 rclone.exe 추출
+        rclone_data = None
+        with zipfile.ZipFile(tmp, "r") as z:
+            for name in z.namelist():
+                if name.endswith("rclone.exe"):
+                    rclone_data = z.read(name)
+                    break
+        os.unlink(tmp)
+
+        if rclone_data is None:
+            return "zip 파일에서 rclone.exe를 찾을 수 없습니다."
+
+        # rclone.exe 교체 시도
+        target = dest_dir / "rclone.exe"
+        try:
+            target.write_bytes(rclone_data)
+            return True
+        except PermissionError:
+            # 다른 프로그램이 rclone.exe를 사용 중
+            # → 프로그램 실행 폴더(APP_DIR)에 rclone_new.exe로 저장
+            new_target = APP_DIR / "rclone_new.exe"
+            new_target.write_bytes(rclone_data)
+            write_log("WARN", f"[rclone 업데이트] 파일락으로 교체 불가 → {new_target} 저장")
+            return "manual"
+
+    except Exception as e:
+        write_log("ERROR", f"[rclone 다운로드] 실패: {e}")
+        return str(e)
+
+
+def download_app_release(asset_url: str, progress_cb=None):
+    """
+    앱 자체 업데이트 파일 다운로드.
+
+    Windows에서 실행 중인 exe는 OS 파일락으로 자동 교체가 불가능합니다.
+    → 업데이트 파일을 프로그램과 같은 폴더에 다운로드하고 수동 교체 안내.
+
+    반환값:
+      "manual" - 다운로드 완료, 수동 교체 안내
+      str      - 오류 메시지
+    """
+    try:
+        suffix = "." + asset_url.rsplit(".", 1)[-1] if "." in asset_url else ".zip"
+
+        # 프로그램과 같은 폴더에 저장
+        dest_dir = Path(sys.executable).parent if getattr(sys, 'frozen', False) else APP_DIR
+        dest_file = dest_dir / f"RcloneManager_update{suffix}"
+
+        # 다운로드
+        r = requests.get(asset_url, stream=True, timeout=60)
+        total = int(r.headers.get("content-length", 0))
+        downloaded = 0
+        with open(dest_file, "wb") as f:
+            for chunk in r.iter_content(65536):
+                f.write(chunk)
+                downloaded += len(chunk)
+                if progress_cb and total:
+                    progress_cb(int(downloaded * 100 / total))
+
+        return "manual"
+
+    except Exception as e:
+        write_log("ERROR", f"[앱 업데이트 다운로드] 실패: {e}")
+        return str(e)
+
+
+# ── 3. 설정 관리 ──
+def _ver_tuple(v: str):
+    """
+    버전 문자열을 정수 튜플로 변환하여 올바른 버전 비교를 수행한다.
+
+    - 문자열 비교 버그 방지: '1.68.2' < '1.68.10' = False 문제 해결
+    - wiserain fork 버전 형식(예: '1.75.0-315')의 하이픈 뒤 빌드번호를
+      "버리지 않고" 마지막 비교 요소로 포함한다.
+
+      ⚠️ 이전 버전에서는 하이픈 뒤를 통째로 버리고 '1.75.0'까지만 비교했는데,
+      wiserain은 rclone 버전 숫자가 그대로여도(1.75.0) 빌드번호만
+      올려서(-306 → -315) 재배포하는 경우가 있어, 그걸 버리면 서로 다른
+      두 빌드가 완전히 같은 버전으로 취급되어 업데이트를 절대 감지하지
+      못하는 결함이 있었다. 빌드번호까지 비교해야 정확하다.
+
+    예: '1.75.0-315' → (1, 75, 0, 315)
+        '1.68.10'    → (1, 68, 10)          (하이픈 없으면 3자리 그대로)
+        '1.68.2'     → (1, 68, 2)
+    """
+    try:
+        v = v.strip()
+        if "-" in v:
+            main, _, build = v.partition("-")
+            try:
+                build_num = int(build)
+            except ValueError:
+                build_num = 0
+            return tuple(int(x) for x in main.split(".")) + (build_num,)
+        return tuple(int(x) for x in v.split("."))
+    except Exception:
+        return (0,)
+
+
+if getattr(sys, 'frozen', False):
+    APP_DIR = Path(sys.executable).parent
+else:
+    APP_DIR = Path(__file__).parent
+CONFIG_FILE = APP_DIR / "mounts.json"
+
+
+def _ensure_stable_ca_bundle():
+    """
+    PyInstaller onefile 실행 시 requests(certifi)가 참조하는 SSL 인증서
+    번들은 exe 실행마다 새로 만들어지는 임시 압축 해제 폴더
+    (%TEMP%\\_MEI숫자) 안에 있다.
+
+    문제: 이 임시 폴더가 프로그램이 오래 켜져 있는 동안 Windows 임시파일
+    정리, 백신 검사/격리, 디스크 정리 도구 등에 의해 삭제될 수 있다.
+    그러면 이후의 모든 HTTPS 요청(GitHub API 호출 등)이 인증서 파일을
+    찾지 못해 계속 실패한다. 이때 버전 체크는 실패 시 이전에 캐시해둔
+    값을 그대로 재사용하므로 겉보기엔 정상 동작하는 것처럼 보이지만
+    실제로는 새 버전을 영영 확인하지 못하게 된다.
+    (프로그램을 재시작하면 새 임시 폴더가 다시 만들어지므로 그제서야
+    우연히 해결되는 것처럼 보이는 현상이 바로 이것이다.)
+
+    해결: 인증서 파일을 프로그램 폴더(APP_DIR, 임시 폴더가 아닌 안정적인
+    위치)에 한 번만 복사해두고, requests가 항상 그 경로를 쓰도록
+    환경 변수로 고정한다. 이러면 임시 폴더가 나중에 사라져도 영향받지
+    않는다.
+    """
+    try:
+        import certifi
+        import shutil
+        stable_cert = APP_DIR / "cacert.pem"
+        src_cert = Path(certifi.where())
+        if not stable_cert.exists() or stable_cert.stat().st_size == 0:
+            shutil.copy(src_cert, stable_cert)
+        os.environ["REQUESTS_CA_BUNDLE"] = str(stable_cert)
+        os.environ["SSL_CERT_FILE"] = str(stable_cert)
+    except Exception:
+        pass  # 실패해도 무시: 시스템/certifi 기본 동작으로 폴백
+
+
+_ensure_stable_ca_bundle()
+
+
+LOG_FILE = APP_DIR / "RcloneManager.log"
+LOG_MAX_LINES = 1000
+
+
+def write_log(level: str, message: str):
+    """
+    로그 파일에 한 줄 기록.
+    LOG_MAX_LINES 초과 시 오래된 줄부터 삭제 (rotate).
+
+    level: "INFO" | "ERROR" | "WARN"
+    포맷:  2026-04-14 13:01:07 INFO  [마운트] G: ← gdrive:movies
+    """
+    try:
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"{timestamp} {level:<5} {message}\n"
+
+        # 기존 로그 읽기
+        if LOG_FILE.exists():
+            try:
+                lines = LOG_FILE.read_text(encoding="utf-8").splitlines(keepends=True)
+            except Exception:
+                lines = []
+        else:
+            lines = []
+
+        # 1000줄 초과 시 오래된 것 삭제
+        lines.append(line)
+        if len(lines) > LOG_MAX_LINES:
+            lines = lines[len(lines) - LOG_MAX_LINES:]
+
+        LOG_FILE.write_text("".join(lines), encoding="utf-8")
+    except Exception:
+        pass  # 로그 실패는 무시
+
+
+BACKUP_FILE = APP_DIR / "mounts.json.bak"
+
+
+def load_config():
+    """
+    설정 파일 로드.
+
+    복구 순서:
+      1. mounts.json 정상 파싱 → 그대로 반환
+      2. 파싱 실패 → mounts.json.bak(마지막 정상 저장본)으로 자동 복구 시도
+      3. 백업도 없거나 손상됐으면 → 손상된 원본을
+         mounts.json.corrupted-<타임스탬프> 로 보존(삭제하지 않음, 수동 복구 가능)
+         후 기본값 반환
+    """
+    if CONFIG_FILE.exists():
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            if "mounts" not in cfg:
+                cfg["mounts"] = []
+            return cfg
+        except Exception as e:
+            write_log("ERROR", f"[설정] mounts.json 파싱 실패: {e}")
+
+            # 1차 복구 시도: 마지막 정상 저장본(.bak)
+            if BACKUP_FILE.exists():
+                try:
+                    cfg = json.loads(BACKUP_FILE.read_text(encoding="utf-8"))
+                    if "mounts" not in cfg:
+                        cfg["mounts"] = []
+                    write_log("INFO", "[설정] mounts.json.bak 으로 자동 복구 완료")
+                    # 복구된 내용을 다시 mounts.json으로 저장해 정상 상태로 되돌림
+                    try:
+                        save_config(cfg)
+                    except Exception:
+                        pass
+                    return cfg
+                except Exception as e2:
+                    write_log("ERROR", f"[설정] mounts.json.bak 도 손상됨: {e2}")
+
+            # 2차: 손상된 원본을 보존 (덮어쓰지 않고 타임스탬프 붙여 남김)
+            try:
+                from datetime import datetime
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                corrupted_path = APP_DIR / f"mounts.json.corrupted-{stamp}"
+                CONFIG_FILE.replace(corrupted_path)
+                write_log("WARN", f"[설정] 손상된 파일 보존: {corrupted_path}")
+            except Exception as e3:
+                write_log("ERROR", f"[설정] 손상 파일 보존 실패: {e3}")
+
+    return {"remotes": [], "mounts": [], "rclone_path": "", "auto_mount": False, "start_minimized": False}
+
+
+def save_config(cfg):
+    """
+    설정 파일 저장.
+
+    - 기존 파일이 정상 JSON이면 저장 전에 mounts.json.bak 으로 백업
+      (다음번 손상 시 이 백업으로 자동 복구됨)
+    - 임시 파일에 먼저 쓰고 원자적으로 교체(os.replace)하여
+      쓰는 도중 프로그램이 종료/충돌해도 mounts.json 자체는 손상되지 않음
+    """
+    # 기존 파일이 유효하면 백업 (손상된 파일을 백업으로 덮어쓰지 않기 위해 검증)
+    if CONFIG_FILE.exists():
+        try:
+            existing = CONFIG_FILE.read_text(encoding="utf-8")
+            json.loads(existing)  # 유효성 검증
+            BACKUP_FILE.write_text(existing, encoding="utf-8")
+        except Exception:
+            pass  # 기존 파일이 이미 손상됐다면 백업하지 않음(정상본 보존)
+
+    # 임시 파일에 쓴 후 원자적 교체
+    tmp_file = APP_DIR / "mounts.json.tmp"
+    data = json.dumps(cfg, ensure_ascii=False, indent=2)
+    tmp_file.write_text(data, encoding="utf-8")
+    tmp_file.replace(CONFIG_FILE)
+
+
+def normalize_flags(extra: str) -> str:
+    """
+    extra_flags를 정규화하여 저장.
+
+    입력 형식 (모두 허용):
+      --flag=value;--flag2 value2
+      --flag value\n--flag2=value2
+      --flag1 --flag2 --flag3 value
+
+    출력 형식: --flag=value;--flag2=value2;--flag3
+      - 플래그 구분자: 세미콜론(;)
+      - 값 연결: = (공백 없이)
+      - 값 없는 플래그: 그대로 유지
+
+    이유:
+      - 세미콜론은 값에 공백이 포함된 플래그를 안전하게 구분
+      - = 연결은 rclone이 가장 확실하게 인식
+      - JSON 저장 시 \n 이스케이프 없이 한 줄로 저장됨
+    """
+    import re as _re
+    if not extra.strip():
+        return ""
+
+    flags = []
+    for chunk in _re.split(r'[;\n]+', extra):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        # 청크 내 공백으로 구분된 다중 플래그 처리
+        # '--no-modtime --no-checksum' → ['--no-modtime', '--no-checksum']
+        for part in _re.split(r'(?=--)', chunk):
+            part = part.strip()
+            if not part or not part.startswith('--'):
+                continue
+            if '=' in part:
+                flags.append(part)
+            else:
+                m = _re.match(r'^(--[\w-]+)\s+(\S+)$', part)
+                if m:
+                    flags.append(f"{m.group(1)}={m.group(2)}")
+                else:
+                    flags.append(part)
+
+    return ";".join(flags)
+
+
+def is_internet_available(host: str = "8.8.8.8", port: int = 53, timeout: float = 3.0) -> bool:
+    """
+    인터넷 연결 상태 확인.
+    Google DNS(8.8.8.8:53)에 TCP 연결을 시도하여 판단.
+    외부 라이브러리 불필요, 응답 빠름.
+    """
+    try:
+        socket.setdefaulttimeout(timeout)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect((host, port))
+        return True
+    except Exception:
+        return False
+
+
+def get_rclone_exe(cfg):
+    """
+    등록된 rclone 경로 반환.
+    1순위: cfg의 rclone_path (등록된 경로)
+    2순위: APP_DIR/rclone.exe (같은 폴더의 rclone)
+    없으면 None 반환.
+    """
+    p = cfg.get("rclone_path", "").strip()
+    if p and Path(p).exists():
+        return Path(p)
+    # 같은 폴더에 rclone.exe가 있으면 사용 (원본 동작 복구)
+    fallback = APP_DIR / "rclone.exe"
+    if fallback.exists():
+        return fallback
+    return None
+
+
+active_mounts = {}
+
+
+def _get_volname(mount: dict) -> str:
+    """
+    드라이브 볼륨 이름 결정.
+
+    우선순위:
+    1. extra_flags에 --volname=VALUE 가 있으면 그 값 사용
+    2. 없으면 remote_path의 마지막 경로 요소 사용
+       PLEX:KODI        → KODI
+       gds:GDRIVE/VIDEO → VIDEO
+    3. remote_path 없으면 리모트명
+       nas:             → nas
+    """
+    extra = mount.get("extra_flags", "")
+    if extra:
+        for token in extra.split(";"):
+            m = re.match(r'^--volname=(.+)$', token.strip())
+            if m:
+                return m.group(1).strip()
+
+    rpath = mount.get("remote_path", "").strip().replace("\\", "/").strip("/")
+    if rpath:
+        return rpath.split("/")[-1]
+
+    return mount.get("remote", "").split(":")[0]
+
+
+def build_cmd(exe: Path, mount: dict):
+    rpath = mount.get("remote_path", "").strip().replace("\\", "/").strip("/")
+    drive_target = mount.get("drive", "").strip() or " "
+
+    # --volname: extra_flags에 --volname=VALUE 가 있으면 그 값을, 없으면 자동 생성
+    # 주의: --volname을 명시하면 WinFsp가 DRIVE_REMOTE로 인식해 exe 실행이 차단될 수 있음
+    #       그러나 볼륨 이름이 없으면 리모트 경로의 특수문자(:, \)가 그대로 표시됨
+    #       → _get_volname으로 깔끔한 이름 생성 후 --volname으로 전달
+    volname = _get_volname(mount)
+    cmd = [str(exe), "mount", f"{mount['remote']}:{rpath}", drive_target,
+           "--volname", volname]
+
+    if mount.get("cache_dir"):
+        cmd += ["--cache-dir", mount["cache_dir"]]
+    if mount.get("cache_mode"):
+        cmd += ["--vfs-cache-mode", mount["cache_mode"]]
+
+    extra = mount.get("extra_flags", "").strip()
+    if extra:
+        for f in extra.split(";"):
+            f = f.strip()
+            # --volname은 이미 위에서 처리했으므로 extra_flags에서 제외
+            if f and not f.startswith("--volname"):
+                cmd.append(f)
+    return cmd
+
+
+# 의도적 언마운트 중인 ID 집합 (오류 메시지 억제용)
+_unmounting = set()
+
+def unmount(mid):
+    """
+    마운트 프로세스를 종료한다.
+    _unmounting에 mid를 추가해 의도적 종료임을 표시한다.
+    discard는 _mount_task의 finally에서만 수행하여
+    타이밍 경쟁 조건(race condition)을 방지한다.
+    """
+    p = active_mounts.get(mid)
+    if p:
+        _unmounting.add(mid)   # 의도적 종료 표시 (discard는 _mount_task finally에서)
+        p.terminate()
+        try:
+            p.wait(timeout=3)
+        except Exception:
+            p.kill()
+        active_mounts.pop(mid, None)
+        # _unmounting.discard 는 여기서 하지 않음
+        # → _mount_task의 p.wait() 반환 후 finally에서만 discard
+        #   (unmount()가 먼저 discard하면 _mount_task가 오류로 인식하는 race condition 발생)
+
+
+def activate_existing_window():
+    hwnd = ctypes.windll.user32.FindWindowW(None, "RcloneManager")
+    if hwnd:
+        ctypes.windll.user32.ShowWindow(hwnd, 9)
+        ctypes.windll.user32.SetForegroundWindow(hwnd)
+        return True
+    return False
+
+
+# ── 트레이 아이콘 이미지 헬퍼 ──
+def _make_circle_icon(color="#cba6f7", size=64):
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse([2, 2, size - 2, size - 2], fill=color)
+    return img
+
+
+# ── 4. 다이얼로그 ──
+class ConfImportDialog(tk.Toplevel):
+    def __init__(self, parent, remotes):
+        super().__init__(parent)
+        self.title("리모트 선택")
+        self.grab_set()
+        self.configure(bg="#1e1e2e")
+        self.selected = []
+        self._remotes = remotes
+        self._vars = []
+        tk.Label(self, text="가져올 리모트 선택:", bg="#1e1e2e", fg="#cba6f7",
+                 font=("Segoe UI", 10, "bold")).pack(padx=16, pady=10, anchor="w")
+        for r in self._remotes:
+            v = tk.BooleanVar(value=True)
+            self._vars.append((v, r))
+            row = tk.Frame(self, bg="#1e1e2e")
+            row.pack(fill="x", padx=16, pady=2)
+            tk.Checkbutton(row, variable=v, bg="#1e1e2e", fg="#cdd6f4",
+                           selectcolor="#313244").pack(side="left")
+            tk.Label(row, text=f"{r['name']} [{r['type']}]", bg="#1e1e2e",
+                     fg="#cdd6f4").pack(side="left")
+        tk.Button(self, text="가져오기", bg="#cba6f7", fg="#1e1e2e",
+                  font=("Segoe UI", 10, "bold"), relief="flat",
+                  command=self._ok).pack(pady=10, ipady=3, ipadx=10)
+
+    def _ok(self):
+        self.selected = [(r["name"], r["type"]) for v, r in self._vars if v.get()]
+        self.destroy()
+
+
+class UpdateDialog(tk.Toplevel):
+    """
+    앱 업데이트 확인 다이얼로그.
+    - 업데이트 내역 필드에만 조건부 스크롤바
+    - grid 레이아웃: 버튼 항상 하단 고정
+    """
+
+    def __init__(self, parent, tag, body, assets=None):
+        super().__init__(parent)
+        self.title(f"업데이트 확인 - {tag}")
+        self.configure(bg="#1e1e2e")
+        self.grab_set()
+        self.confirmed = False
+        self._asset_url = self._pick_asset(assets or [])
+
+        w, h = calc_window_size(34, 56, min_w=480, min_h=360)
+        self.geometry(f"{w}x{h}")
+        self.minsize(480, 360)
+        self.resizable(True, True)
+
+        self.rowconfigure(0, weight=0)
+        self.rowconfigure(1, weight=1)
+        self.rowconfigure(2, weight=0)
+        self.columnconfigure(0, weight=1)
+
+        tk.Label(self,
+                 text=f"✨ 새 버전({tag})으로 업데이트하시겠습니까?",
+                 bg="#1e1e2e", fg="#cba6f7",
+                 font=("Segoe UI", 11, "bold"),
+                 wraplength=w - 40).grid(row=0, column=0, sticky="ew",
+                                         padx=20, pady=(16, 8))
+
+        txt_frame = tk.Frame(self, bg="#1e1e2e")
+        txt_frame.grid(row=1, column=0, sticky="nsew", padx=20, pady=4)
+        txt_frame.rowconfigure(0, weight=1)
+        txt_frame.columnconfigure(0, weight=1)
+
+        vsb = tk.Scrollbar(txt_frame)
+        txt = tk.Text(txt_frame, bg="#313244", fg="#cdd6f4", relief="flat",
+                      font=("Segoe UI", 10), padx=10, pady=10, wrap="word")
+        txt.grid(row=0, column=0, sticky="nsew")
+        txt.insert("1.0", body)
+        txt.config(state="disabled")
+
+        # 내용이 필드보다 길 때만 스크롤바 표시
+        def _maybe_show_scrollbar(event=None):
+            _, last = txt.yview()
+            if last < 1.0:
+                vsb.grid(row=0, column=1, sticky="ns")
+                txt.config(yscrollcommand=vsb.set)
+                vsb.config(command=txt.yview)
+            else:
+                vsb.grid_remove()
+
+        txt.bind("<Configure>", _maybe_show_scrollbar)
+        self.after(100, _maybe_show_scrollbar)
+
+        btn_f = tk.Frame(self, bg="#1e1e2e")
+        btn_f.grid(row=2, column=0, sticky="ew", padx=20, pady=(8, 16))
+        tk.Button(btn_f, text="다운로드", bg="#a6e3a1", fg="#1e1e2e",
+                  font=("Segoe UI", 10, "bold"), relief="flat",
+                  command=self._ok, width=14).pack(side="right", padx=5, ipady=5)
+        tk.Button(btn_f, text="취소", bg="#45475a", fg="#cdd6f4",
+                  font=("Segoe UI", 10, "bold"), relief="flat",
+                  command=self.destroy, width=14).pack(side="right", padx=5, ipady=5)
 
     @staticmethod
-    def _sync_thread():
-        """threading.Thread를 동기 실행으로 대체하는 patch용 헬퍼."""
-        class _FakeThread:
-            def __init__(self, target=None, args=(), kwargs=None, daemon=None):
-                self._target = target
-                self._args = args
-                self._kwargs = kwargs or {}
-
-            def start(self):
-                if self._target:
-                    self._target(*self._args, **self._kwargs)
-
-        return _FakeThread
-
-    def _create_mocked_dialog(self, parent, mount=None, cfg=None):
-        """Mock 다이얼로그 생성 유틸리티"""
-        dlg = rclone_manager.MountDialog.__new__(rclone_manager.MountDialog)
-        dlg._m = mount if mount else {}
-        dlg._app_cfg = dict(cfg) if cfg else dict(self.sample_cfg)
-        if "mounts" not in dlg._app_cfg:
-            dlg._app_cfg["mounts"] = []
-        dlg._rem = MagicMock()
-        dlg._drv = MagicMock()
-        dlg._pth = MagicMock()
-        dlg._cdir = MagicMock()
-        dlg._cmode = MagicMock()
-        dlg._ext = MagicMock()
-        dlg._auto = MagicMock()
-        dlg.destroy = MagicMock()
-        # 기본 반환값 설정 (strip 체인 호환)
-        dlg._drv.get.return_value = ""
-        dlg._pth.get.return_value = ""
-        dlg._cdir.get.return_value = ""
-        dlg._cmode.get.return_value = "full"
-        dlg._ext.get.return_value = ""
-        dlg._auto.get.return_value = False
-        return dlg
-
-    # ── Scenario 01: rclone 실행 파일 로드 ────────────────────────────────
-    def test_scenario_01_load_rclone(self):
-        # Given: rclone_path가 설정 파일에 존재할 때
-        cfg = {"rclone_path": "C:\\fake\\rclone.exe"}
-        with patch("pathlib.Path.exists", return_value=True):
-            # When: rclone 실행 파일을 가져오면
-            exe = rclone_manager.get_rclone_exe(cfg)
-            # Then: 설정된 경로가 반환되어야 한다.
-            self.assertEqual(str(exe), "C:\\fake\\rclone.exe")
-
-    # ── Scenario 02: rclone 명령어 빌드 (기본) ───────────────────────────
-    def test_scenario_02_build_cmd_basic(self):
-        # Given: 리모트 이름과 드라이브 문자가 주어졌을 때
-        exe = Path("rclone.exe")
-        mount = {"remote": "drive", "drive": "X:", "remote_path": "data"}
-        # When: 명령어를 빌드하면
-        cmd = rclone_manager.build_cmd(exe, mount)
-        # Then: 필수 인자들이 포함되어야 한다.
-        self.assertIn("mount", cmd)
-        self.assertIn("drive:data", cmd)
-
-    # ── Scenario 03: rclone 명령어 빌드 (캐시 설정 포함) ─────────────────
-    def test_scenario_03_build_cmd_with_cache(self):
-        # Given: 캐시 경로와 모드가 주어졌을 때
-        exe = Path("rclone.exe")
-        mount = {
-            "remote": "drive", "drive": "X:",
-            "cache_dir": "C:\\cache", "cache_mode": "full"
-        }
-        # When: 명령어를 빌드하면
-        cmd = rclone_manager.build_cmd(exe, mount)
-        # Then: 캐시 관련 플래그가 포함되어야 한다.
-        self.assertIn("--cache-dir", cmd)
-        self.assertIn("full", cmd)
-
-    # ── Scenario 04: rclone 명령어 빌드 (추가 플래그 포함) ───────────────
-    def test_scenario_04_build_cmd_with_extra_flags(self):
-        # Given: 추가 플래그가 주어졌을 때
-        # extra_flags는 저장 시 normalize_flags를 거쳐 정규화된 형태로 저장됨
-        # '--bwlimit 10M' → '--bwlimit=10M' (=로 연결)
-        exe = Path("rclone.exe")
-        mount = {
-            "remote": "drive", "drive": "X:",
-            "extra_flags": rclone_manager.normalize_flags("--read-only; --bwlimit 10M")
-        }
-        # When: 명령어를 빌드하면
-        cmd = rclone_manager.build_cmd(exe, mount)
-        # Then: 정규화된 형태의 플래그가 포함되어야 한다.
-        self.assertIn("--read-only", cmd)
-        self.assertIn("--bwlimit=10M", cmd)
-
-    # ── Scenario 05: 설정 파일 로드 (파일 없음) ──────────────────────────
-    def test_scenario_05_load_config_none(self):
-        # Given: 설정 파일이 존재하지 않을 때
-        with patch("pathlib.Path.exists", return_value=False):
-            # When: 설정을 로드하면
-            cfg = rclone_manager.load_config()
-            # Then: 기본 구조의 빈 데이터가 반환되어야 한다.
-            self.assertEqual(cfg["mounts"], [])
-
-    # ── Scenario 06: 설정 파일 로드 (손상된 파일) ────────────────────────
-    def test_scenario_06_load_config_corrupt(self):
-        # Given: 설정 파일이 잘못된 JSON 형식일 때
-        with patch("pathlib.Path.exists", return_value=True), \
-             patch("pathlib.Path.read_text", return_value="{bad"):
-            # When: 설정을 로드하면
-            cfg = rclone_manager.load_config()
-            # Then: 에러 없이 기본 설정을 반환해야 한다.
-            self.assertEqual(cfg["mounts"], [])
-
-    # ── Scenario 07: 설정 파일 저장 ──────────────────────────────────────
-    def test_scenario_07_save_config(self):
-        # Given: 저장할 설정 데이터가 있을 때
-        cfg = {"mounts": []}
-        # 원자적 쓰기 방식: 기존 파일 없음 → 백업 스킵 → 임시파일 write_text → replace
-        with patch("pathlib.Path.exists", return_value=False), \
-             patch("pathlib.Path.write_text") as mock_write, \
-             patch("pathlib.Path.replace") as mock_replace:
-            # When: 설정을 저장하면
-            rclone_manager.save_config(cfg)
-            # Then: 임시 파일에 쓰고 원자적으로 교체해야 한다.
-            mock_write.assert_called_once()
-            mock_replace.assert_called_once()
-
-    # ── Scenario 07b: 설정 저장 - 기존 파일이 유효하면 백업 생성 ─────────
-    def test_scenario_07b_save_config_creates_backup(self):
-        cfg = {"mounts": [{"id": "new"}]}
-        with patch("pathlib.Path.exists", return_value=True), \
-             patch("pathlib.Path.read_text", return_value='{"mounts": [{"id": "old"}]}'), \
-             patch("pathlib.Path.write_text") as mock_write, \
-             patch("pathlib.Path.replace") as mock_replace:
-            rclone_manager.save_config(cfg)
-            # 백업 파일 쓰기 1회 + 임시파일 쓰기 1회 = 총 2회
-            self.assertEqual(mock_write.call_count, 2)
-            mock_replace.assert_called_once()
-
-    # ── Scenario 07c: 설정 로드 - 손상 시 백업으로 자동 복구 ─────────────
-    def test_scenario_07c_load_config_recovers_from_backup(self):
-        good_backup = '{"mounts": [{"id": "backup-ok"}]}'
-        with patch("pathlib.Path.exists", return_value=True), \
-             patch("pathlib.Path.read_text", side_effect=["{bad", good_backup]), \
-             patch("rclone_manager.save_config"), \
-             patch("rclone_manager.write_log"):
-            cfg = rclone_manager.load_config()
-            self.assertEqual(cfg["mounts"][0]["id"], "backup-ok")
-
-    # ── Scenario 07d: 설정 로드 - 백업도 손상되면 원본 보존 후 기본값 ────
-    def test_scenario_07d_load_config_preserves_corrupted_file(self):
-        with patch("pathlib.Path.exists", return_value=True), \
-             patch("pathlib.Path.read_text", side_effect=["{bad", "{also bad"]), \
-             patch("pathlib.Path.replace") as mock_replace, \
-             patch("rclone_manager.write_log"):
-            cfg = rclone_manager.load_config()
-            self.assertEqual(cfg["mounts"], [])
-            # 손상된 원본을 보존하기 위해 replace(rename)가 호출되어야 한다
-            mock_replace.assert_called_once()
-
-    # ── Scenario 08: 시작 프로그램 상태 확인 ─────────────────────────────
-    def test_scenario_08_startup_check(self):
-        # Given: 레지스트리에 시작 프로그램이 등록되어 있을 때
-        with patch("rclone_manager.winreg") as mock_winreg:
-            mock_winreg.OpenKey.return_value = MagicMock()
-            mock_winreg.QueryValueEx.return_value = ("path", 1)
-            # When: 등록 상태를 확인하면
-            enabled = rclone_manager.is_startup_enabled()
-            # Then: True를 반환해야 한다.
-            self.assertTrue(enabled)
-
-    # ── Scenario 09: 마운트 중지 로직 ────────────────────────────────────
-    def test_scenario_09_unmount_logic(self):
-        # Given: 실행 중인 프로세스가 등록되어 있을 때
-        mock_proc = MagicMock()
-        rclone_manager.active_mounts["test_id"] = mock_proc
-        # When: 언마운트를 수행하면
-        rclone_manager.unmount("test_id")
-        # Then: 프로세스가 종료되어야 한다.
-        mock_proc.terminate.assert_called_once()
-        # And: active_mounts에서 제거되어야 한다.
-        self.assertNotIn("test_id", rclone_manager.active_mounts)
-
-    # ── Scenario 10: 중복 실행 시 창 활성화 ──────────────────────────────
-    def test_scenario_10_activate_existing_window(self):
-        # Given: 이미 실행 중인 창의 핸들이 있을 때
-        with patch("ctypes.windll.user32.FindWindowW", return_value=123), \
-             patch("ctypes.windll.user32.ShowWindow") as mock_show:
-            # When: 창 활성화를 시도하면
-            res = rclone_manager.activate_existing_window()
-            # Then: ShowWindow가 호출되고 True가 반환되어야 한다.
-            self.assertTrue(res)
-            mock_show.assert_called()
-
-    # ── Scenario 11: 마운트 다이얼로그 저장 ──────────────────────────────
-    def test_scenario_11_dialog_save_new(self):
-        # Given: 다이얼로그에 정보를 입력했을 때
-        app = self._create_mocked_app()
-        dlg = self._create_mocked_dialog(app)
-        dlg._rem.get.return_value = "remote"
-        # When: 저장 버튼을 누르면
-        dlg._save()
-        # Then: result 객체가 생성되어야 한다.
-        self.assertIsNotNone(dlg.result)
-
-    # ── Scenario 12: 리모트 이름 미입력 에러 ─────────────────────────────
-    def test_scenario_12_dialog_save_empty_remote(self):
-        # Given: 리모트 이름이 비어있을 때
-        app = self._create_mocked_app()
-        dlg = self._create_mocked_dialog(app)
-        dlg._rem.get.return_value = ""
-        with patch("tkinter.messagebox.showinfo") as mock_info:
-            # When: 저장을 시도하면
-            dlg._save()
-            # Then: 알림 창이 표시되어야 한다.
-            mock_info.assert_called_with("알림", "리모트 이름을 입력해 주세요.")
-
-    # ── Scenario 13: 드라이브 문자 중복 에러 ─────────────────────────────
-    def test_scenario_13_dialog_duplicate_drive(self):
-        # Given: 이미 사용 중인 드라이브 문자를 선택했을 때
-        cfg = {"mounts": [{"id": "1", "drive": "Z:", "remote": "other",
-                           "remote_path": ""}]}
-        app = self._create_mocked_app(cfg)
-        dlg = self._create_mocked_dialog(app, cfg=cfg)
-        dlg._rem.get.return_value = "test"
-        dlg._drv.get.return_value = "Z:"
-        with patch("tkinter.messagebox.showinfo") as mock_info:
-            # When: 저장을 시도하면
-            dlg._save()
-            # Then: 알림 창이 표시되어야 한다.
-            mock_info.assert_called_with("알림", "이미 사용 중인 드라이브 문자입니다.")
-
-    # ── Scenario 14: 동일 리모트/경로 중복 에러 ──────────────────────────
-    def test_scenario_14_dialog_duplicate_remote_path(self):
-        # Given: 동일한 리모트와 경로가 이미 있을 때
-        cfg = {"mounts": [{"id": "1", "remote": "test", "remote_path": "path",
-                           "drive": ""}]}
-        app = self._create_mocked_app(cfg)
-        dlg = self._create_mocked_dialog(app, cfg=cfg)
-        dlg._rem.get.return_value = "test"
-        dlg._pth.get.return_value = "path"
-        with patch("tkinter.messagebox.showinfo") as mock_info:
-            # When: 저장을 시도하면
-            dlg._save()
-            # Then: 알림 창이 표시되어야 한다.
-            mock_info.assert_called()
-
-    # ── Scenario 15: rclone 다운로드 및 설치 ─────────────────────────────
-    def test_scenario_15_rclone_install_path(self):
-        # Given: 다운로드 요청이 있을 때
-        with patch("requests.get") as mock_get, \
-             patch("zipfile.ZipFile") as mock_zip, \
-             patch("pathlib.Path.write_bytes"), \
-             patch("os.unlink"), \
-             patch("tempfile.mktemp", return_value="/tmp/fake_rclone.zip"), \
-             patch("builtins.open", mock.mock_open()):
-            mock_get.return_value.iter_content = lambda x: [b"data"]
-            mock_get.return_value.headers = {"content-length": "4"}
-            mock_zip.return_value.__enter__ = lambda s: mock_zip.return_value
-            mock_zip.return_value.__exit__ = MagicMock(return_value=False)
-            mock_zip.return_value.namelist.return_value = [
-                "rclone-v1.65.0-windows-amd64/rclone.exe"
-            ]
-            mock_zip.return_value.read.return_value = b"fake_exe"
-            # When: 다운로드를 실행하면
-            res = rclone_manager.download_rclone(Path("."), "1.65.0")
-            # Then: True가 반환되어야 한다.
-            self.assertTrue(res)
-
-    # ── Scenario 16: 시작 프로그램 등록 설정 ─────────────────────────────
-    def test_scenario_16_set_startup(self):
-        # Given: 시작 프로그램 등록을 요청할 때
-        with patch("rclone_manager.winreg") as mock_winreg:
-            mock_winreg.OpenKey.return_value = MagicMock()
-            # When: set_startup(True)를 호출하면
-            rclone_manager.set_startup(True)
-            # Then: 레지스트리 쓰기 함수가 호출되어야 한다.
-            mock_winreg.SetValueEx.assert_called()
-
-    # ── Scenario 17: 앱 삭제 UI 테스트 ───────────────────────────────────
-    def test_scenario_17_app_delete_ui(self):
-        # Given: 삭제할 마운트 항목이 데이터에 존재할 때
-        app = self._create_mocked_app()
-        app._cfg["mounts"] = [{"id": "test-id", "remote": "test"}]
-        with patch("tkinter.messagebox.askyesno", return_value=True), \
-             patch("rclone_manager.save_config"), \
-             patch("rclone_manager.unmount"):
-            # When: 삭제 메서드를 호출하면
-            app._delete_mount("test-id")
-            # Then: 데이터에서 해당 항목이 제거되어야 한다.
-            self.assertEqual(len(app._cfg["mounts"]), 0)
-
-    # ── Scenario 18: 마운트 작업 시작 테스트 ─────────────────────────────
-    def test_scenario_18_mount_task_start(self):
-        """
-        [데드락 수정]
-        원인: app._cfg['rclone_path'] = '' → get_rclone_exe() → None
-              → _do_mount()에서 messagebox.showerror() 호출
-              → Tk 루트 없이 GUI 이벤트루프 대기 → 데드락
-        수정:
-          1. rclone_path를 유효한 경로로 설정
-          2. pathlib.Path.exists를 True로 mock
-          3. _cfg['mounts'] 항목에 build_cmd에 필요한 전체 필드 포함
-          4. messagebox.showerror도 patch하여 안전망 추가
-        """
-        # Given: 마운트할 데이터가 있고 rclone.exe가 존재할 때
-        app = self._create_mocked_app()
-        app._cfg["rclone_path"] = "C:\\fake\\rclone.exe"
-        app._cfg["mounts"] = [{
-            "id": "test-id",
-            "remote": "test",
-            "remote_path": "",
-            "drive": "X:",
-            "cache_dir": "",
-            "cache_mode": "full",
-            "extra_flags": "",
-        }]
-        # When: 단일 마운트를 실행하면
-        with patch("subprocess.Popen") as mock_popen, \
-             patch("pathlib.Path.exists", return_value=True), \
-             patch("tkinter.messagebox.showerror"):
-            mock_proc = MagicMock()
-            mock_proc.wait.return_value = 0
-            mock_popen.return_value = mock_proc
-            app._mount_single("test-id")
-            import time
-            time.sleep(0.3)  # 데몬 스레드 시작 대기
-            # Then: Popen이 실제로 호출되어야 한다.
-            self.assertTrue(mock_popen.called)
-
-    # ── Scenario 19: 자동 마운트 설정 토글 테스트 ────────────────────────
-    def test_scenario_19_toggle_auto_mount(self):
-        # Given: UI에서 자동 마운트 체크박스 값을 변경했을 때
-        app = self._create_mocked_app()
-        app._am_var.get.return_value = True
-        with patch("rclone_manager.save_config"):
-            # When: 설정을 저장하면
-            app._save_settings()
-        # Then: 설정 데이터(cfg)에 반영되어야 한다.
-        self.assertTrue(app._cfg["auto_mount"])
-
-    # ── Scenario 20: 시스템 DPI 정보 수집 ────────────────────────────────
-    def test_scenario_20_sys_info_retrieval(self):
-        # Given: 시스템 정보를 조회할 때
-        with patch("rclone_manager.get_sys_info", return_value="1920x1080"):
-            # When: 정보를 가져오면
-            info = rclone_manager.get_sys_info()
-            # Then: 반환값이 일치해야 한다.
-            self.assertEqual(info, "1920x1080")
-
-    # ── Scenario 21: 이슈 리포트 URL 테스트 ──────────────────────────────
-    def test_scenario_21_issue_report_url(self):
-        # Given: 이슈 제보 버튼을 누를 때
-        app = self._create_mocked_app()
-        with patch("webbrowser.open") as mock_open:
-            # When: _open_issue를 호출하면
-            app._open_issue()
-            # Then: 브라우저가 이슈 페이지 URL을 열어야 한다.
-            called_url = mock_open.call_args[0][0]
-            self.assertIn("issues", called_url)
-
-    # ── Scenario 22: 드라이브 문자 빈칸 허용 ─────────────────────────────
-    def test_scenario_22_blank_drive_letter_save(self):
-        # Given: 드라이브 문자를 비워두었을 때
-        app = self._create_mocked_app()
-        dlg = self._create_mocked_dialog(app)
-        dlg._rem.get.return_value = "remote"
-        dlg._drv.get.return_value = ""
-        # When: 저장을 시도하면
-        dlg._save()
-        # Then: 정상 저장되어야 한다.
-        self.assertIsNotNone(dlg.result)
-        self.assertEqual(dlg.result["drive"], "")
-
-    # ── Scenario 23: rclone 버전 레이블 로직 ─────────────────────────────
-    def test_scenario_23_rclone_version_label_text_logic(self):
-        # Given: 버전 비교 문구를 구성할 때
-        msg = "v1.60.0 / v1.65.0 업데이트"
-        # Then: 업데이트 문구가 포함되어야 한다.
-        self.assertIn("업데이트", msg)
-
-    # ── Scenario 24: rclone.conf 파싱 ────────────────────────────────────
-    def test_scenario_24_parse_rclone_conf(self):
-        # Given: 설정 파일을 파싱할 때
-        with patch("configparser.ConfigParser.read"), \
-             patch("configparser.ConfigParser.sections", return_value=["drive"]):
-            # When: 파싱을 수행하면
-            remotes = rclone_manager.parse_rclone_conf(Path("fake.conf"))
-            # Then: 리스트가 반환되어야 한다.
-            self.assertIsInstance(remotes, list)
-
-    # ── Scenario 25: 트레이 아이콘 동작 ──────────────────────────────────
-    def test_scenario_25_tray_default_action(self):
-        # Given: 트레이 메뉴 항목을 만들 때
-        with patch("rclone_manager.pystray", create=True) as mock_pystray:
-            mock_pystray.MenuItem = MagicMock()
-            # When: '열기' 메뉴를 생성하면
-            rclone_manager.pystray.MenuItem("열기", MagicMock(), default=True)
-            # Then: default 인자가 True여야 한다.
-            mock_pystray.MenuItem.assert_called_with(
-                "열기", unittest.mock.ANY, default=True
-            )
-
-    # ── Scenario 26: 업데이트 취소 ───────────────────────────────────────
-    def test_scenario_26_update_dialog_cancel(self):
-        # Given: 업데이트 질문에 '아니오'를 선택할 때
-        with patch("tkinter.messagebox.askyesno", return_value=False):
-            # When: 확인을 수행하면
-            res = tk.messagebox.askyesno("rclone", "업데이트?")
-            # Then: False가 반환되어야 한다.
-            self.assertFalse(res)
-
-    # ── Scenario 27: 업데이트 승인 ───────────────────────────────────────
-    def test_scenario_27_update_dialog_confirm(self):
-        # Given: 업데이트 질문에 '예'를 선택할 때
-        with patch("tkinter.messagebox.askyesno", return_value=True):
-            # When: 확인을 수행하면
-            res = tk.messagebox.askyesno("rclone", "업데이트?")
-            # Then: True가 반환되어야 한다.
-            self.assertTrue(res)
-
-    # ── Scenario 28: rclone 미등록 시 다운로드 문구 표시 ─────────────────
-    def test_scenario_28_rclone_download_label_when_missing(self):
-        # Given: 등록된 rclone 실행 파일이 시스템에 없을 때
-        app = self._create_mocked_app()
-        app._cfg["rclone_path"] = "C:\\non_existent\\rclone.exe"
-        with patch("pathlib.Path.exists", return_value=False):
-            # When: 존재 여부 체크 로직이 실행되면
-            app._check_rclone_presence()
-            # Then: UI 레이블이 'rclone 다운로드'로 변경되어야 한다.
-            app._rc_ver_label.config.assert_called_with(
-                text="rclone 다운로드", fg="#f38ba8"
-            )
-
-    # ── Scenario 29: 창 활성화 시 rclone 존재 여부 재확인 ────────────────
-    def test_scenario_29_check_rclone_on_focus(self):
-        # Given: 프로그램이 활성화될 때
-        app = self._create_mocked_app()
-        mock_event = MagicMock()
-        mock_event.widget = app  # event.widget = 최상위 창 인스턴스
-        # When: 창에 포커스가 생기면
-        with patch.object(app, "_check_rclone_presence") as mock_check:
-            app._on_focus_in(mock_event)
-            # Then: 재확인 로직이 호출되어야 한다.
-            mock_check.assert_called_once()
-
-
-    # ══════════════════════════════════════════════════════════════════
-    # 분기 커버리지 보강 테스트 (Scenario 30 이후)
-    # ══════════════════════════════════════════════════════════════════
-
-    # ── Scenario 30: DPI 배율 조회 (정상) ────────────────────────────────
-    def test_scenario_30_get_dpi_scale_success(self):
-        with patch("ctypes.windll.user32.GetDC", return_value=1), \
-             patch("ctypes.windll.gdi32.GetDeviceCaps", return_value=192), \
-             patch("ctypes.windll.user32.ReleaseDC"):
-            scale = rclone_manager.get_dpi_scale()
-            self.assertEqual(scale, 2.0)
-
-    # ── Scenario 31: DPI 배율 조회 (예외 시 기본값) ──────────────────────
-    def test_scenario_31_get_dpi_scale_exception(self):
-        with patch("ctypes.windll.user32.GetDC", side_effect=Exception("fail")):
-            scale = rclone_manager.get_dpi_scale()
-            self.assertEqual(scale, 1.0)
-
-    # ── Scenario 32: 화면 해상도 조회 (정상) ─────────────────────────────
-    def test_scenario_32_get_screen_size_success(self):
-        with patch("ctypes.windll.user32.GetSystemMetrics", side_effect=[2560, 1440]):
-            w, h = rclone_manager.get_screen_size()
-            self.assertEqual((w, h), (2560, 1440))
-
-    # ── Scenario 33: 화면 해상도 조회 (예외 시 기본값) ───────────────────
-    def test_scenario_33_get_screen_size_exception(self):
-        with patch("ctypes.windll.user32.GetSystemMetrics", side_effect=Exception):
-            w, h = rclone_manager.get_screen_size()
-            self.assertEqual((w, h), (1920, 1080))
-
-    # ── Scenario 34: 논리 해상도 계산 ────────────────────────────────────
-    def test_scenario_34_get_logical_screen_size(self):
-        with patch("rclone_manager.get_screen_size", return_value=(1920, 1080)), \
-             patch("rclone_manager.get_dpi_scale", return_value=2.0):
-            lw, lh = rclone_manager.get_logical_screen_size()
-            self.assertEqual((lw, lh), (960, 540))
-
-    # ── Scenario 35: 시스템 정보 문자열 (정상) ───────────────────────────
-    def test_scenario_35_get_sys_info_success(self):
-        with patch("ctypes.windll.user32.GetSystemMetrics", side_effect=[1920, 1080]), \
-             patch("ctypes.windll.user32.GetDC", return_value=1), \
-             patch("ctypes.windll.gdi32.GetDeviceCaps", return_value=96), \
-             patch("ctypes.windll.user32.ReleaseDC"):
-            info = rclone_manager.get_sys_info()
-            self.assertIn("1920x1080", info)
-            self.assertIn("100%", info)
-
-    # ── Scenario 36: 시스템 정보 문자열 (예외 시 N/A) ────────────────────
-    def test_scenario_36_get_sys_info_exception(self):
-        with patch("ctypes.windll.user32.GetSystemMetrics", side_effect=Exception):
-            info = rclone_manager.get_sys_info()
-            self.assertEqual(info, "N/A")
-
-    # ── Scenario 37: 창 크기 계산 (최솟값 보장) ──────────────────────────
-    def test_scenario_37_calc_window_size_min_bound(self):
-        with patch("rclone_manager.get_logical_screen_size", return_value=(100, 100)):
-            w, h = rclone_manager.calc_window_size(34, 56, min_w=480, min_h=360)
-            self.assertEqual((w, h), (480, 360))
-
-    # ── Scenario 38: 시작 프로그램 상태 확인 (winreg 없음) ───────────────
-    def test_scenario_38_startup_check_no_winreg(self):
-        with patch("rclone_manager.winreg", None):
-            self.assertFalse(rclone_manager.is_startup_enabled())
-
-    # ── Scenario 39: 시작 프로그램 상태 확인 (예외) ──────────────────────
-    def test_scenario_39_startup_check_exception(self):
-        with patch("rclone_manager.winreg") as mock_winreg:
-            mock_winreg.OpenKey.side_effect = Exception("no key")
-            self.assertFalse(rclone_manager.is_startup_enabled())
-
-    # ── Scenario 40: 시작 프로그램 등록 (winreg 없음) ────────────────────
-    def test_scenario_40_set_startup_no_winreg(self):
-        with patch("rclone_manager.winreg", None):
-            self.assertFalse(rclone_manager.set_startup(True))
-
-    # ── Scenario 41: 시작 프로그램 해제 (내부 예외 무시) ─────────────────
-    def test_scenario_41_set_startup_disable_inner_exception(self):
-        with patch("rclone_manager.winreg") as mock_winreg:
-            mock_winreg.OpenKey.return_value = MagicMock()
-            mock_winreg.DeleteValue.side_effect = Exception("not found")
-            res = rclone_manager.set_startup(False)
-            self.assertTrue(res)
-
-    # ── Scenario 42: 시작 프로그램 등록 (전체 예외) ──────────────────────
-    def test_scenario_42_set_startup_outer_exception(self):
-        with patch("rclone_manager.winreg") as mock_winreg, \
-             patch("rclone_manager.write_log") as mock_log:
-            mock_winreg.OpenKey.side_effect = Exception("boom")
-            res = rclone_manager.set_startup(True)
-            self.assertEqual(res, "boom")
-            mock_log.assert_called()
-
-    # ── Scenario 43: 시작프로그램 경로 조회 (winreg 없음) ────────────────
-    def test_scenario_43_get_startup_path_no_winreg(self):
-        with patch("rclone_manager.winreg", None):
-            self.assertEqual(rclone_manager.get_startup_path(), "")
-
-    # ── Scenario 44: 시작프로그램 경로 조회 (예외) ───────────────────────
-    def test_scenario_44_get_startup_path_exception(self):
-        with patch("rclone_manager.winreg") as mock_winreg:
-            mock_winreg.OpenKey.side_effect = Exception("fail")
-            self.assertEqual(rclone_manager.get_startup_path(), "")
-
-    # ── Scenario 45: 시작프로그램 경로 조회 (성공) ───────────────────────
-    def test_scenario_45_get_startup_path_success(self):
-        with patch("rclone_manager.winreg") as mock_winreg:
-            mock_winreg.OpenKey.return_value = MagicMock()
-            mock_winreg.QueryValueEx.return_value = ("some_path", 1)
-            self.assertEqual(rclone_manager.get_startup_path(), "some_path")
-
-    # ── Scenario 46: 현재 실행 경로 (frozen) ─────────────────────────────
-    def test_scenario_46_get_current_exe_path_frozen(self):
-        with patch("sys.frozen", True, create=True), \
-             patch("sys.executable", "C:\\app\\RcloneManager.exe"):
-            path = rclone_manager.get_current_exe_path()
-            self.assertIn("RcloneManager.exe", path)
-
-    # ── Scenario 47: 현재 실행 경로 (스크립트 실행) ──────────────────────
-    def test_scenario_47_get_current_exe_path_script(self):
-        path = rclone_manager.get_current_exe_path()
-        self.assertIn("pythonw", path)
-
-    # ── Scenario 48: 시작프로그램 경로 재등록 불필요 (미등록) ────────────
-    def test_scenario_48_check_and_fix_startup_not_registered(self):
-        with patch("rclone_manager.get_startup_path", return_value=""):
-            self.assertFalse(rclone_manager.check_and_fix_startup())
-
-    # ── Scenario 49: 시작프로그램 경로 재등록 불필요 (경로 일치) ─────────
-    def test_scenario_49_check_and_fix_startup_match(self):
-        with patch("rclone_manager.get_startup_path", return_value="samepath"), \
-             patch("rclone_manager.get_current_exe_path", return_value="samepath"):
-            self.assertFalse(rclone_manager.check_and_fix_startup())
-
-    # ── Scenario 50: 시작프로그램 경로 자동 재등록 ───────────────────────
-    def test_scenario_50_check_and_fix_startup_mismatch(self):
-        with patch("rclone_manager.get_startup_path", return_value="old"), \
-             patch("rclone_manager.get_current_exe_path", return_value="new"), \
-             patch("rclone_manager.set_startup") as mock_set:
-            self.assertTrue(rclone_manager.check_and_fix_startup())
-            mock_set.assert_called_once_with(True)
-
-    # ── Scenario 51: rclone.conf 파싱 실패 시 빈 리스트 ──────────────────
-    def test_scenario_51_parse_rclone_conf_exception(self):
-        with patch("configparser.ConfigParser.read", side_effect=Exception("bad")):
-            remotes = rclone_manager.parse_rclone_conf(Path("bad.conf"))
-            self.assertEqual(remotes, [])
-
-    # ── Scenario 52: 기본 rclone.conf 탐색 (발견) ────────────────────────
-    def test_scenario_52_find_default_rclone_conf_found(self):
-        with patch("pathlib.Path.exists", return_value=True):
-            p = rclone_manager.find_default_rclone_conf()
-            self.assertIsNotNone(p)
-
-    # ── Scenario 53: 기본 rclone.conf 탐색 (없음) ────────────────────────
-    def test_scenario_53_find_default_rclone_conf_not_found(self):
-        with patch("pathlib.Path.exists", return_value=False):
-            p = rclone_manager.find_default_rclone_conf()
-            self.assertIsNone(p)
-
-    # ── Scenario 54: rclone 다운로드 - zip에 exe 없음 ────────────────────
-    def test_scenario_54_download_rclone_no_exe_in_zip(self):
-        with patch("requests.get") as mock_get, \
-             patch("zipfile.ZipFile") as mock_zip, \
-             patch("os.unlink"), \
-             patch("tempfile.mktemp", return_value="/tmp/fake.zip"), \
-             patch("builtins.open", mock.mock_open()):
-            mock_get.return_value.iter_content = lambda x: [b"data"]
-            mock_get.return_value.headers = {"content-length": "4"}
-            mock_zip.return_value.__enter__ = lambda s: mock_zip.return_value
-            mock_zip.return_value.__exit__ = MagicMock(return_value=False)
-            mock_zip.return_value.namelist.return_value = ["readme.txt"]
-            res = rclone_manager.download_rclone(Path("."), "1.65.0")
-            self.assertIn("찾을 수 없습니다", res)
-
-    # ── Scenario 55: rclone 다운로드 - 네트워크 예외 ─────────────────────
-    def test_scenario_55_download_rclone_network_exception(self):
-        with patch("requests.get", side_effect=Exception("network down")):
-            res = rclone_manager.download_rclone(Path("."), "1.65.0")
-            self.assertEqual(res, "network down")
-
-    # ── Scenario 56: rclone 다운로드 - 파일락(수동 교체 필요) ────────────
-    def test_scenario_56_download_rclone_permission_error(self):
-        with patch("requests.get") as mock_get, \
-             patch("zipfile.ZipFile") as mock_zip, \
-             patch("os.unlink"), \
-             patch("tempfile.mktemp", return_value="/tmp/fake.zip"), \
-             patch("builtins.open", mock.mock_open()), \
-             patch("pathlib.Path.write_bytes",
-                   side_effect=[PermissionError(), None]):
-            mock_get.return_value.iter_content = lambda x: [b"data"]
-            mock_get.return_value.headers = {"content-length": "4"}
-            mock_zip.return_value.__enter__ = lambda s: mock_zip.return_value
-            mock_zip.return_value.__exit__ = MagicMock(return_value=False)
-            mock_zip.return_value.namelist.return_value = ["rclone.exe"]
-            mock_zip.return_value.read.return_value = b"fake"
-            res = rclone_manager.download_rclone(Path("."), "1.65.0")
-            self.assertEqual(res, "manual")
-
-    # ── Scenario 57: 앱 업데이트 파일 다운로드 성공 ──────────────────────
-    def test_scenario_57_download_app_release_success(self):
-        with patch("requests.get") as mock_get, \
-             patch("builtins.open", mock.mock_open()):
-            mock_get.return_value.iter_content = lambda x: [b"data"]
-            mock_get.return_value.headers = {"content-length": "4"}
-            res = rclone_manager.download_app_release(
-                "https://example.com/RcloneManager.zip")
-            self.assertEqual(res, "manual")
-
-    # ── Scenario 58: 앱 업데이트 파일 다운로드 실패 ──────────────────────
-    def test_scenario_58_download_app_release_exception(self):
-        with patch("requests.get", side_effect=Exception("timeout")):
-            res = rclone_manager.download_app_release("https://example.com/x.zip")
-            self.assertEqual(res, "timeout")
-
-    # ── Scenario 59: 앱 업데이트 URL에 확장자 없음(기본 zip) ─────────────
-    def test_scenario_59_download_app_release_no_dot_in_url(self):
-        with patch("requests.get") as mock_get, \
-             patch("builtins.open", mock.mock_open()):
-            mock_get.return_value.iter_content = lambda x: [b"data"]
-            mock_get.return_value.headers = {"content-length": "0"}
-            res = rclone_manager.download_app_release("https://example.com/nodot")
-            self.assertEqual(res, "manual")
-
-    # ── Scenario 60: 버전 문자열 파싱 실패 시 (0,) ───────────────────────
-    def test_scenario_60_ver_tuple_malformed(self):
-        self.assertEqual(rclone_manager._ver_tuple("not-a-version"), (0,))
-
-    # ── Scenario 61: 빌드번호 포함 버전 비교 ─────────────────────────────
-    def test_scenario_61_ver_tuple_build_suffix(self):
-        # 빌드번호를 버리지 않고 마지막 비교 요소로 포함해야 한다
-        self.assertEqual(rclone_manager._ver_tuple("1.74.0-297"), (1, 74, 0, 297))
-        self.assertTrue(
-            rclone_manager._ver_tuple("1.73.5") < rclone_manager._ver_tuple("1.74.0-297"))
-
-    # ── Scenario 61b: 버전 숫자는 같고 빌드번호만 다른 경우 감지 ─────────
-    # (실사용 사례: rclone 버전은 그대로(1.75.0)인데 wiserain이 빌드번호만
-    #  올려 재배포(-306 → -315)하는 경우, 예전 코드는 빌드번호를 버려서
-    #  두 버전을 동일하게 취급해 업데이트를 절대 감지하지 못했다.)
-    def test_scenario_61b_ver_tuple_same_version_different_build(self):
-        loc = rclone_manager._ver_tuple("1.75.0-306")
-        lat = rclone_manager._ver_tuple("1.75.0-315")
-        self.assertNotEqual(loc, lat)
-        self.assertTrue(loc < lat)
-
-    # ── Scenario 62: 로그 rotate (최대 줄 수 초과) ───────────────────────
-    def test_scenario_62_write_log_rotation(self):
-        with patch("rclone_manager.LOG_MAX_LINES", 3), \
-             patch("pathlib.Path.exists", return_value=True), \
-             patch("pathlib.Path.read_text",
-                   return_value="l1\nl2\nl3\n"), \
-             patch("pathlib.Path.write_text") as mock_write:
-            rclone_manager.write_log("INFO", "새 라인")
-            written = mock_write.call_args[0][0]
-            self.assertEqual(len(written.splitlines()), 3)
-
-    # ── Scenario 63: 로그 기록 실패 시 무시 ──────────────────────────────
-    def test_scenario_63_write_log_exception_ignored(self):
-        with patch("pathlib.Path.exists", side_effect=Exception("io error")):
+    def _pick_asset(assets):
+        for a in assets:
+            name = a.get("name", "").lower()
+            if name.endswith(".exe") or name.endswith(".zip"):
+                return a.get("browser_download_url", "")
+        return ""
+
+    def _ok(self):
+        self.confirmed = True
+        self.destroy()
+
+
+class MountDialog(tk.Toplevel):
+    def __init__(self, parent, mount=None, app_cfg=None):
+        super().__init__(parent)
+        self.title("마운트 추가" if not mount or "id" not in mount else "마운트 설정")
+
+        w, h = calc_window_size(34, 82, min_w=490, min_h=580)
+        self.geometry(f"{w}x{h}")
+        self.minsize(490, 580)
+        self.resizable(True, True)
+        self.configure(bg="#1e1e2e")
+        self.grab_set()
+        self.result = None
+        self._m = mount or {}
+        self._app_cfg = app_cfg
+        self._build()
+
+    def _build(self):
+        c = tk.Frame(self, padx=26, pady=16, bg="#1e1e2e")
+        c.pack(fill="both", expand=True)
+
+        lbl_s = {"bg": "#1e1e2e", "fg": "#cba6f7", "font": ("Segoe UI", 10, "bold")}
+        ent_s = {"bg": "#313244", "fg": "#cdd6f4", "insertbackground": "#cdd6f4",
+                 "relief": "flat", "font": ("Segoe UI", 10)}
+
+        tk.Label(c, text="리모트 이름", **lbl_s).pack(anchor="w")
+        self._rem = tk.Entry(c, **ent_s)
+        self._rem.pack(fill="x", pady=(4, 11), ipady=4)
+        self._rem.insert(0, self._m.get("remote", ""))
+
+        tk.Label(c, text="서브 디렉토리", **lbl_s).pack(anchor="w")
+        pth_f = tk.Frame(c, bg="#1e1e2e")
+        pth_f.pack(fill="x", pady=(4, 11))
+        self._pth = tk.Entry(pth_f, **ent_s)
+        self._pth.pack(side="left", fill="x", expand=True, ipady=4)
+        self._pth.insert(0, self._m.get("remote_path", ""))
+        tk.Button(pth_f, text="연결 테스트", bg="#89b4fa", fg="#1e1e2e",
+                  font=("Segoe UI", 9, "bold"), relief="flat",
+                  command=self._test).pack(side="left", padx=(10, 0), ipady=3)
+
+        tk.Label(c, text="드라이브 문자", **lbl_s).pack(anchor="w")
+        drive_values = [""] + [f"{chr(i)}:" for i in range(ord('D'), ord('Z') + 1)]
+        self._drv = ttk.Combobox(c, values=drive_values, font=("Segoe UI", 10),
+                                  state="readonly")
+        self._drv.pack(fill="x", pady=(4, 11))
+        self._drv.set(self._m.get("drive", ""))
+
+        tk.Label(c, text="캐시 디렉토리", **lbl_s).pack(anchor="w")
+        cdir_f = tk.Frame(c, bg="#1e1e2e")
+        cdir_f.pack(fill="x", pady=(4, 11))
+        self._cdir = tk.Entry(cdir_f, **ent_s)
+        self._cdir.pack(side="left", fill="x", expand=True, ipady=4)
+        self._cdir.insert(0, self._m.get("cache_dir", ""))
+        tk.Button(cdir_f, text="📂", bg="#45475a", fg="#cdd6f4", relief="flat",
+                  command=self._browse_cache).pack(side="left", padx=(5, 0))
+
+        tk.Label(c, text="캐시 모드", **lbl_s).pack(anchor="w")
+        self._cmode = ttk.Combobox(c, values=["off", "minimal", "writes", "full"],
+                                    font=("Segoe UI", 10), state="readonly")
+        self._cmode.pack(fill="x", pady=(4, 11))
+        self._cmode.set(self._m.get("cache_mode", "full"))
+
+        tk.Label(c, text="추가 플래그", **lbl_s).pack(anchor="w")
+        self._ext = tk.Text(c, height=4, **ent_s)
+        self._ext.pack(fill="x", pady=(4, 11))
+        self._ext.insert("1.0", self._m.get("extra_flags", ""))
+
+        self._auto = tk.BooleanVar(value=self._m.get("auto_mount", False))
+        tk.Checkbutton(c, text="시작 시 자동 마운트", variable=self._auto,
+                       bg="#1e1e2e", fg="#cdd6f4", selectcolor="#313244",
+                       font=("Segoe UI", 10)).pack(anchor="w", pady=5)
+
+        btn_f = tk.Frame(c, bg="#1e1e2e")
+        btn_f.pack(fill="x", pady=(14, 0))
+        tk.Button(btn_f, text="저장", bg="#cba6f7", fg="#1e1e2e",
+                  font=("Segoe UI", 11, "bold"), relief="flat",
+                  command=self._save, width=13).pack(side="right", padx=(10, 0), ipady=5)
+        tk.Button(btn_f, text="취소", bg="#45475a", fg="#cdd6f4",
+                  font=("Segoe UI", 11, "bold"), relief="flat",
+                  command=self.destroy, width=13).pack(side="right", ipady=5)
+
+    def _browse_cache(self):
+        d = filedialog.askdirectory()
+        if d:
+            self._cdir.delete(0, tk.END)
+            self._cdir.insert(0, d)
+
+    def _test(self):
+        target = f"{self._rem.get().strip()}:{self._pth.get().strip().strip('/')}"
+        exe = get_rclone_exe(self._app_cfg)
+        if not exe:
+            return messagebox.showinfo("알림", "rclone 경로가 등록되어 있지 않습니다.")
+
+        def r():
             try:
-                rclone_manager.write_log("ERROR", "실패해도 괜찮음")
-            except Exception:
-                self.fail("write_log는 예외를 삼켜야 한다")
+                p = subprocess.run([str(exe), "lsf", target, "--max-depth", "1"],
+                                   capture_output=True, text=True, timeout=10,
+                                   creationflags=_CREATE_NO_WINDOW)
+                if p.returncode == 0:
+                    messagebox.showinfo("성공", "연결 확인 완료!")
+                else:
+                    messagebox.showinfo("연결 실패", f"연결 불가:\n{p.stderr.strip()}")
+            except Exception as e:
+                write_log("ERROR", f"[연결 테스트] 실패: {e}")
+                messagebox.showinfo("알림", str(e))
 
-    # ── Scenario 64: 설정 로드 - mounts 키 이미 존재 ─────────────────────
-    def test_scenario_64_load_config_mounts_key_present(self):
-        with patch("pathlib.Path.exists", return_value=True), \
-             patch("pathlib.Path.read_text",
-                   return_value='{"mounts": [{"id": "x"}], "remotes": []}'):
-            cfg = rclone_manager.load_config()
-            self.assertEqual(len(cfg["mounts"]), 1)
+        threading.Thread(target=r, daemon=True).start()
 
-    # ── Scenario 65: 플래그 정규화 - 빈 문자열 ───────────────────────────
-    def test_scenario_65_normalize_flags_empty(self):
-        self.assertEqual(rclone_manager.normalize_flags(""), "")
-        self.assertEqual(rclone_manager.normalize_flags("   "), "")
+    def _save(self):
+        rem, drv, pth = self._rem.get().strip(), self._drv.get(), self._pth.get().strip()
+        if not rem:
+            return messagebox.showinfo("알림", "리모트 이름을 입력해 주세요.")
+        for m in self._app_cfg.get("mounts", []):
+            if m.get("id") == self._m.get("id"):
+                continue
+            if drv and m.get("drive") == drv:
+                return messagebox.showinfo("알림", "이미 사용 중인 드라이브 문자입니다.")
+            if m.get("remote") == rem and m.get("remote_path", "") == pth:
+                return messagebox.showinfo("알림", "동일한 리모트/경로가 이미 등록되어 있습니다.")
+        self.result = {
+            "remote": rem, "drive": drv, "remote_path": pth,
+            "cache_dir": self._cdir.get().strip(),
+            "cache_mode": self._cmode.get(),
+            "extra_flags": normalize_flags(self._ext.get("1.0", tk.END).strip()),
+            "auto_mount": self._auto.get(),
+        }
+        self.destroy()
 
-    # ── Scenario 66: 플래그 정규화 - 값 없는 플래그 유지 ─────────────────
-    def test_scenario_66_normalize_flags_no_value_flag(self):
-        result = rclone_manager.normalize_flags("--links;--fast-list")
-        self.assertEqual(result, "--links;--fast-list")
 
-    # ── Scenario 67: 인터넷 연결 확인 - 성공 ─────────────────────────────
-    def test_scenario_67_is_internet_available_true(self):
-        with patch("socket.socket") as mock_sock:
-            instance = mock_sock.return_value.__enter__.return_value
-            instance.connect.return_value = None
-            self.assertTrue(rclone_manager.is_internet_available())
+# ── 5. 메인 앱 ──
+class App(tk.Tk):
+    def __init__(self):
+        self._tray = None
+        super().__init__()
+        self.title("RcloneManager")
+        self.configure(bg="#1e1e2e")
+        self.protocol("WM_DELETE_WINDOW", self.hide_window)
 
-    # ── Scenario 68: 인터넷 연결 확인 - 실패 ─────────────────────────────
-    def test_scenario_68_is_internet_available_false(self):
-        with patch("socket.socket", side_effect=OSError("no route")):
-            self.assertFalse(rclone_manager.is_internet_available())
+        self._cfg = load_config()
+        self._status = {}
+        self._latest_rc = ""
+        self._latest_app_info = None
+        self._version_check_running = False
+        self._pending_force_check = False
+        self._geometry_save_after = None
+        self._net_was_connected = None   # 이전 인터넷 상태 (None = 아직 미확인)
+        self._net_monitor_running = False
 
-    # ── Scenario 69: rclone 경로 - fallback 폴더 사용 ────────────────────
-    def test_scenario_69_get_rclone_exe_fallback(self):
-        cfg = {"rclone_path": ""}
-        with patch("pathlib.Path.exists", return_value=True):
-            exe = rclone_manager.get_rclone_exe(cfg)
-            self.assertIsNotNone(exe)
+        write_log("INFO", f"[시작] RcloneManager v{APP_VERSION}")
 
-    # ── Scenario 70: rclone 경로 - 존재하지 않음 ─────────────────────────
-    def test_scenario_70_get_rclone_exe_none(self):
-        cfg = {"rclone_path": ""}
-        with patch("pathlib.Path.exists", return_value=False):
-            exe = rclone_manager.get_rclone_exe(cfg)
-            self.assertIsNone(exe)
+        # ── 창 크기 복원 또는 초기 계산 ──────────────────────────────────────
+        # 저장된 크기: 복원
+        # 없으면: UI 구성 후 Tkinter 자동 측정으로 적절한 크기 결정
+        self._saved_geo = self._cfg.get("window_geometry", "")
+        self.minsize(560, 420)
+        self.resizable(True, True)
+        # ─────────────────────────────────────────────────────────────────────
 
-    # ── Scenario 71: 볼륨 이름 - extra_flags 지정값 우선 ─────────────────
-    def test_scenario_71_get_volname_from_extra_flags(self):
-        mount = {"remote": "gds", "remote_path": "GDRIVE/VIDEO",
-                  "extra_flags": "--buffer-size=512M;--volname=GDS;--no-modtime"}
-        self.assertEqual(rclone_manager._get_volname(mount), "GDS")
+        self._build_ui()
+        self._refresh_list()
+        self._start_tray()
+        self._apply_measured_minsize()
 
-    # ── Scenario 72: 볼륨 이름 - remote_path 마지막 요소 ─────────────────
-    def test_scenario_72_get_volname_from_remote_path(self):
-        mount = {"remote": "PLEX", "remote_path": "KODI", "extra_flags": ""}
-        self.assertEqual(rclone_manager._get_volname(mount), "KODI")
+        # UI 구성 완료 후 창 크기 결정
+        # 저장된 크기 있으면 복원, 없으면 Tkinter가 필요 크기 측정 후 여유 추가
+        if self._saved_geo and self._is_valid_geometry(self._saved_geo):
+            self.geometry(self._saved_geo)
+        else:
+            self._auto_size_window()
 
-    # ── Scenario 73: 볼륨 이름 - remote_path 없으면 리모트명 ─────────────
-    def test_scenario_73_get_volname_fallback_remote(self):
-        mount = {"remote": "nas", "remote_path": "", "extra_flags": ""}
-        self.assertEqual(rclone_manager._get_volname(mount), "nas")
+        self._init_rc_label()
+        self._check_versions_async()
 
-    # ── Scenario 74: build_cmd - extra_flags의 --volname 중복 제거 ──────
-    def test_scenario_74_build_cmd_volname_deduplication(self):
-        exe = Path("rclone.exe")
-        mount = {"remote": "gds", "drive": "G:", "remote_path": "GDRIVE/VIDEO",
-                  "extra_flags": "--volname=GDS;--no-modtime"}
-        cmd = rclone_manager.build_cmd(exe, mount)
-        self.assertEqual(cmd.count("--volname"), 1)
-        self.assertIn("GDS", cmd)
+        # 실행 위치가 변경된 경우 시작프로그램 경로 자동 재등록
+        if check_and_fix_startup():
+            write_log("INFO", f"[시작프로그램] 실행 경로 변경 감지 → 자동 재등록: {get_current_exe_path()}")
+            self._st_var.set(True)  # 체크박스 상태 동기화
 
-    # ── Scenario 75: build_cmd - 캐시 설정 없을 때 플래그 미포함 ─────────
-    def test_scenario_75_build_cmd_no_cache_flags(self):
-        exe = Path("rclone.exe")
-        mount = {"remote": "drive", "drive": "X:"}
-        cmd = rclone_manager.build_cmd(exe, mount)
-        self.assertNotIn("--cache-dir", cmd)
-        self.assertNotIn("--vfs-cache-mode", cmd)
+        # FocusIn 바인딩을 3초 후에 등록
+        # 앱 시작 직후 창 표시 과정에서 FocusIn이 여러 번 발생해
+        # 버전 체크가 중복 호출되는 것을 방지
+        self.after(3000, lambda: self.bind("<FocusIn>", self._on_focus_in))
+        self.bind("<Configure>", self._on_configure)
 
-    # ── Scenario 76: 언마운트 - 대상 없음 (no-op) ────────────────────────
-    def test_scenario_76_unmount_noop(self):
+        # 네트워크 모니터 시작
+        # - auto_mount 활성화 여부와 무관하게 항상 실행
+        # - 인터넷 연결 감지 → auto_mount 항목 자동 마운트/언마운트
+        # - 시작 시 인터넷 없으면 팝업 없이 대기, 연결되면 자동 마운트
+        self.after(1000, self._start_net_monitor)
+
+        # 시작 시 트레이로 최소화
+        if self._cfg.get("start_minimized"):
+            self.after(100, self.hide_window)
+
+    @staticmethod
+    def _is_valid_geometry(geo: str) -> bool:
+        """저장된 geometry 문자열이 유효한지 확인 (최솟값만 체크)"""
         try:
-            rclone_manager.unmount("no-such-id")
+            m = re.match(r"^(\d+)x(\d+)", geo)
+            if not m:
+                return False
+            w, h = int(m.group(1)), int(m.group(2))
+            return w >= 400 and h >= 300
         except Exception:
-            self.fail("대상이 없으면 조용히 무시되어야 한다")
-
-    # ── Scenario 77: 언마운트 - wait 타임아웃 시 kill ────────────────────
-    def test_scenario_77_unmount_wait_timeout_kill(self):
-        mock_proc = MagicMock()
-        mock_proc.wait.side_effect = Exception("timeout")
-        rclone_manager.active_mounts["tid"] = mock_proc
-        rclone_manager.unmount("tid")
-        mock_proc.kill.assert_called_once()
-
-    # ── Scenario 78: 중복 실행 감지 안 됨 (핸들 없음) ────────────────────
-    def test_scenario_78_activate_existing_window_none(self):
-        with patch("ctypes.windll.user32.FindWindowW", return_value=0):
-            self.assertFalse(rclone_manager.activate_existing_window())
-
-    # ── Scenario 79: 트레이 원형 아이콘 생성 ─────────────────────────────
-    def test_scenario_79_make_circle_icon(self):
-        fake_image = MagicMock()
-        fake_draw = MagicMock()
-        with patch.object(rclone_manager, "Image", create=True) as mock_image, \
-             patch.object(rclone_manager, "ImageDraw", create=True) as mock_imagedraw:
-            mock_image.new.return_value = fake_image
-            mock_imagedraw.Draw.return_value = fake_draw
-            img = rclone_manager._make_circle_icon("#ffffff", 32)
-            self.assertEqual(img, fake_image)
-            fake_draw.ellipse.assert_called_once()
-
-    # ── Scenario 80: ConfImportDialog 선택 항목만 반환 ───────────────────
-    def test_scenario_80_conf_import_dialog_ok(self):
-        dlg = rclone_manager.ConfImportDialog.__new__(rclone_manager.ConfImportDialog)
-        v1, v2 = MagicMock(), MagicMock()
-        v1.get.return_value = True
-        v2.get.return_value = False
-        dlg._vars = [(v1, {"name": "a", "type": "drive"}),
-                     (v2, {"name": "b", "type": "drive"})]
-        dlg.destroy = MagicMock()
-        dlg._ok()
-        self.assertEqual(dlg.selected, [("a", "drive")])
-
-    # ── Scenario 81: UpdateDialog._pick_asset - exe 우선 ─────────────────
-    def test_scenario_81_pick_asset_exe(self):
-        assets = [{"name": "readme.txt", "browser_download_url": "u0"},
-                  {"name": "app.exe", "browser_download_url": "u1"}]
-        url = rclone_manager.UpdateDialog._pick_asset(assets)
-        self.assertEqual(url, "u1")
-
-    # ── Scenario 82: UpdateDialog._pick_asset - 해당 없음 ────────────────
-    def test_scenario_82_pick_asset_none(self):
-        assets = [{"name": "readme.txt", "browser_download_url": "u0"}]
-        url = rclone_manager.UpdateDialog._pick_asset(assets)
-        self.assertEqual(url, "")
-
-    # ── Scenario 83: MountDialog 캐시 폴더 선택 ──────────────────────────
-    def test_scenario_83_browse_cache_selected(self):
-        dlg = self._create_mocked_dialog(None)
-        with patch("tkinter.filedialog.askdirectory", return_value="D:\\cache"):
-            dlg._browse_cache()
-            dlg._cdir.delete.assert_called_once()
-            dlg._cdir.insert.assert_called_once_with(0, "D:\\cache")
-
-    # ── Scenario 84: MountDialog 캐시 폴더 선택 취소 ─────────────────────
-    def test_scenario_84_browse_cache_cancelled(self):
-        dlg = self._create_mocked_dialog(None)
-        with patch("tkinter.filedialog.askdirectory", return_value=""):
-            dlg._browse_cache()
-            dlg._cdir.insert.assert_not_called()
-
-    # ── Scenario 85: MountDialog 연결 테스트 - rclone 미등록 ─────────────
-    def test_scenario_85_dialog_test_no_rclone(self):
-        dlg = self._create_mocked_dialog(None, cfg={"rclone_path": ""})
-        dlg._rem.get.return_value = "remote"
-        dlg._pth.get.return_value = ""
-        with patch("pathlib.Path.exists", return_value=False), \
-             patch("tkinter.messagebox.showinfo") as mock_info:
-            dlg._test()
-            mock_info.assert_called_with("알림", "rclone 경로가 등록되어 있지 않습니다.")
-
-    # ── Scenario 86: MountDialog 연결 테스트 - 성공 ──────────────────────
-    def test_scenario_86_dialog_test_success(self):
-        dlg = self._create_mocked_dialog(
-            None, cfg={"rclone_path": "C:\\fake\\rclone.exe"})
-        dlg._rem.get.return_value = "remote"
-        dlg._pth.get.return_value = ""
-        with patch("pathlib.Path.exists", return_value=True), \
-             patch("threading.Thread", self._sync_thread()), \
-             patch("subprocess.run") as mock_run, \
-             patch("tkinter.messagebox.showinfo") as mock_info:
-            mock_run.return_value = MagicMock(returncode=0)
-            dlg._test()
-            mock_info.assert_called_with("성공", "연결 확인 완료!")
-
-    # ── Scenario 87: MountDialog 연결 테스트 - 실패(연결 불가) ───────────
-    def test_scenario_87_dialog_test_failure(self):
-        dlg = self._create_mocked_dialog(
-            None, cfg={"rclone_path": "C:\\fake\\rclone.exe"})
-        dlg._rem.get.return_value = "remote"
-        dlg._pth.get.return_value = ""
-        with patch("pathlib.Path.exists", return_value=True), \
-             patch("threading.Thread", self._sync_thread()), \
-             patch("subprocess.run") as mock_run, \
-             patch("tkinter.messagebox.showinfo") as mock_info:
-            mock_run.return_value = MagicMock(returncode=1, stderr="conn refused")
-            dlg._test()
-            args = mock_info.call_args[0]
-            self.assertEqual(args[0], "연결 실패")
-
-    # ── Scenario 88: MountDialog 연결 테스트 - 예외 ──────────────────────
-    def test_scenario_88_dialog_test_exception(self):
-        dlg = self._create_mocked_dialog(
-            None, cfg={"rclone_path": "C:\\fake\\rclone.exe"})
-        dlg._rem.get.return_value = "remote"
-        dlg._pth.get.return_value = ""
-        with patch("pathlib.Path.exists", return_value=True), \
-             patch("threading.Thread", self._sync_thread()), \
-             patch("subprocess.run", side_effect=Exception("boom")), \
-             patch("tkinter.messagebox.showinfo") as mock_info:
-            dlg._test()
-            mock_info.assert_called_with("알림", "boom")
-
-    # ── Scenario 89: 창 geometry 유효성 - 정상 ───────────────────────────
-    def test_scenario_89_is_valid_geometry_true(self):
-        self.assertTrue(rclone_manager.App._is_valid_geometry("800x600+0+0"))
-
-    # ── Scenario 90: 창 geometry 유효성 - 패턴 불일치 ────────────────────
-    def test_scenario_90_is_valid_geometry_no_match(self):
-        self.assertFalse(rclone_manager.App._is_valid_geometry("invalid"))
-
-    # ── Scenario 91: 창 geometry 유효성 - 최솟값 미달 ────────────────────
-    def test_scenario_91_is_valid_geometry_too_small(self):
-        self.assertFalse(rclone_manager.App._is_valid_geometry("100x100+0+0"))
-
-    # ── Scenario 92: 창 geometry 유효성 - 예외 ───────────────────────────
-    def test_scenario_92_is_valid_geometry_exception(self):
-        with patch("re.match", side_effect=Exception("bad")):
-            self.assertFalse(rclone_manager.App._is_valid_geometry("800x600"))
-
-    # ── Scenario 93: Configure 이벤트 - 다른 위젯이면 무시 ───────────────
-    def test_scenario_93_on_configure_other_widget(self):
-        app = self._create_mocked_app()
-        event = MagicMock()
-        event.widget = MagicMock()
-        app._on_configure(event)
-        app.after.assert_not_called()
-
-    # ── Scenario 94: Configure 이벤트 - 본인 창이면 예약 ─────────────────
-    def test_scenario_94_on_configure_self_widget(self):
-        app = self._create_mocked_app()
-        event = MagicMock()
-        event.widget = app
-        app._on_configure(event)
-        app.after.assert_called()
-
-    # ── Scenario 95: 창 크기/위치 저장 ───────────────────────────────────
-    def test_scenario_95_save_geometry(self):
-        app = self._create_mocked_app()
-        with patch("rclone_manager.save_config") as mock_save:
-            app._save_geometry()
-            self.assertIn("window_geometry", app._cfg)
-            mock_save.assert_called_once()
-
-    # ── Scenario 96: 컬럼 폭 저장 - 일부 컬럼 예외는 건너뜀 ──────────────
-    def test_scenario_96_on_column_resize_partial_exception(self):
-        app = self._create_mocked_app()
-
-        def _column(col, _):
-            if col == "drive":
-                raise Exception("no such column")
-            return 100
-
-        app._tree.column.side_effect = _column
-        with patch("rclone_manager.save_config") as mock_save:
-            app._on_column_resize()
-            mock_save.assert_called_once()
-            widths = app._cfg["column_widths"]
-            self.assertNotIn("drive", widths)
-
-    # ── Scenario 96b: 컬럼 폭 저장 - remote(리모트/서브경로)도 포함 ──────
-    def test_scenario_96b_on_column_resize_includes_remote(self):
-        app = self._create_mocked_app()
-        app._tree.column.return_value = 250
-        with patch("rclone_manager.save_config"):
-            app._on_column_resize()
-            widths = app._cfg["column_widths"]
-            self.assertIn("remote", widths)
-            self.assertEqual(widths["remote"], 250)
-
-    # ── Scenario 97: rclone 레이블 초기화 - 존재함 ───────────────────────
-    def test_scenario_97_init_rc_label_found(self):
-        app = self._create_mocked_app({"rclone_path": "C:\\fake\\rclone.exe"})
-        with patch("pathlib.Path.exists", return_value=True):
-            app._init_rc_label()
-            app._rc_ver_label.config.assert_called_with(
-                text="v체크 중...", fg="#94e2d5")
-
-    # ── Scenario 98: rclone 존재 확인 - 경로 없음(초기화 스킵) ───────────
-    def test_scenario_98_check_rclone_presence_no_registered(self):
-        app = self._create_mocked_app({"rclone_path": ""})
-        with patch("pathlib.Path.exists", return_value=False), \
-             patch("rclone_manager.save_config") as mock_save:
-            app._check_rclone_presence()
-            mock_save.assert_not_called()
-            app._rc_ver_label.config.assert_called_with(
-                text="rclone 다운로드", fg="#f38ba8")
-
-    # ── Scenario 99: rclone 존재 확인 - 등록 경로 사라짐(초기화) ─────────
-    def test_scenario_99_check_rclone_presence_reset_path(self):
-        app = self._create_mocked_app({"rclone_path": "C:\\gone\\rclone.exe"})
-        with patch("pathlib.Path.exists", return_value=False), \
-             patch("rclone_manager.save_config") as mock_save:
-            app._check_rclone_presence()
-            self.assertEqual(app._cfg["rclone_path"], "")
-            mock_save.assert_called_once()
-
-    # ── Scenario 100: 포커스 이벤트 - 다른 위젯이면 무시 ─────────────────
-    def test_scenario_100_on_focus_in_other_widget(self):
-        app = self._create_mocked_app()
-        event = MagicMock()
-        event.widget = MagicMock()
-        with patch.object(app, "_check_rclone_presence") as mock_check:
-            app._on_focus_in(event)
-            mock_check.assert_not_called()
-
-    # ── Scenario 101: 버전 체크 - 이미 실행 중이면 스킵 ──────────────────
-    def test_scenario_101_check_versions_async_already_running(self):
-        app = self._create_mocked_app()
-        app._version_check_running = True
-        with patch("threading.Thread") as mock_thread:
-            app._check_versions_async()
-            mock_thread.assert_not_called()
-            # force=False로 호출했으므로 예약(pending)도 설정되지 않아야 한다
-            self.assertFalse(app._pending_force_check)
-
-    # ── Scenario 101b: 버전 체크 - 실행 중에 force 요청 시 예약만 하고
-    #                  새 스레드는 만들지 않는다(경쟁 상태 방지) ─────────
-    def test_scenario_101b_check_versions_async_running_force_sets_pending(self):
-        app = self._create_mocked_app()
-        app._version_check_running = True
-        with patch("threading.Thread") as mock_thread:
-            app._check_versions_async(force=True)
-            # 이미 실행 중이면 새 스레드를 만들지 않고 예약만 한다
-            mock_thread.assert_not_called()
-            self.assertTrue(app._pending_force_check)
-
-    # ── Scenario 101c: 버전 체크 완료 후 예약된 force 요청을 자동 실행 ───
-    def test_scenario_101c_check_versions_async_runs_pending_after_finish(self):
-        app = self._create_mocked_app({"rclone_path": "C:\\fake\\rclone.exe"})
-        app._pending_force_check = True
-        with patch("threading.Thread", self._sync_thread()), \
-             patch("pathlib.Path.exists", return_value=True), \
-             patch("subprocess.run") as mock_run, \
-             patch("requests.get") as mock_get, \
-             patch("rclone_manager.save_config"), \
-             patch.object(app, "_check_versions_async",
-                          wraps=app._check_versions_async) as wrapped:
-            mock_run.return_value = MagicMock(stdout="rclone v1.70.0")
-            resp = MagicMock()
-            resp.json.return_value = {"tag_name": "v1.70.0"}
-            mock_get.return_value = resp
-            wrapped(force=False)
-            # 체크가 끝난 뒤 예약돼 있던 force 체크가 자동으로 한 번 더 실행되어
-            # 총 2회(원래 호출 + 예약 실행) 호출되어야 한다
-            self.assertGreaterEqual(wrapped.call_count, 2)
-            self.assertFalse(app._pending_force_check)
-
-    # ── Scenario 102: 버전 체크 - force=True, 앱 업데이트 있음 ───────────
-    def test_scenario_102_check_versions_async_force_update_available(self):
-        app = self._create_mocked_app({"rclone_path": "C:\\fake\\rclone.exe"})
-        with patch("threading.Thread", self._sync_thread()), \
-             patch("pathlib.Path.exists", return_value=True), \
-             patch("subprocess.run") as mock_run, \
-             patch("requests.get") as mock_get, \
-             patch("rclone_manager.save_config"):
-            mock_run.return_value = MagicMock(stdout="rclone v1.70.0")
-            rclone_resp = MagicMock()
-            rclone_resp.json.return_value = {"tag_name": "v1.75.0"}
-            app_resp = MagicMock()
-            app_resp.json.return_value = {"tag_name": "v9.9.9", "body": "note",
-                                           "assets": []}
-            mock_get.side_effect = [rclone_resp, app_resp]
-            app._check_versions_async(force=True)
-            app.after.assert_any_call(0, app._show_app_update_btn)
-
-    # ── Scenario 103: 버전 체크 - 앱 최신 버전 아님(숨김) ────────────────
-    def test_scenario_103_check_versions_async_app_up_to_date(self):
-        app = self._create_mocked_app({"rclone_path": "C:\\fake\\rclone.exe"})
-        with patch("threading.Thread", self._sync_thread()), \
-             patch("pathlib.Path.exists", return_value=True), \
-             patch("subprocess.run") as mock_run, \
-             patch("requests.get") as mock_get, \
-             patch("rclone_manager.save_config"):
-            mock_run.return_value = MagicMock(stdout="rclone v1.70.0")
-            rclone_resp = MagicMock()
-            rclone_resp.json.return_value = {"tag_name": "v1.70.0"}
-            app_resp = MagicMock()
-            app_resp.json.return_value = {"tag_name": "v0.0.1", "body": "", "assets": []}
-            mock_get.side_effect = [rclone_resp, app_resp]
-            app._check_versions_async(force=True)
-            app.after.assert_any_call(0, app._hide_app_update_btn)
-
-    # ── Scenario 104: 버전 체크 - rclone API 실패 시 이전 값 재사용 ──────
-    def test_scenario_104_check_versions_async_rclone_api_failure(self):
-        app = self._create_mocked_app({"rclone_path": "C:\\fake\\rclone.exe"})
-        app._latest_rc = "1.70.0"
-        with patch("threading.Thread", self._sync_thread()), \
-             patch("pathlib.Path.exists", return_value=True), \
-             patch("subprocess.run") as mock_run, \
-             patch("requests.get") as mock_get, \
-             patch("rclone_manager.save_config"), \
-             patch("rclone_manager.write_log") as mock_log:
-            mock_run.return_value = MagicMock(stdout="rclone v1.70.0")
-            app_resp = MagicMock()
-            app_resp.json.return_value = {"tag_name": "v0.0.1", "body": "", "assets": []}
-            mock_get.side_effect = [Exception("network fail"), app_resp]
-            app._check_versions_async(force=True)
-            mock_log.assert_any_call(
-                "WARN", "[버전] rclone GitHub API 호출 실패: network fail")
-
-    # ── Scenario 105: 버전 체크 - 앱 API 실패해도 계속 진행 ──────────────
-    def test_scenario_105_check_versions_async_app_api_failure(self):
-        app = self._create_mocked_app({"rclone_path": "C:\\fake\\rclone.exe"})
-        with patch("threading.Thread", self._sync_thread()), \
-             patch("pathlib.Path.exists", return_value=True), \
-             patch("subprocess.run") as mock_run, \
-             patch("requests.get") as mock_get, \
-             patch("rclone_manager.save_config"):
-            mock_run.return_value = MagicMock(stdout="rclone v1.70.0")
-            rclone_resp = MagicMock()
-            rclone_resp.json.return_value = {"tag_name": "v1.70.0"}
-            mock_get.side_effect = [rclone_resp, Exception("app api down")]
-            app._check_versions_async(force=True)
-
-    # ── Scenario 106: 버전 체크 - rclone 미등록(다운로드 표시) ───────────
-    def test_scenario_106_check_versions_async_no_rclone(self):
-        app = self._create_mocked_app({"rclone_path": ""})
-        with patch("threading.Thread", self._sync_thread()), \
-             patch("pathlib.Path.exists", return_value=False), \
-             patch("requests.get") as mock_get, \
-             patch("rclone_manager.save_config"):
-            resp = MagicMock()
-            resp.json.return_value = {"tag_name": "v1.0.0", "body": "", "assets": []}
-            mock_get.return_value = resp
-            app._check_versions_async(force=True)
-            app.after.assert_any_call(0, mock.ANY)
-
-    # ── Scenario 107: 버전 체크 - 로컬 버전 매칭 실패 ────────────────────
-    def test_scenario_107_check_versions_async_local_version_unmatched(self):
-        app = self._create_mocked_app({"rclone_path": "C:\\fake\\rclone.exe"})
-        with patch("threading.Thread", self._sync_thread()), \
-             patch("pathlib.Path.exists", return_value=True), \
-             patch("subprocess.run") as mock_run, \
-             patch("requests.get") as mock_get, \
-             patch("rclone_manager.save_config"):
-            mock_run.return_value = MagicMock(stdout="no version info here")
-            resp = MagicMock()
-            resp.json.return_value = {"tag_name": "v1.0.0", "body": "", "assets": []}
-            mock_get.return_value = resp
-            app._check_versions_async(force=True)
-            self.assertTrue(app.after.called)
-
-    # ── Scenario 108: 버전 체크 - rclone version 실행 예외 ───────────────
-    def test_scenario_108_check_versions_async_subprocess_exception(self):
-        app = self._create_mocked_app({"rclone_path": "C:\\fake\\rclone.exe"})
-        with patch("threading.Thread", self._sync_thread()), \
-             patch("pathlib.Path.exists", return_value=True), \
-             patch("subprocess.run", side_effect=Exception("crash")), \
-             patch("requests.get") as mock_get, \
-             patch("rclone_manager.save_config"), \
-             patch("rclone_manager.write_log") as mock_log:
-            resp = MagicMock()
-            resp.json.return_value = {"tag_name": "v1.0.0", "body": "", "assets": []}
-            mock_get.return_value = resp
-            app._check_versions_async(force=True)
-            mock_log.assert_any_call("ERROR", mock.ANY)
-
-    # ── Scenario 109: 버전 체크 - skip_app_api(24h 이내) 캐시된 정보 사용 ─
-    def test_scenario_109_check_versions_async_skip_app_api(self):
-        import time as _time_mod
-        app = self._create_mocked_app({"rclone_path": "C:\\fake\\rclone.exe"})
-        app._cfg["last_version_check"] = _time_mod.time()
-        app._latest_app_info = {"tag_name": "v9.9.9"}
-        with patch("threading.Thread", self._sync_thread()), \
-             patch("pathlib.Path.exists", return_value=True), \
-             patch("subprocess.run") as mock_run, \
-             patch("requests.get") as mock_get, \
-             patch("rclone_manager.save_config"):
-            mock_run.return_value = MagicMock(stdout="rclone v1.70.0")
-            resp = MagicMock()
-            resp.json.return_value = {"tag_name": "v1.75.0"}
-            mock_get.return_value = resp
-            app._check_versions_async(force=False)
-            app.after.assert_any_call(0, app._show_app_update_btn)
-            self.assertEqual(mock_get.call_count, 1)
-
-    # ── Scenario 110: 앱 업데이트 버튼 표시 - 이미 표시됨(중복 방지) ─────
-    def test_scenario_110_show_app_update_btn_already_mapped(self):
-        app = self._create_mocked_app()
-        app._app_up_btn.winfo_ismapped.return_value = True
-        app._show_app_update_btn()
-        app._app_up_btn.pack.assert_not_called()
-
-    # ── Scenario 111: 앱 업데이트 버튼 표시 - 미표시 상태에서 표시 ───────
-    def test_scenario_111_show_app_update_btn_not_mapped(self):
-        app = self._create_mocked_app()
-        app._app_up_btn.winfo_ismapped.return_value = False
-        app._show_app_update_btn()
-        app._app_up_btn.pack.assert_called_once_with(side="right")
-
-    # ── Scenario 112: 앱 업데이트 버튼 숨김 - 표시 상태에서 숨김 ─────────
-    def test_scenario_112_hide_app_update_btn_mapped(self):
-        app = self._create_mocked_app()
-        app._app_up_btn.winfo_ismapped.return_value = True
-        app._hide_app_update_btn()
-        app._app_up_btn.pack_forget.assert_called_once()
-
-    # ── Scenario 113: 앱 업데이트 확인 - 최신 정보 없으면 무시 ───────────
-    def test_scenario_113_show_app_update_confirm_no_info(self):
-        app = self._create_mocked_app()
-        app._latest_app_info = None
-        with patch("rclone_manager.UpdateDialog") as mock_dlg_cls:
-            app._show_app_update_confirm()
-            mock_dlg_cls.assert_not_called()
-
-    # ── Scenario 114: 앱 업데이트 확인 - 취소 시 다운로드 안 함 ──────────
-    def test_scenario_114_show_app_update_confirm_cancelled(self):
-        app = self._create_mocked_app()
-        app._latest_app_info = {"tag_name": "v9.9.9", "body": "note", "assets": []}
-        with patch("rclone_manager.UpdateDialog") as mock_dlg_cls, \
-             patch("threading.Thread") as mock_thread:
-            mock_dlg = MagicMock()
-            mock_dlg.confirmed = False
-            mock_dlg_cls.return_value = mock_dlg
-            app._show_app_update_confirm()
-            mock_thread.assert_not_called()
-
-    # ── Scenario 115: 앱 업데이트 확인 - asset 없으면 브라우저 오픈 ──────
-    def test_scenario_115_show_app_update_confirm_no_asset(self):
-        app = self._create_mocked_app()
-        app._latest_app_info = {"tag_name": "v9.9.9", "body": "note", "assets": []}
-        with patch("rclone_manager.UpdateDialog") as mock_dlg_cls, \
-             patch("webbrowser.open") as mock_open:
-            mock_dlg = MagicMock()
-            mock_dlg.confirmed = True
-            mock_dlg._asset_url = ""
-            mock_dlg_cls.return_value = mock_dlg
-            app._show_app_update_confirm()
-            mock_open.assert_called_once()
-
-    # ── Scenario 116: 앱 업데이트 확인 - 다운로드 성공(수동 교체 안내) ───
-    def test_scenario_116_show_app_update_confirm_manual_success(self):
-        app = self._create_mocked_app()
-        app._latest_app_info = {"tag_name": "v9.9.9", "body": "note", "assets": []}
-        with patch("rclone_manager.UpdateDialog") as mock_dlg_cls, \
-             patch("threading.Thread", self._sync_thread()), \
-             patch("rclone_manager.download_app_release", return_value="manual"), \
-             patch("tkinter.messagebox.showinfo") as mock_info, \
-             patch("rclone_manager.write_log"):
-            mock_dlg = MagicMock()
-            mock_dlg.confirmed = True
-            mock_dlg._asset_url = "https://example.com/app.zip"
-            mock_dlg_cls.return_value = mock_dlg
-            app._show_app_update_confirm()
-            mock_info.assert_called_once()
-
-    # ── Scenario 117: 앱 업데이트 확인 - 다운로드 실패 ───────────────────
-    def test_scenario_117_show_app_update_confirm_download_error(self):
-        app = self._create_mocked_app()
-        app._latest_app_info = {"tag_name": "v9.9.9", "body": "note", "assets": []}
-        with patch("rclone_manager.UpdateDialog") as mock_dlg_cls, \
-             patch("threading.Thread", self._sync_thread()), \
-             patch("rclone_manager.download_app_release", return_value="failed"), \
-             patch("tkinter.messagebox.showinfo") as mock_info, \
-             patch("rclone_manager.write_log"):
-            mock_dlg = MagicMock()
-            mock_dlg.confirmed = True
-            mock_dlg._asset_url = "https://example.com/app.zip"
-            mock_dlg_cls.return_value = mock_dlg
-            app._show_app_update_confirm()
-            mock_info.assert_called_with("알림", "failed")
-
-    # ── Scenario 118: 업데이트 폴더 버튼 설정 ────────────────────────────
-    def test_scenario_118_set_update_downloaded_btn(self):
-        app = self._create_mocked_app()
-        app._set_update_downloaded_btn(Path("C:\\out"))
-        self.assertEqual(app._update_folder, Path("C:\\out"))
-        app._app_up_btn.config.assert_called_once()
-
-    # ── Scenario 119: 업데이트 폴더 열기 - 지정된 폴더 ───────────────────
-    def test_scenario_119_open_update_folder_with_folder(self):
-        app = self._create_mocked_app()
-        app._update_folder = Path("C:\\out")
-        with patch("subprocess.Popen") as mock_popen:
-            app._open_update_folder()
-            mock_popen.assert_called_once()
-
-    # ── Scenario 120: 업데이트 폴더 열기 - 기본값(APP_DIR) ───────────────
-    def test_scenario_120_open_update_folder_default(self):
-        app = self._create_mocked_app()
-        with patch("subprocess.Popen") as mock_popen:
-            app._open_update_folder()
-            mock_popen.assert_called_once()
-
-    # ── Scenario 121: rclone 클릭 - 다운로드, 최신 버전 미확인 ───────────
-    def test_scenario_121_handle_rc_click_download_no_latest(self):
-        app = self._create_mocked_app()
-        app._rc_ver_label.cget.return_value = "rclone 다운로드"
-        app._latest_rc = ""
-        with patch("tkinter.messagebox.showinfo") as mock_info:
-            app._handle_rc_click(MagicMock())
-            mock_info.assert_called_once()
-
-    # ── Scenario 122: rclone 클릭 - 다운로드 동의 ────────────────────────
-    def test_scenario_122_handle_rc_click_download_confirmed(self):
-        app = self._create_mocked_app()
-        app._rc_ver_label.cget.return_value = "rclone 다운로드"
-        app._latest_rc = "1.70.0"
-        with patch("tkinter.messagebox.askyesno", return_value=True), \
-             patch.object(app, "_do_rc_down") as mock_down, \
-             patch("threading.Thread", self._sync_thread()):
-            app._handle_rc_click(MagicMock())
-            mock_down.assert_called_once()
-
-    # ── Scenario 123: rclone 클릭 - 다운로드 거절 ────────────────────────
-    def test_scenario_123_handle_rc_click_download_declined(self):
-        app = self._create_mocked_app()
-        app._rc_ver_label.cget.return_value = "rclone 다운로드"
-        app._latest_rc = "1.70.0"
-        with patch("tkinter.messagebox.askyesno", return_value=False), \
-             patch.object(app, "_do_rc_down") as mock_down, \
-             patch("threading.Thread", self._sync_thread()):
-            app._handle_rc_click(MagicMock())
-            mock_down.assert_not_called()
-
-    # ── Scenario 124: rclone 클릭 - 업데이트, 최신버전 미확인시 무시 ─────
-    def test_scenario_124_handle_rc_click_update_no_latest(self):
-        app = self._create_mocked_app()
-        app._rc_ver_label.cget.return_value = "v1.0.0 / v1.1.0 업데이트"
-        app._latest_rc = ""
-        with patch.object(app, "_do_rc_down") as mock_down, \
-             patch("threading.Thread", self._sync_thread()):
-            app._handle_rc_click(MagicMock())
-            mock_down.assert_not_called()
-
-    # ── Scenario 125: rclone 클릭 - 업데이트, 마운트 중이면 경고 후 거절 ─
-    def test_scenario_125_handle_rc_click_update_mounted_declined(self):
-        app = self._create_mocked_app()
-        app._rc_ver_label.cget.return_value = "v1.0.0 / v1.1.0 업데이트"
-        app._latest_rc = "1.1.0"
-        app._cfg["mounts"] = [{"id": "m1", "drive": "X:", "remote": "r"}]
-        rclone_manager.active_mounts["m1"] = MagicMock()
-        with patch("tkinter.messagebox.askyesno", return_value=False), \
-             patch.object(app, "_do_rc_down") as mock_down, \
-             patch("threading.Thread", self._sync_thread()):
-            app._handle_rc_click(MagicMock())
-            mock_down.assert_not_called()
-
-    # ── Scenario 126: rclone 클릭 - 업데이트, 마운트 없으면 바로 진행 ────
-    def test_scenario_126_handle_rc_click_update_no_mounts(self):
-        app = self._create_mocked_app()
-        app._rc_ver_label.cget.return_value = "v1.0.0 / v1.1.0 업데이트"
-        app._latest_rc = "1.1.0"
-        app._cfg["mounts"] = []
-        with patch.object(app, "_do_rc_down") as mock_down, \
-             patch("threading.Thread", self._sync_thread()):
-            app._handle_rc_click(MagicMock())
-            mock_down.assert_called_once()
-
-    # ── Scenario 127: rclone 업데이트 실행 - 성공(재마운트 포함) ─────────
-    def test_scenario_127_do_rc_down_success_with_remount(self):
-        app = self._create_mocked_app({"rclone_path": "C:\\fake\\rclone.exe"})
-        app._latest_rc = "1.70.0"
-        app._cfg["mounts"] = [{"id": "m1", "drive": "X:", "remote": "r",
-                                "remote_path": ""}]
-        rclone_manager.active_mounts["m1"] = MagicMock()
-        with patch("rclone_manager.download_rclone", return_value=True), \
-             patch("rclone_manager.save_config"), \
-             patch("rclone_manager.unmount") as mock_unmount, \
-             patch("tkinter.messagebox.showinfo"), \
-             patch.object(app, "_check_versions_async"), \
-             patch.object(app, "_do_mount") as mock_do_mount:
-            app._do_rc_down()
-            mock_unmount.assert_called_once_with("m1")
-            self.assertTrue(app.after.called)
-
-    # ── Scenario 128: rclone 업데이트 실행 - 수동 교체 필요 ──────────────
-    def test_scenario_128_do_rc_down_manual(self):
-        app = self._create_mocked_app({"rclone_path": "C:\\fake\\rclone.exe"})
-        app._latest_rc = "1.70.0"
-        app._cfg["mounts"] = []
-        with patch("rclone_manager.download_rclone", return_value="manual"), \
-             patch("tkinter.messagebox.showinfo") as mock_info:
-            app._do_rc_down()
-            self.assertTrue(app.after.called)
-            mock_info.assert_called_once()
-
-    # ── Scenario 129: rclone 업데이트 실행 - 오류 ────────────────────────
-    def test_scenario_129_do_rc_down_error(self):
-        app = self._create_mocked_app({"rclone_path": "C:\\fake\\rclone.exe"})
-        app._latest_rc = "1.70.0"
-        app._cfg["mounts"] = []
-        with patch("rclone_manager.download_rclone", return_value="some error"), \
-             patch("tkinter.messagebox.showinfo") as mock_info:
-            app._do_rc_down()
-            mock_info.assert_called_with("알림", "some error")
-
-    # ── Scenario 130: 트레이 시작 - 사용 불가 환경 ───────────────────────
-    def test_scenario_130_start_tray_unavailable(self):
-        app = self._create_mocked_app()
-        with patch("rclone_manager._TRAY_AVAILABLE", False):
-            app._start_tray()
-
-    # ── Scenario 131: 트레이 시작 - 예외 발생 시 None 처리 ───────────────
-    def test_scenario_131_start_tray_exception(self):
-        app = self._create_mocked_app()
-        with patch("rclone_manager._TRAY_AVAILABLE", True), \
-             patch("rclone_manager._make_circle_icon", side_effect=Exception("x")), \
-             patch("rclone_manager.write_log") as mock_log:
-            app._start_tray()
-            self.assertIsNone(app._tray)
-            mock_log.assert_called()
-
-    # ── Scenario 132: 트레이 메뉴 - 사용 불가 환경 ───────────────────────
-    def test_scenario_132_build_tray_menu_unavailable(self):
-        app = self._create_mocked_app()
-        with patch("rclone_manager._TRAY_AVAILABLE", False):
-            self.assertIsNone(app._build_tray_menu())
-
-    # ── Scenario 133: 트레이 메뉴 - 마운트 없음 ──────────────────────────
-    def test_scenario_133_build_tray_menu_no_mounts(self):
-        app = self._create_mocked_app()
-        app._cfg["mounts"] = []
-        with patch("rclone_manager._TRAY_AVAILABLE", True), \
-             patch("rclone_manager.pystray", create=True) as mock_pystray:
-            mock_pystray.Menu.SEPARATOR = "SEP"
-            mock_pystray.MenuItem = MagicMock(side_effect=lambda *a, **k: (a, k))
-            mock_pystray.Menu = MagicMock(side_effect=lambda *a: a)
-            app._build_tray_menu()
-            calls = [c for c in mock_pystray.MenuItem.call_args_list
-                     if c[0][0] == "(등록된 마운트 없음)"]
-            self.assertEqual(len(calls), 1)
-
-    # ── Scenario 134: 트레이 메뉴 - 마운트 중 항목 토글(언마운트) ────────
-    def test_scenario_134_build_tray_menu_toggle_unmount(self):
-        app = self._create_mocked_app()
-        app._cfg["mounts"] = [{"id": "m1", "drive": "X:", "remote": "r",
-                                "remote_path": ""}]
-        app._status["m1"] = "mounted"
-        with patch("rclone_manager._TRAY_AVAILABLE", True), \
-             patch("rclone_manager.pystray", create=True) as mock_pystray, \
-             patch("rclone_manager.unmount") as mock_unmount:
-            mock_pystray.Menu.SEPARATOR = "SEP"
-            captured = {}
-
-            def _menu_item(display, callback, **kw):
-                captured.setdefault("items", []).append((display, callback))
-                return (display, callback)
-
-            mock_pystray.MenuItem = MagicMock(side_effect=_menu_item)
-            mock_pystray.Menu = MagicMock(side_effect=lambda *a: a)
-            app._build_tray_menu()
-            toggle_cb = [cb for disp, cb in captured["items"] if "X:" in disp][0]
-            toggle_cb(None, None)
-            mock_unmount.assert_called_once_with("m1")
-
-    # ── Scenario 135: 트레이 메뉴 - 중지 상태 항목 토글(마운트) ──────────
-    def test_scenario_135_build_tray_menu_toggle_mount(self):
-        app = self._create_mocked_app()
-        app._cfg["mounts"] = [{"id": "m1", "drive": "X:", "remote": "r",
-                                "remote_path": ""}]
-        with patch("rclone_manager._TRAY_AVAILABLE", True), \
-             patch("rclone_manager.pystray", create=True) as mock_pystray:
-            mock_pystray.Menu.SEPARATOR = "SEP"
-            captured = {}
-
-            def _menu_item(display, callback, **kw):
-                captured.setdefault("items", []).append((display, callback))
-                return (display, callback)
-
-            mock_pystray.MenuItem = MagicMock(side_effect=_menu_item)
-            mock_pystray.Menu = MagicMock(side_effect=lambda *a: a)
-            app._build_tray_menu()
-            toggle_cb = [cb for disp, cb in captured["items"] if "X:" in disp][0]
-            with patch("tkinter.messagebox.showinfo"):
-                toggle_cb(None, None)
-            self.assertTrue(app.after.called)
-
-    # ── Scenario 136: 목록 갱신 - 트레이 갱신 예외 무시 ──────────────────
-    def test_scenario_136_refresh_list_tray_exception(self):
-        app = self._create_mocked_app()
-        app._cfg["remotes"] = [{"name": "r1", "type": "drive"}]
-        app._cfg["mounts"] = [{"id": "m1", "remote": "r1", "remote_path": "",
-                                "drive": "X:"}]
-        app._tray.update_menu.side_effect = Exception("tray gone")
-        with patch("rclone_manager.write_log") as mock_log:
-            app._refresh_list()
-            mock_log.assert_any_call("WARN", mock.ANY)
-
-    # ── Scenario 137: 시작프로그램 토글 ───────────────────────────────────
-    def test_scenario_137_toggle_st(self):
-        app = self._create_mocked_app()
-        app._st_var.get.return_value = True
-        with patch("rclone_manager.set_startup") as mock_set:
-            app._toggle_st()
-            mock_set.assert_called_once_with(True)
-
-    # ── Scenario 138: 트레이 최소화 옵션 토글 ────────────────────────────
-    def test_scenario_138_toggle_min(self):
-        app = self._create_mocked_app()
-        app._min_var.get.return_value = True
-        with patch("rclone_manager.save_config") as mock_save:
-            app._toggle_min()
-            self.assertTrue(app._cfg["start_minimized"])
-            mock_save.assert_called_once()
-
-    # ── Scenario 139: 마운트 삭제 - 거절 시 삭제 안 함 ───────────────────
-    def test_scenario_139_delete_mount_declined(self):
-        app = self._create_mocked_app()
-        app._cfg["mounts"] = [{"id": "m1", "remote": "r"}]
-        with patch("tkinter.messagebox.askyesno", return_value=False), \
-             patch("rclone_manager.save_config") as mock_save:
-            app._delete_mount("m1")
-            self.assertEqual(len(app._cfg["mounts"]), 1)
-            mock_save.assert_not_called()
-
-    # ── Scenario 140: rclone 경로 찾아보기 - 선택함 ──────────────────────
-    def test_scenario_140_browse_rc_selected(self):
-        app = self._create_mocked_app()
-        with patch("tkinter.filedialog.askopenfilename",
-                   return_value="C:\\new\\rclone.exe"), \
-             patch("rclone_manager.save_config") as mock_save, \
-             patch.object(app, "_check_rclone_presence") as mock_check:
-            app._browse_rc()
-            self.assertEqual(app._cfg["rclone_path"], "C:\\new\\rclone.exe")
-            mock_save.assert_called_once()
-            mock_check.assert_called_once()
-
-    # ── Scenario 141: rclone 경로 찾아보기 - 취소함 ──────────────────────
-    def test_scenario_141_browse_rc_cancelled(self):
-        app = self._create_mocked_app()
-        prev = app._cfg.get("rclone_path", "")
-        with patch("tkinter.filedialog.askopenfilename", return_value=""), \
-             patch("rclone_manager.save_config") as mock_save:
-            app._browse_rc()
-            mock_save.assert_not_called()
-            self.assertEqual(app._cfg.get("rclone_path", ""), prev)
-
-    # ── Scenario 142: conf 가져오기 - 경로 선택 취소 ─────────────────────
-    def test_scenario_142_import_conf_cancelled(self):
-        app = self._create_mocked_app()
-        with patch("rclone_manager.find_default_rclone_conf", return_value=None), \
-             patch("tkinter.filedialog.askopenfilename", return_value=""):
-            app._import_conf()
-
-    # ── Scenario 143: conf 가져오기 - 신규 리모트만 추가(중복 제외) ──────
-    def test_scenario_143_import_conf_adds_new_only(self):
-        app = self._create_mocked_app()
-        app._cfg["remotes"] = [{"name": "existing", "type": "drive"}]
-        with patch("rclone_manager.find_default_rclone_conf",
-                   return_value=Path("C:\\rclone.conf")), \
-             patch("tkinter.filedialog.askopenfilename",
-                   return_value="C:\\rclone.conf"), \
-             patch("rclone_manager.parse_rclone_conf", return_value=[]), \
-             patch("rclone_manager.ConfImportDialog") as mock_dlg_cls, \
-             patch("rclone_manager.save_config") as mock_save:
-            mock_dlg = MagicMock()
-            mock_dlg.selected = [("existing", "drive"), ("newone", "drive")]
-            mock_dlg_cls.return_value = mock_dlg
-            app._import_conf()
-            names = [r["name"] for r in app._cfg["remotes"]]
-            self.assertEqual(names.count("existing"), 1)
-            self.assertIn("newone", names)
-            mock_save.assert_called_once()
-
-    # ── Scenario 144: 마운트 추가 - 원본 선택 상태에서 사전 채움 ─────────
-    def test_scenario_144_add_prefill_from_remote_selection(self):
-        app = self._create_mocked_app()
-        app._tree.selection.return_value = ["remote_gds"]
-        with patch("rclone_manager.MountDialog") as mock_dlg_cls, \
-             patch("rclone_manager.save_config"):
-            mock_dlg = MagicMock()
-            mock_dlg.result = None
-            mock_dlg_cls.return_value = mock_dlg
-            app._add()
-            args, kwargs = mock_dlg_cls.call_args
-            mount_arg = kwargs.get("mount") if "mount" in kwargs else args[1]
-            self.assertEqual(mount_arg["remote"], "gds")
-
-    # ── Scenario 145: 마운트 추가 - 결과 없음(취소) ──────────────────────
-    def test_scenario_145_add_cancelled(self):
-        app = self._create_mocked_app()
-        app._tree.selection.return_value = []
-        before = len(app._cfg["mounts"])
-        with patch("rclone_manager.MountDialog") as mock_dlg_cls, \
-             patch("rclone_manager.save_config") as mock_save:
-            mock_dlg = MagicMock()
-            mock_dlg.result = None
-            mock_dlg_cls.return_value = mock_dlg
-            app._add()
-            self.assertEqual(len(app._cfg["mounts"]), before)
-            mock_save.assert_not_called()
-
-    # ── Scenario 146: 마운트 편집 - 선택 없음(무시) ──────────────────────
-    def test_scenario_146_edit_no_selection(self):
-        app = self._create_mocked_app()
-        app._tree.selection.return_value = []
-        with patch("rclone_manager.MountDialog") as mock_dlg_cls:
-            app._edit()
-            mock_dlg_cls.assert_not_called()
-
-    # ── Scenario 147: 마운트 편집 - 원본 선택시 무시 ─────────────────────
-    def test_scenario_147_edit_remote_selection_ignored(self):
-        app = self._create_mocked_app()
-        app._tree.selection.return_value = ["remote_gds"]
-        with patch("rclone_manager.MountDialog") as mock_dlg_cls:
-            app._edit()
-            mock_dlg_cls.assert_not_called()
-
-    # ── Scenario 148: 마운트 편집 - 결과 반영 ────────────────────────────
-    def test_scenario_148_edit_applies_result(self):
-        app = self._create_mocked_app()
-        app._cfg["mounts"] = [{"id": "m1", "remote": "old"}]
-        app._tree.selection.return_value = ["m1"]
-        with patch("rclone_manager.MountDialog") as mock_dlg_cls, \
-             patch("rclone_manager.save_config") as mock_save:
-            mock_dlg = MagicMock()
-            mock_dlg.result = {"remote": "new"}
-            mock_dlg_cls.return_value = mock_dlg
-            app._edit()
-            self.assertEqual(app._cfg["mounts"][0]["remote"], "new")
-            mock_save.assert_called_once()
-
-    # ── Scenario 149: 삭제 - 선택 없음 ───────────────────────────────────
-    def test_scenario_149_del_no_selection(self):
-        app = self._create_mocked_app()
-        app._tree.selection.return_value = []
-        with patch("rclone_manager.save_config") as mock_save:
-            app._del()
-            mock_save.assert_not_called()
-
-    # ── Scenario 150: 삭제 - 원본 삭제 동의 ──────────────────────────────
-    def test_scenario_150_del_remote_confirmed(self):
-        app = self._create_mocked_app()
-        app._cfg["remotes"] = [{"name": "gds", "type": "drive"}]
-        app._tree.selection.return_value = ["remote_gds"]
-        with patch("tkinter.messagebox.askyesno", return_value=True), \
-             patch("rclone_manager.save_config") as mock_save:
-            app._del()
-            self.assertEqual(len(app._cfg["remotes"]), 0)
-            mock_save.assert_called_once()
-
-    # ── Scenario 151: 삭제 - 원본 삭제 거절 ──────────────────────────────
-    def test_scenario_151_del_remote_declined(self):
-        app = self._create_mocked_app()
-        app._cfg["remotes"] = [{"name": "gds", "type": "drive"}]
-        app._tree.selection.return_value = ["remote_gds"]
-        with patch("tkinter.messagebox.askyesno", return_value=False), \
-             patch("rclone_manager.save_config") as mock_save:
-            app._del()
-            self.assertEqual(len(app._cfg["remotes"]), 1)
-            mock_save.assert_not_called()
-
-    # ── Scenario 152: 삭제 - 마운트 항목은 _delete_mount로 위임 ──────────
-    def test_scenario_152_del_mount_delegates(self):
-        app = self._create_mocked_app()
-        app._tree.selection.return_value = ["m1"]
-        with patch.object(app, "_delete_mount") as mock_del:
-            app._del()
-            mock_del.assert_called_once_with("m1")
-
-    # ── Scenario 153: 위로 이동 - 원본, 경계(맨 위)라 이동 없음 ──────────
-    def test_scenario_153_move_up_remote_boundary(self):
-        app = self._create_mocked_app()
-        app._cfg["remotes"] = [{"name": "a", "type": "drive"},
-                                {"name": "b", "type": "drive"}]
-        app._tree.selection.return_value = ["remote_a"]
-        with patch("rclone_manager.save_config") as mock_save:
-            app._move_up()
-            mock_save.assert_not_called()
-            self.assertEqual(app._cfg["remotes"][0]["name"], "a")
-
-    # ── Scenario 154: 위로 이동 - 원본, 스왑 발생 ────────────────────────
-    def test_scenario_154_move_up_remote_swap(self):
-        app = self._create_mocked_app()
-        app._cfg["remotes"] = [{"name": "a", "type": "drive"},
-                                {"name": "b", "type": "drive"}]
-        app._tree.selection.return_value = ["remote_b"]
-        with patch("rclone_manager.save_config") as mock_save:
-            app._move_up()
-            self.assertEqual(app._cfg["remotes"][0]["name"], "b")
-            mock_save.assert_called_once()
-
-    # ── Scenario 155: 위로 이동 - 마운트, 맨 위라 이동 없음 ──────────────
-    def test_scenario_155_move_up_mount_boundary(self):
-        app = self._create_mocked_app()
-        app._cfg["mounts"] = [{"id": "m1", "remote": "r1", "remote_path": "",
-                                "drive": "X:"},
-                               {"id": "m2", "remote": "r2", "remote_path": "",
-                                "drive": "Y:"}]
-        app._tree.selection.return_value = ["m1"]
-        with patch("rclone_manager.save_config") as mock_save:
-            app._move_up()
-            mock_save.assert_not_called()
-
-    # ── Scenario 156: 위로 이동 - 마운트, 스왑 발생 ──────────────────────
-    def test_scenario_156_move_up_mount_swap(self):
-        app = self._create_mocked_app()
-        app._cfg["mounts"] = [{"id": "m1", "remote": "r1", "remote_path": "",
-                                "drive": "X:"},
-                               {"id": "m2", "remote": "r2", "remote_path": "",
-                                "drive": "Y:"}]
-        app._tree.selection.return_value = ["m2"]
-        with patch("rclone_manager.save_config") as mock_save:
-            app._move_up()
-            self.assertEqual(app._cfg["mounts"][0]["id"], "m2")
-            mock_save.assert_called_once()
-
-    # ── Scenario 157: 아래로 이동 - 원본, 맨 아래라 이동 없음 ────────────
-    def test_scenario_157_move_down_remote_boundary(self):
-        app = self._create_mocked_app()
-        app._cfg["remotes"] = [{"name": "a", "type": "drive"},
-                                {"name": "b", "type": "drive"}]
-        app._tree.selection.return_value = ["remote_b"]
-        with patch("rclone_manager.save_config") as mock_save:
-            app._move_down()
-            mock_save.assert_not_called()
-
-    # ── Scenario 158: 아래로 이동 - 원본, 스왑 발생 ──────────────────────
-    def test_scenario_158_move_down_remote_swap(self):
-        app = self._create_mocked_app()
-        app._cfg["remotes"] = [{"name": "a", "type": "drive"},
-                                {"name": "b", "type": "drive"}]
-        app._tree.selection.return_value = ["remote_a"]
-        with patch("rclone_manager.save_config") as mock_save:
-            app._move_down()
-            self.assertEqual(app._cfg["remotes"][1]["name"], "a")
-            mock_save.assert_called_once()
-
-    # ── Scenario 159: 아래로 이동 - 마운트, 맨 아래라 이동 없음 ──────────
-    def test_scenario_159_move_down_mount_boundary(self):
-        app = self._create_mocked_app()
-        app._cfg["mounts"] = [{"id": "m1", "remote": "r1", "remote_path": "",
-                                "drive": "X:"},
-                               {"id": "m2", "remote": "r2", "remote_path": "",
-                                "drive": "Y:"}]
-        app._tree.selection.return_value = ["m2"]
-        with patch("rclone_manager.save_config") as mock_save:
-            app._move_down()
-            mock_save.assert_not_called()
-
-    # ── Scenario 160: 아래로 이동 - 마운트, 스왑 발생 ────────────────────
-    def test_scenario_160_move_down_mount_swap(self):
-        app = self._create_mocked_app()
-        app._cfg["mounts"] = [{"id": "m1", "remote": "r1", "remote_path": "",
-                                "drive": "X:"},
-                               {"id": "m2", "remote": "r2", "remote_path": "",
-                                "drive": "Y:"}]
-        app._tree.selection.return_value = ["m1"]
-        with patch("rclone_manager.save_config") as mock_save:
-            app._move_down()
-            self.assertEqual(app._cfg["mounts"][1]["id"], "m1")
-            mock_save.assert_called_once()
-
-    # ── Scenario 161: 마운트 선택 실행 - 선택 없음 ───────────────────────
-    def test_scenario_161_mount_sel_no_selection(self):
-        app = self._create_mocked_app()
-        app._tree.selection.return_value = []
-        with patch.object(app, "_mount_single") as mock_single:
-            app._mount_sel()
-            mock_single.assert_not_called()
-
-    # ── Scenario 162: 마운트 선택 실행 - 원본이면 무시 ───────────────────
-    def test_scenario_162_mount_sel_remote_ignored(self):
-        app = self._create_mocked_app()
-        app._tree.selection.return_value = ["remote_gds"]
-        with patch.object(app, "_mount_single") as mock_single:
-            app._mount_sel()
-            mock_single.assert_not_called()
-
-    # ── Scenario 163: 마운트 선택 실행 - 이미 마운트 중이면 무시 ─────────
-    def test_scenario_163_mount_sel_already_mounted(self):
-        app = self._create_mocked_app()
-        app._tree.selection.return_value = ["m1"]
-        rclone_manager.active_mounts["m1"] = MagicMock()
-        with patch.object(app, "_mount_single") as mock_single:
-            app._mount_sel()
-            mock_single.assert_not_called()
-
-    # ── Scenario 164: _do_mount - rclone 미등록 시 경고 로그 ─────────────
-    def test_scenario_164_do_mount_no_rclone(self):
-        app = self._create_mocked_app({"rclone_path": ""})
-        with patch("pathlib.Path.exists", return_value=False), \
-             patch("tkinter.messagebox.showinfo") as mock_info, \
-             patch("rclone_manager.write_log") as mock_log:
-            app._do_mount("m1", {"drive": "X:", "remote": "r"})
-            mock_info.assert_called_once()
-            mock_log.assert_called()
-
-    # ── Scenario 165: _do_mount - 이미 마운트 중이면 무시 ────────────────
-    def test_scenario_165_do_mount_already_mounted(self):
-        app = self._create_mocked_app({"rclone_path": "C:\\fake\\rclone.exe"})
-        rclone_manager.active_mounts["m1"] = MagicMock()
-        with patch("pathlib.Path.exists", return_value=True), \
-             patch("threading.Thread") as mock_thread:
-            app._do_mount("m1", {"drive": "X:", "remote": "r"})
-            mock_thread.assert_not_called()
-
-    # ── Scenario 166: _mount_task - 2초 내 종료(오류 표시) ───────────────
-    def test_scenario_166_mount_task_immediate_failure(self):
-        app = self._create_mocked_app()
-        mock_proc = MagicMock()
-        mock_proc.poll.return_value = 1
-        mock_proc.stderr.read.return_value = b"error: bad flag"
-        with patch("subprocess.Popen", return_value=mock_proc), \
-             patch("time.sleep"), \
-             patch("tkinter.messagebox.showinfo") as mock_info, \
-             patch("rclone_manager.write_log"):
-            app._mount_task("m1", Path("rclone.exe"),
-                            {"remote": "r", "drive": "X:", "remote_path": ""})
-            mock_info.assert_called_once()
-            self.assertEqual(app._status["m1"], "stopped")
-
-    # ── Scenario 167: _mount_task - 정상 마운트(오류 없음) ───────────────
-    def test_scenario_167_mount_task_success(self):
-        app = self._create_mocked_app()
-        mock_proc = MagicMock()
-        mock_proc.poll.return_value = None
-        mock_proc.stderr = iter([])
-        mock_proc.wait.return_value = None
-        mock_proc.returncode = 0
-        with patch("subprocess.Popen", return_value=mock_proc), \
-             patch("time.sleep"), \
-             patch("tkinter.messagebox.showinfo") as mock_info, \
-             patch("rclone_manager.write_log"):
-            app._mount_task("m1", Path("rclone.exe"),
-                            {"remote": "r", "drive": "X:", "remote_path": ""})
-            import time as _t
-            _t.sleep(0.2)
-            mock_info.assert_not_called()
-
-    # ── Scenario 168: _mount_task - 실행 중 종료(비정상 종료코드) ────────
-    def test_scenario_168_mount_task_runtime_failure(self):
-        app = self._create_mocked_app()
-        mock_proc = MagicMock()
-        mock_proc.poll.return_value = None
-        mock_proc.stderr = iter([])
-        mock_proc.wait.return_value = None
-        mock_proc.returncode = 1
-        with patch("subprocess.Popen", return_value=mock_proc), \
-             patch("time.sleep"), \
-             patch("tkinter.messagebox.showinfo") as mock_info, \
-             patch("rclone_manager.write_log"):
-            app._mount_task("m1", Path("rclone.exe"),
-                            {"remote": "r", "drive": "X:", "remote_path": ""})
-            import time as _t
-            _t.sleep(0.2)
-            mock_info.assert_called_once()
-
-    # ── Scenario 169: _mount_task - Popen 자체 예외 ──────────────────────
-    def test_scenario_169_mount_task_popen_exception(self):
-        app = self._create_mocked_app()
-        with patch("subprocess.Popen", side_effect=Exception("cannot exec")), \
-             patch("tkinter.messagebox.showinfo") as mock_info, \
-             patch("rclone_manager.write_log"):
-            app._mount_task("m1", Path("rclone.exe"),
-                            {"remote": "r", "drive": "X:", "remote_path": ""})
-            mock_info.assert_called_once()
-            self.assertEqual(app._status["m1"], "stopped")
-
-    # ── Scenario 170: _mount_task - 의도적 언마운트 중이면 오류 억제 ─────
-    def test_scenario_170_mount_task_suppressed_during_unmount(self):
-        app = self._create_mocked_app()
-        rclone_manager._unmounting.add("m1")
+            return False
+
+    def _apply_measured_minsize(self):
+        """
+        하단 버튼 행/상태바가 창 축소 시 사라지지 않도록 실측 기반 최소 창
+        크기를 계산해 적용한다.
+
+        원리:
+          1. 트리뷰의 height(행 수)를 일시적으로 1로 줄여 update_idletasks()
+             → 이 상태의 winfo_reqheight()는 "트리뷰를 제외한 나머지 위젯들
+               (헤더/rclone 경로/옵션/버튼 행/상태바) + 트리뷰 최소 1행"의
+               실제 필요 높이가 된다.
+          2. 트리뷰가 최소 몇 행은 보이도록 여유 높이를 더한다.
+          3. 원래 height(14)로 복원한다.
+          4. 이렇게 측정한 값을 minsize로 지정하면, 폰트 크기나 DPI가
+             달라져도 항상 버튼 행/상태바가 가려지지 않는 최소 크기가 된다.
+        """
         try:
-            mock_proc = MagicMock()
-            mock_proc.poll.return_value = 1
-            mock_proc.stderr.read.return_value = b"terminated"
-            with patch("subprocess.Popen", return_value=mock_proc), \
-                 patch("time.sleep"), \
-                 patch("tkinter.messagebox.showinfo") as mock_info, \
-                 patch("rclone_manager.write_log"):
-                app._mount_task("m1", Path("rclone.exe"),
-                                {"remote": "r", "drive": "X:", "remote_path": ""})
-                mock_info.assert_not_called()
-        finally:
-            rclone_manager._unmounting.discard("m1")
+            original_height = self._tree.cget("height")
+            self._tree.configure(height=1)
+            self.update_idletasks()
+            min_h = self.winfo_reqheight() + 90  # 트리뷰 최소 3행 정도 여유
+            min_w = max(self.winfo_reqwidth(), 560)
+            self._tree.configure(height=original_height)
+            self.update_idletasks()
+            self.minsize(min_w, min_h)
+        except Exception:
+            # 측정 실패 시 기존 고정값으로 폴백
+            self.minsize(560, 420)
 
-    # ── Scenario 171: 자동 마운트 - 대상 없음 ────────────────────────────
-    def test_scenario_171_automount_all_empty(self):
-        app = self._create_mocked_app()
-        app._cfg["mounts"] = [{"id": "m1", "auto_mount": False}]
-        with patch.object(app, "_do_mount") as mock_do_mount, \
-             patch("rclone_manager.write_log") as mock_log:
-            app._automount_all()
-            mock_do_mount.assert_not_called()
-            mock_log.assert_not_called()
+    def _auto_size_window(self):
+        """
+        저장된 크기가 없을 때 Tkinter 자동 측정으로 창 크기 결정.
 
-    # ── Scenario 172: 네트워크 모니터 - 중복 시작 방지 ───────────────────
-    def test_scenario_172_start_net_monitor_already_running(self):
-        app = self._create_mocked_app()
-        app._net_monitor_running = True
-        with patch("threading.Thread") as mock_thread:
-            app._start_net_monitor()
-            mock_thread.assert_not_called()
+        원리:
+          1. update_idletasks()로 모든 위젯 렌더링 완료
+          2. winfo_reqwidth/reqheight로 실제 필요 최소 크기 측정
+          3. 여유 공간 추가 + 화면 90% 초과 방지
+          → DPI/폰트 크기에 관계없이 내용이 항상 화면에 맞게 표시됨
+        """
+        self.update_idletasks()
+        req_w = self.winfo_reqwidth()
+        req_h = self.winfo_reqheight()
+        lw, lh = get_logical_screen_size()
+        # 측정값에 여유 공간 추가 (트리뷰 높이 확보 등)
+        w = min(req_w + 100, int(lw * 0.90))
+        h = min(req_h + 80,  int(lh * 0.90))
+        # 최솟값 보장
+        w = max(w, 780)
+        h = max(h, 520)
+        # 화면 중앙 배치
+        x = max(0, (lw - w) // 2)
+        y = max(0, (lh - h) // 2)
+        self.geometry(f"{w}x{h}+{x}+{y}")
 
-    # ── Scenario 173: 네트워크 모니터 - 연결 감지 시 자동 마운트 ─────────
-    def test_scenario_173_start_net_monitor_connected(self):
-        app = self._create_mocked_app()
+    def _on_configure(self, event):
+        """창 크기/위치 변경 시 디바운스 후 저장"""
+        if event.widget is not self:
+            return
+        if self._geometry_save_after:
+            self.after_cancel(self._geometry_save_after)
+        self._geometry_save_after = self.after(500, self._save_geometry)
 
-        def _fake_sleep(_):
-            app._net_monitor_running = False
+    def _save_geometry(self):
+        """현재 창 크기/위치 저장"""
+        self._geometry_save_after = None
+        self._cfg["window_geometry"] = self.geometry()
+        save_config(self._cfg)
 
-        with patch("rclone_manager.is_internet_available", return_value=True), \
-             patch("threading.Thread", self._sync_thread()), \
-             patch("time.sleep", side_effect=_fake_sleep):
-            app._start_net_monitor()
-            app.after.assert_any_call(0, app._automount_all)
+    def _on_column_resize(self, event=None):
+        """
+        컬럼 폭 조절 후 저장 (헤더 드래그 or ButtonRelease).
 
-    # ── Scenario 174: 네트워크 모니터 - 끊김 감지 시 언마운트 ────────────
-    def test_scenario_174_start_net_monitor_disconnected(self):
-        app = self._create_mocked_app()
-        app._net_was_connected = True
-
-        def _fake_sleep(_):
-            app._net_monitor_running = False
-
-        with patch("rclone_manager.is_internet_available", return_value=False), \
-             patch("threading.Thread", self._sync_thread()), \
-             patch("time.sleep", side_effect=_fake_sleep):
-            app._start_net_monitor()
-            app.after.assert_any_call(0, app._unmount_all_on_disconnect)
-
-    # ── Scenario 175: 끊김 시 전체 해제 - 마운트 없으면 조기 반환 ────────
-    def test_scenario_175_unmount_all_on_disconnect_none_mounted(self):
-        app = self._create_mocked_app()
-        app._cfg["mounts"] = [{"id": "m1", "auto_mount": True}]
-        with patch("rclone_manager.unmount") as mock_unmount, \
-             patch("tkinter.messagebox.showinfo") as mock_info:
-            app._unmount_all_on_disconnect()
-            mock_unmount.assert_not_called()
-            mock_info.assert_not_called()
-
-    # ── Scenario 176: 끊김 시 전체 해제 - 자동 마운트는 조용히 해제 ──────
-    def test_scenario_176_unmount_all_on_disconnect_auto_only(self):
-        app = self._create_mocked_app()
-        app._cfg["mounts"] = [{"id": "m1", "auto_mount": True,
-                                "drive": "X:", "remote": "r", "remote_path": ""}]
-        rclone_manager.active_mounts["m1"] = MagicMock()
-        with patch("rclone_manager.unmount") as mock_unmount, \
-             patch("tkinter.messagebox.showinfo") as mock_info:
-            app._unmount_all_on_disconnect()
-            mock_unmount.assert_called_once_with("m1")
-            mock_info.assert_not_called()
-
-    # ── Scenario 177: 끊김 시 전체 해제 - 수동 마운트는 알림 표시 ────────
-    def test_scenario_177_unmount_all_on_disconnect_manual_alerts(self):
-        app = self._create_mocked_app()
-        app._cfg["mounts"] = [{"id": "m1", "auto_mount": False,
-                                "drive": "X:", "remote": "r", "remote_path": ""}]
-        rclone_manager.active_mounts["m1"] = MagicMock()
-        with patch("rclone_manager.unmount") as mock_unmount, \
-             patch("tkinter.messagebox.showinfo") as mock_info:
-            app._unmount_all_on_disconnect()
-            mock_unmount.assert_called_once_with("m1")
-            mock_info.assert_called_once()
-
-    # ── Scenario 178: 언마운트(선택) - 원본 선택시 무시 ──────────────────
-    def test_scenario_178_unmount_sel_remote_ignored(self):
-        app = self._create_mocked_app()
-        app._tree.selection.return_value = ["remote_gds"]
-        with patch("rclone_manager.unmount") as mock_unmount:
-            app._unmount_sel()
-            mock_unmount.assert_not_called()
-
-    # ── Scenario 179: 언마운트(선택) - 정상 언마운트 ─────────────────────
-    def test_scenario_179_unmount_sel_normal(self):
-        app = self._create_mocked_app()
-        app._cfg["mounts"] = [{"id": "m1", "drive": "X:", "remote": "r",
-                                "remote_path": ""}]
-        app._tree.selection.return_value = ["m1"]
-        with patch("rclone_manager.unmount") as mock_unmount:
-            app._unmount_sel()
-            mock_unmount.assert_called_once_with("m1")
-
-    # ── Scenario 180: 창 숨김/보이기 ─────────────────────────────────────
-    def test_scenario_180_hide_and_show_window(self):
-        app = self._create_mocked_app()
-        app.hide_window()
-        app.withdraw.assert_called_once()
-        app.show_window()
-        app.deiconify.assert_called_once()
-        app.lift.assert_called_once()
-        app.focus_force.assert_called_once()
-
-    # ── Scenario 181: 앱 종료 - 트레이 있으면 정지 후 destroy ────────────
-    def test_scenario_181_quit_app_with_tray(self):
-        app = self._create_mocked_app()
-        rclone_manager.active_mounts["m1"] = MagicMock()
-        with patch("rclone_manager.unmount") as mock_unmount, \
-             patch("rclone_manager.write_log"):
-            app._quit_app()
-            mock_unmount.assert_called_once_with("m1")
-            app._tray.stop.assert_called_once()
-            app.destroy.assert_called_once()
-            self.assertFalse(app._net_monitor_running)
-
-    # ── Scenario 182: 앱 종료 - 트레이 없으면 stop 생략 ──────────────────
-    def test_scenario_182_quit_app_without_tray(self):
-        app = self._create_mocked_app()
-        app._tray = None
-        with patch("rclone_manager.write_log"):
-            app._quit_app()
-            app.destroy.assert_called_once()
-
-    # ── Scenario 183: 앱 버전 레이블 클릭 - 즉시 확인(force=True) ────────
-    def test_scenario_183_handle_app_ver_click_forces_check(self):
-        app = self._create_mocked_app()
-        # 진행 중인 체크가 있어도 이제는 강제로 리셋하지 않는다
-        # (강제 리셋은 두 스레드가 동시에 도는 경쟁 상태의 원인이었음)
-        app._version_check_running = True
-        with patch.object(app, "_check_versions_async") as mock_check:
-            app._handle_app_ver_click(MagicMock())
-            # _version_check_running을 건드리지 않고 그대로 force=True 요청만 위임
-            self.assertTrue(app._version_check_running)
-            mock_check.assert_called_once_with(force=True)
-            app._app_ver_label.config.assert_any_call(
-                text="버전 확인 중...", fg="#89b4fa")
-
-    # ── Scenario 184: 인증서 안정화 - 정상 복사 및 환경변수 설정 ─────────
-    def test_scenario_184_ensure_stable_ca_bundle_success(self):
-        # Given: certifi가 정상 설치돼 있고 안정 경로에 인증서가 없을 때
-        fake_certifi = MagicMock()
-        fake_certifi.where.return_value = "/fake/_MEI123/certifi/cacert.pem"
-        with patch.dict("sys.modules", {"certifi": fake_certifi}), \
-             patch("pathlib.Path.exists", return_value=False), \
-             patch("shutil.copy") as mock_copy, \
-             patch.dict("os.environ", {}, clear=False):
-            # When: 인증서 안정화를 수행하면
-            rclone_manager._ensure_stable_ca_bundle()
-            # Then: APP_DIR/cacert.pem 으로 복사하고 환경변수를 고정해야 한다
-            mock_copy.assert_called_once()
-            self.assertTrue(os.environ.get("REQUESTS_CA_BUNDLE", "").endswith("cacert.pem"))
-            self.assertTrue(os.environ.get("SSL_CERT_FILE", "").endswith("cacert.pem"))
-
-    # ── Scenario 185: 인증서 안정화 - 이미 존재하면 재복사하지 않음 ──────
-    def test_scenario_185_ensure_stable_ca_bundle_already_exists(self):
-        fake_certifi = MagicMock()
-        fake_certifi.where.return_value = "/fake/_MEI123/certifi/cacert.pem"
-        with patch.dict("sys.modules", {"certifi": fake_certifi}), \
-             patch("pathlib.Path.exists", return_value=True), \
-             patch("pathlib.Path.stat") as mock_stat, \
-             patch("shutil.copy") as mock_copy:
-            mock_stat.return_value.st_size = 1000  # 이미 유효한 파일 존재
-            rclone_manager._ensure_stable_ca_bundle()
-            mock_copy.assert_not_called()
-
-    # ── Scenario 186: 인증서 안정화 - certifi 없거나 예외 시 조용히 무시 ──
-    def test_scenario_186_ensure_stable_ca_bundle_exception_ignored(self):
-        with patch.dict("sys.modules", {"certifi": None}):
+        "remote"(리모트/서브경로)도 반드시 포함해야 한다.
+        remote와 status 둘 다 stretch=True라서 경계를 드래그하면 두 컬럼의
+        폭이 함께 바뀌는데, 기존 코드는 remote를 저장 대상에서 빠뜨려서
+        재실행 시 remote 폭이 복원되지 않고 기본값으로 되돌아가
+        "조정한 폭이 유지되지 않는" 현상이 발생했다.
+        """
+        widths = {}
+        for col in ("type", "auto", "drive", "remote", "status"):
             try:
-                rclone_manager._ensure_stable_ca_bundle()
+                widths[col] = self._tree.column(col, "width")
             except Exception:
-                self.fail("certifi가 없어도 예외 없이 조용히 넘어가야 한다")
+                pass
+        if widths:
+            self._cfg["column_widths"] = widths
+            save_config(self._cfg)
+
+    # ────────────────────────────────────────────
+    # UI 구성
+    # ────────────────────────────────────────────
+    def _build_ui(self):
+        s = ttk.Style(self)
+        s.theme_use("clam")
+        s.configure("TFrame", background="#1e1e2e")
+        s.configure("TLabel", background="#1e1e2e", foreground="#cdd6f4",
+                    font=("Segoe UI", 10))
+        s.configure("Header.TLabel", font=("Segoe UI", 16, "bold"),
+                    foreground="#cba6f7")
+        s.configure("Treeview", background="#313244", foreground="#cdd6f4",
+                    fieldbackground="#313244", rowheight=30)
+        s.configure("Treeview.Heading", background="#45475a", foreground="#cba6f7",
+                    font=("Segoe UI", 11, "bold"))
+
+        # 헤더
+        hdr = ttk.Frame(self)
+        hdr.pack(fill="x", padx=20, pady=12)
+        ttl_f = ttk.Frame(hdr)
+        ttl_f.pack(side="left")
+        ttk.Label(ttl_f, text="🚀 RcloneManager", style="Header.TLabel").pack(side="left")
+        self._app_ver_label = tk.Label(ttl_f, text=f"v{APP_VERSION}", bg="#1e1e2e",
+                  fg="#fab387", font=("Segoe UI", 10, "bold"), cursor="hand2")
+        self._app_ver_label.pack(side="left", padx=8, pady=(5, 0))
+        self._app_ver_label.bind("<Button-1>", self._handle_app_ver_click)
+        tk.Button(ttl_f, text="!", bg="#f38ba8", fg="#1e1e2e",
+                  font=("Segoe UI", 9, "bold"), relief="flat", width=2,
+                  command=self._open_issue).pack(side="left", padx=5, pady=(5, 0))
+
+        self._app_up_btn = tk.Button(
+            hdr, text="✨ 새 버전 업데이트 가능", bg="#a6e3a1", fg="#1e1e2e",
+            font=("Segoe UI", 9, "bold"), relief="flat",
+            command=self._show_app_update_confirm)
+
+        # rclone 경로 행
+        rcf = tk.Frame(self, bg="#1e1e2e")
+        rcf.pack(fill="x", padx=20, pady=5)
+        tk.Label(rcf, text="rclone 경로:", bg="#1e1e2e", fg="#cba6f7",
+                 font=("Segoe UI", 10, "bold")).pack(side="left")
+        self._rc_var = tk.StringVar(value=self._cfg.get("rclone_path", ""))
+        tk.Entry(rcf, textvariable=self._rc_var, bg="#313244", fg="#cdd6f4",
+                 relief="flat", width=55).pack(side="left", padx=10, ipady=4)
+        tk.Button(rcf, text="📂", bg="#45475a", fg="#cdd6f4", relief="flat",
+                  command=self._browse_rc).pack(side="left")
+
+        self._rc_ver_label = tk.Label(
+            rcf, text="", bg="#1e1e2e", fg="#94e2d5",
+            font=("Segoe UI", 10), cursor="hand2")
+        self._rc_ver_label.pack(side="left", padx=14)
+        self._rc_ver_label.bind("<Button-1>", self._handle_rc_click)
+
+        # 옵션 체크박스 행
+        opt = tk.Frame(self, bg="#1e1e2e")
+        opt.pack(fill="x", padx=20, pady=8)
+        self._st_var = tk.BooleanVar(value=is_startup_enabled())
+        ttk.Checkbutton(opt, text="시작 시 자동 실행", variable=self._st_var,
+                        command=self._toggle_st).pack(side="left", padx=(0, 24))
+        self._am_var = tk.BooleanVar(value=self._cfg.get("auto_mount", False))
+        ttk.Checkbutton(opt, text="시작 시 자동 마운트", variable=self._am_var,
+                        command=self._toggle_am).pack(side="left", padx=(0, 24))
+        self._min_var = tk.BooleanVar(value=self._cfg.get("start_minimized", False))
+        ttk.Checkbutton(opt, text="시작 시 트레이로 최소화", variable=self._min_var,
+                        command=self._toggle_min).pack(side="left")
+
+        # 상태바 - 버튼 행보다 먼저 pack해야 맨 아래 자리를 차지한다
+        # (side="bottom"끼리는 먼저 pack된 쪽이 더 아래쪽에 위치한다)
+        st_bar = tk.Frame(self, bg="#313244", height=28)
+        st_bar.pack(fill="x", side="bottom")
+        tk.Label(st_bar, text=f" System: {get_sys_info()}", bg="#313244",
+                 fg="#9399b2", font=("Segoe UI", 9)).pack(side="left", padx=10)
+
+        # 하단 버튼 행
+        # ⚠️ 트리뷰보다 먼저 pack() 해야 한다.
+        # Tk의 pack 배치 우선순위는 side 값과 무관하게 pack()이 호출된 순서로
+        # 결정되며, 창이 작아져 전체 요청 크기를 담을 공간이 부족해지면
+        # 나중에 pack()된 위젯부터 공간을 못 받아 사라진다.
+        # 트리뷰는 expand=True로 남는 공간을 모두 가져가므로, 트리뷰를
+        # 먼저 pack하면 창을 줄일 때 버튼 행/상태바가 통째로 밀려 사라진다.
+        # → 상태바와 버튼 행을 먼저 pack해 항상 자기 몫을 확보하게 하고,
+        #   트리뷰를 가장 마지막에 pack해서 공간이 부족할 때 트리뷰만 줄어들게 한다.
+        btn_f = ttk.Frame(self)
+        btn_f.pack(fill="x", padx=20, pady=12, side="bottom")
+        ttk.Button(btn_f, text="➕ 추가", command=self._add).pack(side="left", padx=2)
+        ttk.Button(btn_f, text="✏️ 편집", command=self._edit).pack(side="left", padx=2)
+        ttk.Button(btn_f, text="🗑️ 삭제", command=self._del).pack(side="left", padx=2)
+        ttk.Button(btn_f, text="🔼", width=4, command=self._move_up).pack(side="left", padx=2)
+        ttk.Button(btn_f, text="🔽", width=4, command=self._move_down).pack(side="left", padx=2)
+        ttk.Button(btn_f, text="📥 conf 가져오기",
+                   command=self._import_conf).pack(side="left", padx=2)
+        ttk.Button(btn_f, text="▶ 마운트",
+                   command=self._mount_sel).pack(side="left", padx=14)
+        ttk.Button(btn_f, text="■ 언마운트",
+                   command=self._unmount_sel).pack(side="left")
+
+        # 트리뷰 (5컬럼) - 가장 마지막에 pack. 공간이 부족하면 이 위젯만 줄어든다.
+        cols = ("type", "auto", "drive", "remote", "status")
+        # 기본 폭: 상태는 170(기존 85의 2배), 저장된 값 있으면 복원
+        self._col_default_widths = {"type": 70, "auto": 50, "drive": 75, "status": 170}
+        saved_cw = self._cfg.get("column_widths", {})
+        self._tree = ttk.Treeview(self, columns=cols, show="headings", height=14)
+        for col, head, anchor, stretch in zip(
+                cols,
+                ("구분", "자동", "드라이브", "리모트 (서브경로)", "상태"),
+                ("w", "center", "center", "w", "w"),
+                (False, False, False, True, True)):
+            self._tree.heading(col, text=head, anchor=anchor)
+            if not stretch:
+                cw = saved_cw.get(col, self._col_default_widths[col])
+                self._tree.column(col, width=cw, minwidth=40,
+                                  stretch=False, anchor=anchor)
+            else:
+                cw = saved_cw.get(col, self._col_default_widths.get(col, 80))
+                self._tree.column(col, width=cw, minwidth=80,
+                                  stretch=True, anchor=anchor)
+        self._tree.pack(fill="both", expand=True, padx=20, pady=5)
+        self._tree.tag_configure("remote_tag", foreground="#8fa0b5")
+        # <<TreeviewColumnRelease>>: 헤더 드래그 완료 이벤트
+        # <ButtonRelease-1>: 헤더 클릭/드래그 완료 후 폭 저장 (이중 바인딩으로 확실히 감지)
+        self._tree.bind("<<TreeviewColumnRelease>>", self._on_column_resize)
+        self._tree.bind("<ButtonRelease-1>", lambda e: self.after(100, self._on_column_resize))
+
+    # ────────────────────────────────────────────
+    # rclone 레이블 / 버전 확인
+    # ────────────────────────────────────────────
+    def _init_rc_label(self):
+        """초기 rclone 상태 레이블 설정"""
+        exe = get_rclone_exe(self._cfg)
+        if exe is None:
+            self._rc_ver_label.config(text="rclone 다운로드", fg="#f38ba8")
+        else:
+            self._rc_ver_label.config(text="v체크 중...", fg="#94e2d5")
+
+    def _check_rclone_presence(self):
+        """
+        등록된 rclone 존재 여부 즉시 확인.
+        - 등록 경로가 사라졌으면 경로 초기화 + 다운로드 표시 (요구사항 5)
+        - 있으면 버전 체크
+        """
+        registered = self._cfg.get("rclone_path", "").strip()
+        exe = get_rclone_exe(self._cfg)
+
+        if exe is None:
+            # 등록된 경로가 있었는데 파일이 사라진 경우 → 경로 초기화
+            if registered:
+                self._cfg["rclone_path"] = ""
+                self._rc_var.set("")
+                save_config(self._cfg)
+            self._rc_ver_label.config(text="rclone 다운로드", fg="#f38ba8")
+        else:
+            self._rc_ver_label.config(text="v체크 중...", fg="#94e2d5")
+            # 이미 체크 중이면 강제 초기화하지 않고 스킵
+            # (강제 초기화하면 진행 중인 체크가 중단되고 중복 호출됨)
+            self._check_versions_async()
+
+    def _on_focus_in(self, event):
+        """창 활성화 시 rclone + 앱 버전 재확인"""
+        if event.widget is self:
+            self._check_rclone_presence()
+
+    def _check_versions_async(self, force: bool = False):
+        """
+        백그라운드에서 rclone 및 앱 버전 확인.
+
+        GitHub API rate limit 대응 (비인증: 60회/시간/IP):
+          - rclone 버전: 매번 체크 (실행 시, 창 활성화 시)
+            이유: rclone은 자주 업데이트되고 사용자가 직접 인지해야 함
+          - 앱 버전:     24시간 주기로만 체크 (last_version_check 타임스탬프)
+            이유: 앱 업데이트는 빈도가 낮고 rate limit 절약
+          - force=True이면 앱 버전도 주기 무관하게 즉시 체크
+
+        동시 실행 방지:
+          이미 체크가 진행 중일 때 force=True로 다시 호출되면, 예전에는
+          _version_check_running 을 강제로 False로 리셋하고 새 스레드를
+          또 시작해서 두 스레드가 동시에 실행되는 경쟁 상태가 있었다.
+          (늦게 끝난 스레드가 먼저 끝난 스레드의 결과를 덮어써
+           클릭으로 발견한 업데이트가 화면에 반영되지 않는 원인이었다.)
+          이제는 새 스레드를 만들지 않고 "예약(pending)"만 해두고,
+          진행 중이던 체크가 끝나면 그 직후에 자동으로 force 체크를
+          한 번 더 실행한다.
+        """
+        if self._version_check_running:
+            if force:
+                self._pending_force_check = True
+            return
+
+        # 앱 버전만 24시간 주기 체크
+        now = time.time()
+        last_check = self._cfg.get("last_version_check", 0)
+        skip_app_api = (not force) and (now - last_check < VERSION_CHECK_INTERVAL)
+
+        self._version_check_running = True
+
+        def _task():
+            try:
+                exe = get_rclone_exe(self._cfg)
+                lat_rc = ""
+
+                # rclone 최신 버전은 항상 조회 (rate limit 영향 적음: 1회/실행)
+                try:
+                    res = requests.get(
+                        "https://api.github.com/repos/wiserain/rclone/releases/latest",
+                        timeout=5)
+                    lat_rc = res.json().get("tag_name", "").lstrip("v")
+                    self._latest_rc = lat_rc
+                except Exception as e:
+                    write_log("WARN", f"[버전] rclone GitHub API 호출 실패: {e}")
+                    lat_rc = self._latest_rc  # 실패 시 이전 값 재사용
+
+                # 앱 업데이트는 24시간 주기로만 확인
+                if not skip_app_api:
+                    try:
+                        res = requests.get(
+                            f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+                            timeout=5)
+                        data = res.json()
+                        latest_app = data.get("tag_name", "").lstrip("v")
+                        self._latest_app_info = data
+                        if _ver_tuple(latest_app) > _ver_tuple(APP_VERSION):
+                            write_log("INFO",
+                                      f"[버전] 앱 v{APP_VERSION} → v{latest_app} 업데이트 가능")
+                            self.after(0, self._show_app_update_btn)
+                        else:
+                            write_log("INFO", f"[버전] 앱 v{APP_VERSION} (최신)")
+                            self.after(0, self._hide_app_update_btn)
+                    except Exception as e:
+                        write_log("WARN", f"[버전] 앱 GitHub API 호출 실패: {e}")
+
+                    # 앱 체크 완료 시각 저장
+                    self._cfg["last_version_check"] = now
+                    save_config(self._cfg)
+                else:
+                    # 앱 API 스킵: 기존에 저장된 정보로 버튼 상태 복원
+                    if self._latest_app_info:
+                        latest_app = self._latest_app_info.get("tag_name", "").lstrip("v")
+                        if _ver_tuple(latest_app) > _ver_tuple(APP_VERSION):
+                            self.after(0, self._show_app_update_btn)
+
+                # rclone 로컬 버전 표시 (로컬 실행, API 호출 없음)
+                if exe is None:
+                    self.after(0, lambda: self._rc_ver_label.config(
+                        text="rclone 다운로드", fg="#f38ba8"))
+                else:
+                    try:
+                        r = subprocess.run([str(exe), "version"],
+                                           capture_output=True, text=True,
+                                           timeout=5, creationflags=_CREATE_NO_WINDOW)
+                        # wiserain fork는 버전에 빌드번호가 붙음: "rclone v1.74.4-302"
+                        # 하이픈까지 포함해 캡처해야 표시가 GitHub 태그(lat_rc)와 동일한
+                        # 전체 버전 문자열로 나온다. 실제 비교는 _ver_tuple이 빌드번호를
+                        # 제거하고 수행하므로 여기서 전체를 캡처해도 비교 정확도는 그대로다.
+                        loc_match = re.search(r"rclone v([\d.\-]+)", r.stdout)
+                        loc_rc = loc_match.group(1) if loc_match else ""
+                        if loc_rc:
+                            if lat_rc and _ver_tuple(loc_rc) < _ver_tuple(lat_rc):
+                                txt = f"v{loc_rc} / v{lat_rc} 업데이트"
+                                write_log("INFO", f"[버전] rclone {txt}")
+                                self.after(0, lambda t=txt: self._rc_ver_label.config(
+                                    text=t, fg="#fab387"))
+                            else:
+                                txt = f"v{loc_rc} (최신)"
+                                write_log("INFO", f"[버전] rclone {txt}")
+                                self.after(0, lambda t=txt: self._rc_ver_label.config(
+                                    text=t, fg="#94e2d5"))
+                        else:
+                            self.after(0, lambda: self._rc_ver_label.config(
+                                text="v알 수 없음", fg="#f38ba8"))
+                    except Exception as e:
+                        write_log("ERROR", f"[버전] rclone version 실행 실패: {e}")
+                        self.after(0, lambda: self._rc_ver_label.config(
+                            text="v알 수 없음", fg="#f38ba8"))
+            finally:
+                self._version_check_running = False
+                # 진행 중에 force 체크 요청이 예약돼 있었다면 지금 실행한다
+                if self._pending_force_check:
+                    self._pending_force_check = False
+                    self.after(0, lambda: self._check_versions_async(force=True))
+
+        threading.Thread(target=_task, daemon=True).start()
+
+    def _show_app_update_btn(self):
+        if not self._app_up_btn.winfo_ismapped():
+            self._app_up_btn.pack(side="right")
+
+    def _hide_app_update_btn(self):
+        if self._app_up_btn.winfo_ismapped():
+            self._app_up_btn.pack_forget()
+
+    # ────────────────────────────────────────────
+    # 앱 업데이트
+    # ────────────────────────────────────────────
+    def _show_app_update_confirm(self):
+        if not self._latest_app_info:
+            return
+        tag = self._latest_app_info.get("tag_name", "New Version")
+        body = self._latest_app_info.get("body", "No release notes.")
+        assets = self._latest_app_info.get("assets", [])
+
+        dlg = UpdateDialog(self, tag, body, assets=assets)
+        self.wait_window(dlg)
+
+        if not dlg.confirmed:
+            return
+
+        asset_url = dlg._asset_url
+        if not asset_url:
+            webbrowser.open(f"https://github.com/{GITHUB_REPO}/releases/latest")
+            return
+
+        self._app_up_btn.config(text="앱 업데이트 중... 0%", state="disabled")
+
+        def _do():
+            def _prog(p):
+                self.after(0, lambda pv=p: self._app_up_btn.config(
+                    text=f"앱 업데이트 중... {pv}%"))
+
+            res = download_app_release(asset_url, _prog)
+
+            exe_dir = (Path(sys.executable).parent if getattr(sys, 'frozen', False)
+                       else APP_DIR)
+            suffix = "." + asset_url.rsplit(".", 1)[-1] if "." in asset_url else ".zip"
+            dest_file = exe_dir / f"RcloneManager_update{suffix}"
+
+            if res == "manual":
+                # 다운로드 완료 → 안내 메시지 + 버튼을 "교체 파일 위치 열기"로 변경
+                write_log("INFO", f"[앱 업데이트] 다운로드 완료: {dest_file}")
+                self.after(0, lambda df=str(dest_file), folder=exe_dir: (
+                    messagebox.showinfo(
+                        "업데이트 파일 다운로드 완료",
+                        f"다운로드 위치:\n{df}\n\n"
+                        "프로그램을 종료한 후 기존 파일을 새 파일로 교체하고 재시작하세요."),
+                    self._set_update_downloaded_btn(folder)
+                ))
+            else:
+                write_log("ERROR", f"[앱 업데이트] 다운로드 실패: {res}")
+                self.after(0, lambda err=res: messagebox.showinfo("알림", err))
+                self.after(0, lambda: self._app_up_btn.config(
+                    text="✨ 새 버전 업데이트 가능", state="normal"))
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _set_update_downloaded_btn(self, folder: Path):
+        """
+        다운로드 완료 후 버튼을 '📂 교체 파일 위치 열기'로 변경.
+        클릭 시 탐색기로 해당 폴더 열기.
+        """
+        self._update_folder = folder
+        self._app_up_btn.config(
+            text="📂 교체 파일 위치 열기",
+            bg="#fab387",
+            command=self._open_update_folder,
+            state="normal")
+
+    def _open_update_folder(self):
+        """탐색기로 업데이트 파일이 저장된 폴더 열기."""
+        folder = getattr(self, "_update_folder", APP_DIR)
+        subprocess.Popen(["explorer", str(folder)],
+                         creationflags=_CREATE_NO_WINDOW)
+
+    # ────────────────────────────────────────────
+    # rclone 다운로드/업데이트
+    # ────────────────────────────────────────────
+    def _handle_app_ver_click(self, event):
+        """
+        프로그램 버전 레이블 클릭 시 24시간 주기와 무관하게 즉시 확인.
+
+        이미 다른 체크가 진행 중이어도 _version_check_running 을 강제로
+        리셋하지 않는다. 강제로 리셋하면 기존 스레드와 새 스레드가 동시에
+        실행되는 경쟁 상태가 생겨, 늦게 끝난 스레드가 결과를 덮어써서
+        클릭으로 발견한 업데이트가 화면에 반영되지 않는 문제가 있었다.
+        대신 _check_versions_async가 내부적으로 "예약(pending)"해두고
+        진행 중이던 체크가 끝난 직후 자동으로 force 체크를 실행한다.
+        기존의 24시간 주기 자동 확인 로직은 그대로 유지되며, 이 클릭은
+        그 주기를 건너뛰는 수동 트리거일 뿐이다.
+        """
+        self._app_ver_label.config(text="버전 확인 중...", fg="#89b4fa")
+        self._check_versions_async(force=True)
+        # 버전 확인은 백그라운드에서 진행되며, 완료 시 _check_versions_async
+        # 내부에서 self.after(0, ...)로 rclone 레이블은 갱신되지만
+        # 앱 버전 레이블 자체는 텍스트가 고정 표시(vX.X.X)이므로
+        # 잠시 후 원래 텍스트로 되돌린다.
+        self.after(1500, lambda: self._app_ver_label.config(
+            text=f"v{APP_VERSION}", fg="#fab387"))
+
+    def _handle_rc_click(self, event):
+        text = self._rc_ver_label.cget("text")
+        if "다운로드" in text:
+            if not self._latest_rc:
+                messagebox.showinfo("rclone",
+                                    "최신 버전 정보를 확인 중입니다. 잠시 후 다시 시도해 주세요.")
+                self._check_versions_async(force=True)
+                return
+            if messagebox.askyesno("rclone", f"rclone v{self._latest_rc}를 설치할까요?"):
+                threading.Thread(target=self._do_rc_down, daemon=True).start()
+        elif "업데이트" in text:
+            if not self._latest_rc:
+                return
+            # 마운트 중인 드라이브가 있으면 경고 후 확인
+            mounted = [m for m in self._cfg.get("mounts", [])
+                       if m["id"] in active_mounts]
+            if mounted:
+                names = ", ".join(
+                    m.get("drive", "") or m.get("remote", "?")
+                    for m in mounted)
+                if not messagebox.askyesno(
+                        "rclone 업데이트",
+                        f"현재 마운트 중인 드라이브가 있습니다: {names}\n\n"
+                        "업데이트하려면 마운트를 해제해야 합니다.\n"
+                        "모두 해제하고 업데이트할까요?\n"
+                        "(업데이트 완료 후 자동으로 재마운트됩니다)"):
+                    return
+            threading.Thread(target=self._do_rc_down, daemon=True).start()
+
+    def _do_rc_down(self):
+        registered = self._cfg.get("rclone_path", "").strip()
+        dest_dir = Path(registered).parent if registered else APP_DIR
+
+        # 마운트 중인 항목 기록 (업데이트 후 재마운트용)
+        remount_list = [m for m in self._cfg.get("mounts", [])
+                        if m["id"] in active_mounts]
+
+        # 마운트 중인 항목 모두 해제
+        if remount_list:
+            self.after(0, lambda: self._rc_ver_label.config(
+                text="마운트 해제 중...", fg="#89b4fa"))
+            for m in remount_list:
+                unmount(m["id"])
+            self.after(0, self._refresh_list)
+
+        self.after(0, lambda: self._rc_ver_label.config(
+            text="다운로드 중... 0%", fg="#89b4fa"))
+
+        def _prog(p):
+            self.after(0, lambda pv=p: self._rc_ver_label.config(
+                text=f"다운로드 중... {pv}%", fg="#89b4fa"))
+
+        res = download_rclone(dest_dir, self._latest_rc, _prog)
+
+        if res is True:
+            # 교체 완료
+            new_path = str(dest_dir / "rclone.exe")
+            self._rc_var.set(new_path)
+            self._cfg["rclone_path"] = new_path
+            save_config(self._cfg)
+            write_log("INFO", f"[rclone 설치] v{self._latest_rc} 완료: {new_path}")
+            messagebox.showinfo("완료", "rclone 설치/업데이트 완료!")
+            self._check_versions_async(force=True)
+            if remount_list:
+                self.after(500, lambda: [self._do_mount(m["id"], m)
+                                         for m in remount_list])
+
+        elif res == "manual":
+            # 다른 프로그램이 rclone을 사용 중 → 파일락으로 교체 불가
+            new_file = APP_DIR / "rclone_new.exe"
+            self.after(0, lambda nf=str(new_file): messagebox.showinfo(
+                "수동 교체 필요",
+                "다른 프로그램에서 rclone을 사용 중이어서\n"
+                "자동 업데이트가 불가능합니다.\n\n"
+                f"새 파일 저장 위치:\n{nf}\n\n"
+                "해당 프로그램을 종료한 후\n"
+                "rclone_new.exe 파일의 이름을 rclone.exe로 변경하고\n"
+                "기존 rclone.exe를 교체해 주세요."))
+            self.after(0, lambda: self._rc_ver_label.config(
+                text="수동 교체 필요", fg="#fab387"))
+            if remount_list:
+                self.after(500, lambda: [self._do_mount(m["id"], m)
+                                         for m in remount_list])
+
+        else:
+            write_log("ERROR", f"[rclone 다운로드] 실패: {res}")
+            # 다운로드 오류
+            messagebox.showinfo("알림", str(res))
+            self.after(0, lambda: self._rc_ver_label.config(
+                text="rclone 다운로드", fg="#f38ba8"))
+            if remount_list:
+                self.after(500, lambda: [self._do_mount(m["id"], m)
+                                         for m in remount_list])
+
+    # ────────────────────────────────────────────
+    # 이슈 리포트
+    # ────────────────────────────────────────────
+    def _open_issue(self):
+        webbrowser.open(f"https://github.com/{GITHUB_REPO}/issues/new")
+
+    # ────────────────────────────────────────────
+    # 트레이
+    # ────────────────────────────────────────────
+    def _start_tray(self):
+        if not _TRAY_AVAILABLE:
+            return
+        try:
+            main_icon = _make_circle_icon("#cba6f7", 64)
+            self._tray = pystray.Icon(
+                "RcloneManager", main_icon, "RcloneManager",
+                menu=self._build_tray_menu())
+            threading.Thread(target=self._tray.run, daemon=True).start()
+        except Exception as e:
+            write_log("ERROR", f"[트레이] 아이콘 생성 실패: {e}")
+            self._tray = None
+
+    def _build_tray_menu(self):
+        """
+        트레이 우클릭 메뉴.
+        pystray.MenuItem은 icon= 파라미터 미지원 → 이모지로 상태 표시.
+        마운트 항목 클릭 시 현재 active_mounts에서 실시간으로 상태 확인.
+        """
+        if not _TRAY_AVAILABLE:
+            return None
+
+        items = [
+            pystray.MenuItem("🪟 열기", lambda: self.after(0, self.show_window),
+                             default=True),
+            pystray.Menu.SEPARATOR,
+        ]
+
+        mounts = self._cfg.get("mounts", [])
+        if mounts:
+            for m in mounts:
+                mid = m["id"]
+                # _status=="mounted" OR active_mounts 둘 다 확인
+                # 이유: _do_mount에서 _status를 먼저 설정하고 _refresh_list를 호출하지만
+                #       active_mounts[mid]=p는 _mount_task 스레드에서 나중에 설정됨
+                #       → _status를 우선 확인해야 트레이 이모지가 즉시 반영됨
+                is_mounted = (self._status.get(mid) == "mounted") or (mid in active_mounts)
+                label = m.get("drive", "") or m.get("remote", "?")
+                rstr = f"{m['remote']}:{m.get('remote_path', '')}".strip(":")
+                display = f"{'■' if is_mounted else '▶'}  {label}  ({rstr})"
+
+                # 클릭 시 active_mounts와 _status 모두 확인하여 실시간 토글
+                def _make_toggle(mount_id, mount_data):
+                    def _toggle(icon, item):
+                        currently_mounted = (
+                            (self._status.get(mount_id) == "mounted") or
+                            (mount_id in active_mounts)
+                        )
+                        if currently_mounted:
+                            # 현재 마운트 중 → 언마운트
+                            unmount(mount_id)
+                            self.after(0, self._refresh_list)
+                        else:
+                            # 현재 언마운트 → 마운트
+                            self.after(0, lambda: self._do_mount(mount_id, mount_data))
+                    return _toggle
+
+                items.append(
+                    pystray.MenuItem(display, _make_toggle(mid, m))
+                )
+            items.append(pystray.Menu.SEPARATOR)
+        else:
+            items.append(pystray.MenuItem("(등록된 마운트 없음)", lambda *_: None,
+                                          enabled=False))
+            items.append(pystray.Menu.SEPARATOR)
+
+        items.append(
+            pystray.MenuItem("🚪 종료", lambda: self.after(0, self._quit_app))
+        )
+        return pystray.Menu(*items)
+
+    # ────────────────────────────────────────────
+    # 목록 갱신
+    # ────────────────────────────────────────────
+    def _refresh_list(self):
+        for i in self._tree.get_children():
+            self._tree.delete(i)
+        for r in self._cfg.get("remotes", []):
+            self._tree.insert("", "end", iid=f"remote_{r['name']}",
+                              values=("☁️ 원본", "—", "—",
+                                      f"[{r['type']}] {r['name']}", ""),
+                              tags=("remote_tag",))
+        for m in self._cfg.get("mounts", []):
+            st = self._status.get(m["id"], "stopped")
+            auto = "✅" if m.get("auto_mount") else "—"
+            lbl = "■ 실행중" if st == "mounted" else "▶ 중지됨"
+            rstr = f"{m['remote']}:{m.get('remote_path', '')}".strip(":")
+            self._tree.insert("", "end", iid=m["id"],
+                              values=("💾 마운트", auto, m.get("drive", ""), rstr, lbl))
+        if self._tray:
+            try:
+                self._tray.menu = self._build_tray_menu()
+                self._tray.update_menu()
+            except Exception as e:
+                write_log("WARN", f"[트레이] 메뉴 갱신 실패: {e}")
+
+    # ────────────────────────────────────────────
+    # 설정 토글
+    # ────────────────────────────────────────────
+    def _toggle_st(self):
+        set_startup(self._st_var.get())
+
+    def _toggle_am(self):
+        self._save_settings()
+
+    def _toggle_min(self):
+        self._cfg["start_minimized"] = self._min_var.get()
+        save_config(self._cfg)
+
+    # [테스트 호환성] Scenario 17, 18, 19 대응 메서드
+    def _save_settings(self):
+        self._cfg["auto_mount"] = self._am_var.get()
+        save_config(self._cfg)
+
+    # ────────────────────────────────────────────
+    # 마운트 조작
+    # ────────────────────────────────────────────
+    def _delete_mount(self, mid):
+        if messagebox.askyesno("삭제", "선택한 항목을 삭제할까요?"):
+            unmount(mid)
+            self._cfg["mounts"] = [m for m in self._cfg["mounts"] if m["id"] != mid]
+            save_config(self._cfg)
+            self._refresh_list()
+
+    def _mount_single(self, mid):
+        m = next(m for m in self._cfg["mounts"] if m["id"] == mid)
+        self._do_mount(mid, m)
+
+    def _browse_rc(self):
+        p = filedialog.askopenfilename(
+            filetypes=[("실행 파일", "*.exe"), ("모든 파일", "*.*")])
+        if p:
+            self._rc_var.set(p)
+            self._cfg["rclone_path"] = p
+            save_config(self._cfg)
+            self._check_rclone_presence()
+
+    def _import_conf(self):
+        p = find_default_rclone_conf()
+        path = filedialog.askopenfilename(initialdir=str(p.parent) if p else None)
+        if not path:
+            return
+        remotes = parse_rclone_conf(Path(path))
+        dlg = ConfImportDialog(self, remotes)
+        self.wait_window(dlg)
+        if dlg.selected:
+            exist = [r["name"] for r in self._cfg.get("remotes", [])]
+            for r_name, r_type in dlg.selected:
+                if r_name not in exist:
+                    self._cfg.setdefault("remotes", []).append(
+                        {"name": r_name, "type": r_type})
+            save_config(self._cfg)
+            self._refresh_list()
+
+    def _add(self):
+        sel = self._tree.selection()
+        pre = (sel[0].split("remote_", 1)[1]
+               if sel and sel[0].startswith("remote_") else "")
+        dlg = MountDialog(self, mount={"remote": pre}, app_cfg=self._cfg)
+        self.wait_window(dlg)
+        if dlg.result:
+            dlg.result["id"] = str(uuid.uuid4())
+            self._cfg["mounts"].append(dlg.result)
+            save_config(self._cfg)
+            self._refresh_list()
+
+    def _edit(self):
+        sel = self._tree.selection()
+        if not sel or sel[0].startswith("remote_"):
+            return
+        idx = next(i for i, m in enumerate(self._cfg["mounts"]) if m["id"] == sel[0])
+        dlg = MountDialog(self, mount=self._cfg["mounts"][idx], app_cfg=self._cfg)
+        self.wait_window(dlg)
+        if dlg.result:
+            dlg.result["id"] = sel[0]
+            self._cfg["mounts"][idx] = dlg.result
+            save_config(self._cfg)
+            self._refresh_list()
+
+    def _del(self):
+        sel = self._tree.selection()
+        if not sel:
+            return
+        if sel[0].startswith("remote_"):
+            r_name = sel[0].split("remote_", 1)[1]
+            if messagebox.askyesno("삭제", f"원본 '{r_name}'을 삭제할까요?"):
+                self._cfg["remotes"] = [r for r in self._cfg.get("remotes", [])
+                                        if r["name"] != r_name]
+                save_config(self._cfg)
+                self._refresh_list()
+            return
+        self._delete_mount(sel[0])
+
+    def _move_up(self):
+        sel = self._tree.selection()
+        if not sel:
+            return
+        if sel[0].startswith("remote_"):
+            idx = next((i for i, r in enumerate(self._cfg.get("remotes", []))
+                        if f"remote_{r['name']}" == sel[0]), None)
+            if idx is not None and idx > 0:
+                lst = self._cfg["remotes"]
+                lst[idx], lst[idx - 1] = lst[idx - 1], lst[idx]
+                save_config(self._cfg); self._refresh_list(); self._tree.selection_set(sel[0])
+        else:
+            idx = next(i for i, m in enumerate(self._cfg["mounts"]) if m["id"] == sel[0])
+            if idx > 0:
+                lst = self._cfg["mounts"]
+                lst[idx], lst[idx - 1] = lst[idx - 1], lst[idx]
+                save_config(self._cfg); self._refresh_list(); self._tree.selection_set(sel[0])
+
+    def _move_down(self):
+        sel = self._tree.selection()
+        if not sel:
+            return
+        if sel[0].startswith("remote_"):
+            idx = next((i for i, r in enumerate(self._cfg.get("remotes", []))
+                        if f"remote_{r['name']}" == sel[0]), None)
+            if idx is not None and idx < len(self._cfg["remotes"]) - 1:
+                lst = self._cfg["remotes"]
+                lst[idx], lst[idx + 1] = lst[idx + 1], lst[idx]
+                save_config(self._cfg); self._refresh_list(); self._tree.selection_set(sel[0])
+        else:
+            idx = next(i for i, m in enumerate(self._cfg["mounts"]) if m["id"] == sel[0])
+            if idx < len(self._cfg["mounts"]) - 1:
+                lst = self._cfg["mounts"]
+                lst[idx], lst[idx + 1] = lst[idx + 1], lst[idx]
+                save_config(self._cfg); self._refresh_list(); self._tree.selection_set(sel[0])
+
+    def _mount_sel(self):
+        sel = self._tree.selection()
+        if not sel or sel[0].startswith("remote_") or sel[0] in active_mounts:
+            return
+        self._mount_single(sel[0])
+
+    def _do_mount(self, mid, m):
+        exe = get_rclone_exe(self._cfg)
+        if exe is None:
+            messagebox.showinfo("알림", "rclone 경로가 등록되어 있지 않습니다.")
+            write_log("WARN", f"[마운트 실패] {m.get('drive','?')} ← {m.get('remote','?')}: rclone 미등록")
+            return
+        if mid in active_mounts:
+            return  # 이미 마운트 중이면 무시
+        label = m.get("drive", "") or m.get("remote", "?")
+        rstr = f"{m['remote']}:{m.get('remote_path', '')}".strip(":")
+        cache = m.get("cache_mode", "")
+        write_log("INFO", f"[마운트] {label} ← {rstr}" + (f" ({cache})" if cache else ""))
+        self._status[mid] = "mounted"
+        self._refresh_list()
+        threading.Thread(target=self._mount_task, args=(mid, exe, m), daemon=True).start()
+
+    def _mount_task(self, mid, exe, m):
+        """
+        rclone mount 실행.
+
+        rclone 마운트 실패 패턴:
+          1. 즉시 종료 (returncode != 0): 드라이브 충돌 등
+          2. 실행은 되지만 마운트 실패 후 계속 실행:
+             rclone이 서비스를 시작하고 오류를 stderr에 출력하면서도
+             프로세스를 종료하지 않는 경우 (예: symlinks 오류)
+             → p.wait()가 블록되어 계속 '실행중'으로 표시되는 문제
+
+        해결:
+          - Popen 후 2초 대기
+          - poll()로 이미 종료됐으면 → 오류 처리
+          - 살아있으면 → stderr를 별도 스레드로 비동기 수집
+          - stderr에 오류 키워드 감지 시 즉시 오류 표시 + 상태 중지됨
+
+        의도적 언마운트: _unmounting에 있으면 오류 표시 안 함
+        """
+        m_label = m.get("drive", "") or m.get("remote", "?")
+        rstr = f"{m['remote']}:{m.get('remote_path', '')}".strip(":")
+        log_path = str(LOG_FILE)
+
+        def _show_error(msg: str):
+            """오류 표시: 상태 즉시 중지됨 + 오류창 (의도적 언마운트 제외)"""
+            if mid in _unmounting:
+                return
+            write_log("ERROR", f"[마운트 오류] {m_label}: {msg[:200]}")
+            self._status[mid] = "stopped"
+            self.after(0, self._refresh_list)
+            self.after(0, lambda msg_=msg, lp=log_path: messagebox.showinfo(
+                "마운트 오류",
+                f"rclone 오류:\n{msg_[:500]}\n\n"
+                f"자세한 내용은 로그 파일을 확인하세요:\n{lp}"))
+
+        try:
+            cmd = build_cmd(exe, m)
+            write_log("INFO", f"[마운트 명령] {' '.join(cmd)}")
+            p = subprocess.Popen(
+                cmd,
+                stderr=subprocess.PIPE,
+                # DETACHED_PROCESS(0x08): 콘솔 창 없이 현재 사용자 세션에서 실행
+                # CREATE_NO_WINDOW(0x08000000) 대신 사용하는 이유:
+                # CREATE_NO_WINDOW는 비인터랙티브 컨텍스트로 실행되어
+                # WinFsp 마운트 드라이브에서 exe 실행이 차단되는 문제 발생
+                creationflags=_DETACHED_PROCESS
+            )
+            active_mounts[mid] = p
+            write_log("INFO", f"[마운트 시작] {m_label} ← {rstr} (PID {p.pid})")
+
+            # ── 2초 대기 후 상태 확인 ─────────────────────────────────────
+            # rclone mount는 마운트 성공 시 2초 이내에 안정적으로 실행됨
+            # 2초 내에 종료되면 마운트 실패로 판단
+            import time as _time
+            _time.sleep(2)
+
+            poll = p.poll()
+            if poll is not None:
+                # 2초 내에 종료됨 → 오류
+                stderr_out = ""
+                try:
+                    stderr_out = p.stderr.read().decode("utf-8", errors="replace").strip()
+                except Exception:
+                    pass
+                err_msg = stderr_out if stderr_out else f"종료 코드: {poll}"
+                _show_error(err_msg)
+                return
+
+            # ── 2초 후에도 살아있음 → 마운트 성공 ──────────────────────────
+            write_log("INFO", f"[마운트 완료] {m_label} ← {rstr}")
+
+            # stderr 비동기 수집: 실행 중 오류 메시지 감지용
+            stderr_lines = []
+            def _read_stderr():
+                try:
+                    for raw in p.stderr:
+                        line = raw.decode("utf-8", errors="replace").rstrip()
+                        if line:
+                            stderr_lines.append(line)
+                            write_log("WARN", f"[rclone stderr] {m_label}: {line[:200]}")
+                except Exception:
+                    pass
+
+            threading.Thread(target=_read_stderr, daemon=True).start()
+
+            # 프로세스 종료까지 대기 (정상 언마운트 또는 비정상 종료)
+            p.wait()
+
+            if p.returncode != 0 and mid not in _unmounting:
+                err_msg = "\n".join(stderr_lines[-10:]) if stderr_lines else f"종료 코드: {p.returncode}"
+                _show_error(err_msg)
+
+        except Exception as e:
+            write_log("ERROR", f"[마운트 예외] {m_label}: {e}")
+            if mid not in _unmounting:
+                self._status[mid] = "stopped"
+                self.after(0, self._refresh_list)
+                self.after(0, lambda err=str(e), lp=log_path: messagebox.showinfo(
+                    "마운트 오류",
+                    f"오류:\n{err}\n\n"
+                    f"자세한 내용은 로그 파일을 확인하세요:\n{lp}"))
+        finally:
+            active_mounts.pop(mid, None)
+            _unmounting.discard(mid)
+            self._status[mid] = "stopped"
+            write_log("INFO", f"[마운트 종료] {m_label} ← {rstr}")
+            self.after(0, self._refresh_list)
+
+    def _automount_all(self):
+        targets = [m for m in self._cfg.get("mounts", []) if m.get("auto_mount")]
+        if targets:
+            write_log("INFO", f"[자동 마운트] {len(targets)}개 항목 마운트 시작")
+        for m in targets:
+            self._do_mount(m["id"], m)
+
+    def _start_net_monitor(self):
+        """
+        인터넷 연결 상태를 주기적으로 감시하여 auto_mount 항목을 자동 마운트/언마운트.
+
+        동작:
+          - 10초마다 인터넷 연결 상태 확인
+          - 끊김 → 연결: auto_mount 항목 마운트
+          - 연결 → 끊김: auto_mount 항목 언마운트
+          - 시작 시 인터넷 없으면 팝업 없이 대기
+        """
+        if self._net_monitor_running:
+            return
+        self._net_monitor_running = True
+        write_log("INFO", "[네트워크] 인터넷 연결 감시 시작")
+
+        def _monitor():
+            while self._net_monitor_running:
+                connected = is_internet_available()
+
+                if connected != self._net_was_connected:
+                    prev = self._net_was_connected
+                    self._net_was_connected = connected
+
+                    if connected:
+                        # 끊김 → 연결: auto_mount 항목 마운트
+                        write_log("INFO", "[네트워크] 인터넷 연결됨 → auto_mount 마운트 시작")
+                        self.after(0, self._automount_all)
+                    else:
+                        # 연결 → 끊김: 현재 마운트 중인 모든 드라이브 언마운트
+                        # (auto_mount 여부와 무관하게 전부 해제)
+                        write_log("WARN", "[네트워크] 인터넷 끊김 → 마운트 중인 드라이브 해제")
+                        self.after(0, self._unmount_all_on_disconnect)
+
+                import time as _t
+                _t.sleep(10)
+
+        threading.Thread(target=_monitor, daemon=True).start()
+
+    def _unmount_all_on_disconnect(self):
+        """
+        인터넷 끊김 감지 시 현재 마운트 중인 드라이브를 언마운트.
+
+        - 자동 마운트(auto_mount) 항목: 알림 없이 조용히 언마운트
+          (네트워크 상태에 따라 자동으로 켜고 끄는 것이 정상 동작이므로)
+        - 수동 마운트 항목: 언마운트 후 알림 창으로 안내
+          (사용자가 직접 마운트했으므로 끊겼다는 사실을 알려야 함)
+        """
+        mounted = [m for m in self._cfg.get("mounts", []) if m["id"] in active_mounts]
+        if not mounted:
+            return
+
+        auto_targets = [m for m in mounted if m.get("auto_mount")]
+        manual_targets = [m for m in mounted if not m.get("auto_mount")]
+
+        # 자동 마운트: 조용히 해제
+        for m in auto_targets:
+            label = m.get("drive", "") or m.get("remote", "?")
+            rstr = f"{m['remote']}:{m.get('remote_path', '')}".strip(":")
+            write_log("INFO", f"[자동 언마운트] {label} ← {rstr} (인터넷 끊김)")
+            unmount(m["id"])
+
+        # 수동 마운트: 해제 후 알림
+        manual_labels = []
+        for m in manual_targets:
+            label = m.get("drive", "") or m.get("remote", "?")
+            rstr = f"{m['remote']}:{m.get('remote_path', '')}".strip(":")
+            write_log("WARN", f"[언마운트] {label} ← {rstr} (인터넷 끊김)")
+            unmount(m["id"])
+            manual_labels.append(f"{label} ({rstr})")
+
+        if mounted:
+            self._refresh_list()
+
+        if manual_labels:
+            names = "\n".join(manual_labels)
+            messagebox.showinfo(
+                "네트워크 연결 끊김",
+                f"인터넷 연결이 끊겨 다음 드라이브의 마운트를 해제했습니다:\n\n{names}")
+
+    def _unmount_sel(self):
+        sel = self._tree.selection()
+        if sel and not sel[0].startswith("remote_"):
+            mid = sel[0]
+            m = next((m for m in self._cfg.get("mounts", []) if m["id"] == mid), None)
+            if m:
+                label = m.get("drive", "") or m.get("remote", "?")
+                rstr = f"{m['remote']}:{m.get('remote_path', '')}".strip(":")
+                write_log("INFO", f"[언마운트] {label} ← {rstr}")
+            unmount(mid)
+            self._refresh_list()
+
+    # ────────────────────────────────────────────
+    # 창 표시/숨김/종료/재시작
+    # ────────────────────────────────────────────
+    def hide_window(self):
+        self.withdraw()
+
+    def show_window(self):
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def _quit_app(self):
+        write_log("INFO", "[종료] RcloneManager 종료")
+        self._net_monitor_running = False  # 네트워크 모니터 종료
+        for mid in list(active_mounts.keys()):
+            unmount(mid)
+        if self._tray:
+            self._tray.stop()
+        self.destroy()
+
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    if activate_existing_window():
+        sys.exit(0)
+    app = App()
+    app.mainloop()
