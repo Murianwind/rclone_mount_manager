@@ -43,7 +43,7 @@ _DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
 # ── 프로그램 설정 ──
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 GITHUB_REPO = "Murianwind/rclone_mount_manager_go"
 
 # 이 Python 버전은 더 이상 개발되지 않고, Go로 재작성된 후속 프로그램으로
