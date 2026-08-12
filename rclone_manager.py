@@ -44,7 +44,20 @@ _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
 # ── 프로그램 설정 ──
 APP_VERSION = "1.3.0"
-GITHUB_REPO = "Murianwind/rclone_mount_manager"
+GITHUB_REPO = "Murianwind/rclone_mount_manager_go"
+
+# 이 Python 버전은 더 이상 개발되지 않고, Go로 재작성된 후속 프로그램으로
+# 이전을 안내하는 역할만 한다. GITHUB_REPO가 Go 저장소를 가리키므로, 사용자가
+# 지금 업데이트를 누르든 몇 달 뒤에 누르든 그 시점의 "최신" Go 릴리스를
+# 매번 새로 조회해서 받는다(고정된 zip을 한 번 붙여두는 방식과 달리, Go
+# 쪽에 새 릴리스가 나올 때마다 자동으로 그게 최신으로 잡힌다).
+#
+# 다만 그 저장소의 태그(예: v0.1.1)가 이 앱의 APP_VERSION(1.3.0)보다 숫자상
+# 낮게 나오는 게 정상이라, 버전 숫자 비교로는 "업데이트 있음"을 절대 못
+# 잡아낸다. 그래서 이 플래그로 비교 자체를 건너뛰고 항상 새 버전이 있다고
+# 안내한다. (APP_VERSION 자체를 낮추는 방식은 화면에 보이는 버전 배지가
+# "v0.0.0" 처럼 깨져 보이므로 쓰지 않는다.)
+MIGRATED_TO_GO = True
 # GitHub API 버전 체크 주기 (초 단위, 86400 = 24시간)
 VERSION_CHECK_INTERVAL = 86400
 
@@ -1257,10 +1270,16 @@ class App(tk.Tk):
                 self._pending_force_check = True
             return
 
-        # 앱 버전만 24시간 주기 체크
+        # 앱 버전만 24시간 주기 체크 (단, Go로 이전된 다리 버전은 실행할
+        # 때마다 항상 즉시 확인한다 — mounts.json의 last_version_check가
+        # 구버전에서 "방금 확인함"으로 이미 찍혀있는 상태로 넘어올 수
+        # 있는데, 그 직전 조회 결과(_latest_app_info)는 메모리에만 있어서
+        # 새로 실행한 프로세스엔 안 남아있다. 그대로 두면 이 다리 버전을
+        # 처음 실행했을 때 아무 안내도 안 뜨고 24시간을 기다려야 하는
+        # 상황이 생긴다.)
         now = time.time()
         last_check = self._cfg.get("last_version_check", 0)
-        skip_app_api = (not force) and (now - last_check < VERSION_CHECK_INTERVAL)
+        skip_app_api = (not force) and (not MIGRATED_TO_GO) and (now - last_check < VERSION_CHECK_INTERVAL)
 
         self._version_check_running = True
 
@@ -1289,9 +1308,9 @@ class App(tk.Tk):
                         data = res.json()
                         latest_app = data.get("tag_name", "").lstrip("v")
                         self._latest_app_info = data
-                        if _ver_tuple(latest_app) > _ver_tuple(APP_VERSION):
+                        if MIGRATED_TO_GO or _ver_tuple(latest_app) > _ver_tuple(APP_VERSION):
                             write_log("INFO",
-                                      f"[버전] 앱 v{APP_VERSION} → v{latest_app} 업데이트 가능")
+                                      f"[버전] 후속 프로그램(Go 버전) v{latest_app} 발견 — 이전 안내 표시")
                             self.after(0, self._show_app_update_btn)
                         else:
                             write_log("INFO", f"[버전] 앱 v{APP_VERSION} (최신)")
@@ -1306,7 +1325,7 @@ class App(tk.Tk):
                     # 앱 API 스킵: 기존에 저장된 정보로 버튼 상태 복원
                     if self._latest_app_info:
                         latest_app = self._latest_app_info.get("tag_name", "").lstrip("v")
-                        if _ver_tuple(latest_app) > _ver_tuple(APP_VERSION):
+                        if MIGRATED_TO_GO or _ver_tuple(latest_app) > _ver_tuple(APP_VERSION):
                             self.after(0, self._show_app_update_btn)
 
                 # rclone 로컬 버전 표시 (로컬 실행, API 호출 없음)
